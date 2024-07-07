@@ -300,6 +300,7 @@ config SECURITY_COMMONCAP_KUNIT_TEST
 	  If unsure, say N.
 
 source "security/Kconfig.hardening"
+source "security/Kconfig.openpax"
 
 endmenu
 
