@@ -1397,6 +1397,18 @@ int proc_do_static_key(const struct ctl_table *table, int dir,
 	return ret;
 }
 
+#ifdef CONFIG_OPENPAX_SOFTMODE
+static const struct ctl_table pax_table[] = {
+	{
+		.procname       = "softmode",
+		.data           = &pax_softmode,
+		.maxlen         = sizeof(int),
+		.mode           = 0600,
+		.proc_handler   = proc_dointvec,
+	},
+};
+#endif
+
 static const struct ctl_table sysctl_subsys_table[] = {
 #ifdef CONFIG_SYSCTL
 	{
@@ -1446,6 +1458,9 @@ static const struct ctl_table sysctl_subsys_table[] = {
 int __init sysctl_init_bases(void)
 {
 	register_sysctl_init("kernel", sysctl_subsys_table);
+#ifdef CONFIG_OPENPAX_SOFTMODE
+	register_sysctl_init("kernel/pax", pax_table);
+#endif
 
 	return 0;
 }
