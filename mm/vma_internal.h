@@ -37,6 +37,7 @@
 #include <linux/perf_event.h>
 #include <linux/personality.h>
 #include <linux/pfn.h>
+#include <linux/random.h>
 #include <linux/rcupdate.h>
 #include <linux/rmap.h>
 #include <linux/rwsem.h>
