@@ -15,6 +15,7 @@
 #include "tests/vma.c"
 
 int sysctl_max_map_count __read_mostly = DEFAULT_MAX_MAP_COUNT;
+int randomize_va_space = 2;
 
 /* Helper functions which utilise static kernel functions. */
 
