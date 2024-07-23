@@ -418,7 +418,10 @@ enum {
  */
 enum {
 	READ_IMPLIES_EXEC =	0x0400000,
+	ADDR_NO_RANDOMIZE =	0x0040000,
 };
+
+extern int randomize_va_space;
 
 struct vma_iterator {
 	struct ma_state mas;
