@@ -27,6 +27,11 @@ struct unmap_desc;
 
 #define vma_policy(vma) NULL
 
+static inline u32 get_random_u32(void)
+{
+	return 0;
+}
+
 #define down_write_nest_lock(sem, nest_lock)
 
 #define data_race(expr) expr
