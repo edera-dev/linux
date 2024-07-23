@@ -170,6 +170,11 @@ extern unsigned long dac_mmap_min_addr;
 
 #define vma_policy(vma) NULL
 
+static inline u32 get_random_u32(void)
+{
+	return 0;
+}
+
 #define down_write_nest_lock(sem, nest_lock)
 
 #define pgprot_val(x)		((x).pgprot)
@@ -239,7 +244,10 @@ enum {
  */
 enum {
 	READ_IMPLIES_EXEC =	0x0400000,
+	ADDR_NO_RANDOMIZE =	0x0040000,
 };
+
+extern int randomize_va_space;
 
 struct task_struct {
 	char comm[TASK_COMM_LEN];
