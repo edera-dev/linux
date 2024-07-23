@@ -23,6 +23,7 @@ static bool fail_prealloc;
 unsigned long mmap_min_addr = CONFIG_DEFAULT_MMAP_MIN_ADDR;
 unsigned long dac_mmap_min_addr = CONFIG_DEFAULT_MMAP_MIN_ADDR;
 unsigned long stack_guard_gap = 256UL<<PAGE_SHIFT;
+int randomize_va_space = 2;
 
 /*
  * Directly import the VMA implementation here. Our vma_internal.h wrapper
