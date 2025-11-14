@@ -88,14 +88,14 @@ static int __amd_smn_rw(u8 i_off, u8 d_off, u16 node, u32 address, u32 *value, b
 	struct pci_dev *root;
 	int err = -ENODEV;
 
+	if (!smn_exclusive)
+		return err;
+
 	if (node >= amd_num_nodes())
 		return err;
 
 	root = amd_roots[node];
 	if (!root)
-		return err;
-
-	if (!smn_exclusive)
 		return err;
 
 	guard(mutex)(&smn_mutex);
