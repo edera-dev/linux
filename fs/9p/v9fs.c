@@ -578,10 +578,30 @@ static ssize_t caches_show(struct kobject *kobj,
 static struct kobj_attribute v9fs_attr_cache = __ATTR_RO(caches);
 #endif /* CONFIG_9P_FSCACHE */
 
+/*
+ * Capability tokens for userspace to probe, one per line.
+ *
+ * "edera_multi_attach_v1": a transport that sets p9_trans_module.share_client
+ * (e.g. Xen 9pfs) can back several mounts of a single endpoint, each attaching
+ * with its own aname. Userspace can test for this token before mounting subtrees
+ * of one frontend as independent superblocks (distinct st_dev) instead of
+ * bind-mounting from a single mount. The token is vendor-namespaced and
+ * versioned so it never aliases an unrelated upstream feature name, and a future
+ * behavior change can advertise "_v2" instead.
+ */
+static ssize_t features_show(struct kobject *kobj,
+			     struct kobj_attribute *attr, char *buf)
+{
+	return sysfs_emit(buf, "edera_multi_attach_v1\n");
+}
+
+static struct kobj_attribute v9fs_attr_features = __ATTR_RO(features);
+
 static struct attribute *v9fs_attrs[] = {
 #ifdef CONFIG_9P_FSCACHE
 	&v9fs_attr_cache.attr,
 #endif
+	&v9fs_attr_features.attr,
 	NULL,
 };
 

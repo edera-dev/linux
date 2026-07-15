@@ -132,6 +132,59 @@ static int get_protocol_version(char *s)
  * Return 0 upon success, -ERRNO upon failure
  */
 
+/*
+ * Shared-client registry.
+ *
+ * Some transports (currently only Xen 9pfs) expose a single endpoint that
+ * cannot multiplex more than one p9_client: a second mount of the same
+ * endpoint would clobber the first's client pointer. For such transports
+ * (p9_trans_module.share_client) all mounts of one endpoint share a single
+ * refcounted p9_client and tell themselves apart by attaching (Tattach) with
+ * their own aname, which gives each an independent tree and superblock.
+ *
+ * Clients are keyed by endpoint id: the explicit "tag=" mount option when the
+ * mount supplied one, otherwise the mount device name.
+ */
+static LIST_HEAD(p9_shared_clients);
+static DEFINE_MUTEX(p9_shared_clients_lock);
+
+/* Value of the "tag=" mount option in @options, copied into @buf, or NULL when
+ * absent. Matched only at an option boundary.
+ */
+static const char *p9_options_tag(const char *options, char *buf, size_t buflen)
+{
+	const char *p = options;
+
+	while (p && *p) {
+		if (!strncmp(p, "tag=", 4)) {
+			size_t n = strcspn(p + 4, ",");
+
+			if (n == 0 || n >= buflen)
+				return NULL;
+			memcpy(buf, p + 4, n);
+			buf[n] = '\0';
+			return buf;
+		}
+		p = strchr(p, ',');
+		if (p)
+			p++;
+	}
+	return NULL;
+}
+
+/* Caller must hold p9_shared_clients_lock. */
+static struct p9_client *p9_client_find_shared(struct p9_trans_module *trans,
+					       const char *key)
+{
+	struct p9_client *clnt;
+
+	list_for_each_entry(clnt, &p9_shared_clients, shared_list) {
+		if (clnt->trans_mod == trans && !strcmp(clnt->shared_key, key))
+			return clnt;
+	}
+	return NULL;
+}
+
 static int parse_opts(char *opts, struct p9_client *clnt)
 {
 	char *options, *tmp_options;
@@ -983,6 +1036,7 @@ struct p9_client *p9_client_create(const char *dev_name, char *options)
 	struct p9_client *clnt;
 	char *client_id;
 	char *cache_name;
+	bool shared_locked = false;
 
 	clnt = kmalloc(sizeof(*clnt), GFP_KERNEL);
 	if (!clnt)
@@ -998,6 +1052,9 @@ struct p9_client *p9_client_create(const char *dev_name, char *options)
 	spin_lock_init(&clnt->lock);
 	idr_init(&clnt->fids);
 	idr_init(&clnt->reqs);
+	refcount_set(&clnt->refcount, 1);
+	INIT_LIST_HEAD(&clnt->shared_list);
+	clnt->shared_key = NULL;
 
 	err = parse_opts(options, clnt);
 	if (err < 0)
@@ -1015,6 +1072,47 @@ struct p9_client *p9_client_create(const char *dev_name, char *options)
 
 	p9_debug(P9_DEBUG_MUX, "clnt %p trans %p msize %d protocol %d\n",
 		 clnt, clnt->trans_mod, clnt->msize, clnt->proto_version);
+
+	if (clnt->trans_mod->share_client) {
+		char tagbuf[64];
+		const char *key = p9_options_tag(options, tagbuf, sizeof(tagbuf));
+		struct p9_client *shared;
+
+		if (!key)
+			key = dev_name;
+		if (!key) {
+			err = -EINVAL;
+			goto put_trans;
+		}
+		mutex_lock(&p9_shared_clients_lock);
+		shared = p9_client_find_shared(clnt->trans_mod, key);
+		if (shared) {
+			/* Endpoint already has a client; reuse it. Discard the
+			 * client we speculatively allocated above.
+			 */
+			refcount_inc(&shared->refcount);
+			mutex_unlock(&p9_shared_clients_lock);
+			v9fs_put_trans(clnt->trans_mod);
+			idr_destroy(&clnt->reqs);
+			idr_destroy(&clnt->fids);
+			kfree(clnt);
+			return shared;
+		}
+		/* First mount of this endpoint. Hold the registry lock across
+		 * setup (trans->create + version negotiation) so a concurrent
+		 * mount of the same endpoint waits and then finds a fully
+		 * initialised client, rather than racing trans->create which
+		 * binds the endpoint to a single client. share_client
+		 * transports have a local backend, so the stall is bounded.
+		 */
+		clnt->shared_key = kstrdup(key, GFP_KERNEL);
+		if (!clnt->shared_key) {
+			mutex_unlock(&p9_shared_clients_lock);
+			err = -ENOMEM;
+			goto put_trans;
+		}
+		shared_locked = true;
+	}
 
 	err = clnt->trans_mod->create(clnt, dev_name, options);
 	if (err)
@@ -1056,6 +1154,10 @@ struct p9_client *p9_client_create(const char *dev_name, char *options)
 					   NULL);
 
 	kfree(cache_name);
+	if (shared_locked) {
+		list_add(&clnt->shared_list, &p9_shared_clients);
+		mutex_unlock(&p9_shared_clients_lock);
+	}
 	return clnt;
 
 close_trans:
@@ -1063,6 +1165,10 @@ close_trans:
 put_trans:
 	v9fs_put_trans(clnt->trans_mod);
 free_client:
+	if (shared_locked) {
+		kfree(clnt->shared_key);
+		mutex_unlock(&p9_shared_clients_lock);
+	}
 	kfree(clnt);
 	return ERR_PTR(err);
 }
@@ -1074,6 +1180,18 @@ void p9_client_destroy(struct p9_client *clnt)
 	int id;
 
 	p9_debug(P9_DEBUG_MUX, "clnt %p\n", clnt);
+
+	/* Shared client: only the last mount tears it down. */
+	if (clnt->shared_key) {
+		mutex_lock(&p9_shared_clients_lock);
+		if (!refcount_dec_and_test(&clnt->refcount)) {
+			mutex_unlock(&p9_shared_clients_lock);
+			return;
+		}
+		list_del(&clnt->shared_list);
+		mutex_unlock(&p9_shared_clients_lock);
+		kfree(clnt->shared_key);
+	}
 
 	if (clnt->trans_mod)
 		clnt->trans_mod->close(clnt);
@@ -1095,6 +1213,11 @@ EXPORT_SYMBOL(p9_client_destroy);
 void p9_client_disconnect(struct p9_client *clnt)
 {
 	p9_debug(P9_DEBUG_9P, "clnt %p\n", clnt);
+	/* On a shared client, only the last mount may tear the link down;
+	 * disconnecting while a sibling mount is still live would break it.
+	 */
+	if (clnt->shared_key && refcount_read(&clnt->refcount) > 1)
+		return;
 	clnt->status = Disconnected;
 }
 EXPORT_SYMBOL(p9_client_disconnect);
@@ -1102,6 +1225,8 @@ EXPORT_SYMBOL(p9_client_disconnect);
 void p9_client_begin_disconnect(struct p9_client *clnt)
 {
 	p9_debug(P9_DEBUG_9P, "clnt %p\n", clnt);
+	if (clnt->shared_key && refcount_read(&clnt->refcount) > 1)
+		return;
 	clnt->status = BeginDisconnect;
 }
 EXPORT_SYMBOL(p9_client_begin_disconnect);
