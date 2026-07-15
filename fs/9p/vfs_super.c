@@ -293,6 +293,7 @@ static void v9fs_free_fc(struct fs_context *fc)
 #ifdef CONFIG_9P_FSCACHE
 	kfree(ctx->session_opts.cachetag);
 #endif
+	kfree(ctx->tag);
 	if (ctx->client_opts.trans_mod)
 		v9fs_put_trans(ctx->client_opts.trans_mod);
 	kfree(ctx);
