@@ -34,6 +34,14 @@
  * @supports_vmalloc: set if this transport can work with vmalloc'd buffers
  *                    (non-physically contiguous memory). Transports requiring
  *                    DMA should leave this as false.
+ * @share_client: set if a single transport endpoint (e.g. one Xen 9pfs
+ *                frontend/backend pair, identified by its tag) can back more
+ *                than one mount. Such an endpoint cannot multiplex several
+ *                p9_clients, so when this is set the 9p core hands every mount
+ *                of the same endpoint a single, refcounted p9_client instead of
+ *                creating one per mount. Each mount still issues its own Tattach
+ *                (with its own aname), so it gets an independent tree and
+ *                superblock over the shared client.
  * @create: member function to create a new connection on this transport
  * @close: member function to discard a connection on this transport
  * @request: member function to issue a request to the transport
@@ -55,6 +63,7 @@ struct p9_trans_module {
 	bool pooled_rbuffers;
 	bool def;		/* this transport should be default */
 	bool supports_vmalloc;	/* can work with vmalloc'd buffers */
+	bool share_client;	/* one endpoint may back many mounts */
 	struct module *owner;
 	int (*create)(struct p9_client *client,
 		      struct fs_context *fc);
