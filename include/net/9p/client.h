@@ -129,6 +129,16 @@ struct p9_client {
 	struct idr fids;
 	struct idr reqs;
 
+	/* Client sharing, for transports with p9_trans_module.share_client set:
+	 * all mounts of one endpoint reference a single client. @refcount counts
+	 * those mounts; @shared_list links the client into the shared-client
+	 * registry, keyed by @shared_key (a copy of the endpoint tag/source).
+	 * @shared_key is NULL for ordinary, unshared clients.
+	 */
+	refcount_t refcount;
+	struct list_head shared_list;
+	char *shared_key;
+
 	char name[__NEW_UTS_LEN + 1];
 };
 
@@ -222,6 +232,12 @@ struct v9fs_context {
 	struct p9_fd_opts	fd_opts;
 	struct p9_rdma_opts	rdma_opts;
 	struct p9_session_opts	session_opts;
+	/* Optional explicit transport endpoint id (the Xen 9pfs "tag"). When
+	 * set it selects the device and keys client sharing, decoupling the
+	 * endpoint from the mount source string so each mount of one endpoint
+	 * can present a distinct source in /proc/mounts.
+	 */
+	char			*tag;
 };
 
 /**

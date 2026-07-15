@@ -69,7 +69,13 @@ static int p9_xen_cancel(struct p9_client *client, struct p9_req_t *req)
 
 static int p9_xen_create(struct p9_client *client, struct fs_context *fc)
 {
-	const char *addr = fc->source;
+	struct v9fs_context *ctx = fc->fs_private;
+	/* Select the device by its tag. An explicit tag= lets several mounts
+	 * of one frontend carry distinct source strings (distinct
+	 * /proc/mounts device names); without it the source string is the tag,
+	 * as before.
+	 */
+	const char *addr = (ctx && ctx->tag) ? ctx->tag : fc->source;
 	struct xen_9pfs_front_priv *priv;
 
 	if (addr == NULL)
@@ -261,6 +267,7 @@ static struct p9_trans_module p9_xen_trans = {
 	.pooled_rbuffers = false,
 	.def = true,
 	.supports_vmalloc = false,
+	.share_client = true,
 	.create = p9_xen_create,
 	.close = p9_xen_close,
 	.request = p9_xen_request,
