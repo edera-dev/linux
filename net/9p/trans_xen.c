@@ -66,16 +66,49 @@ static int p9_xen_cancel(struct p9_client *client, struct p9_req_t *req)
 	return 1;
 }
 
+/* Value of the "tag=" mount option in @args, copied into @buf, or NULL when
+ * absent. Matched only at an option boundary. The device is selected by tag,
+ * so several mounts of one frontend can carry distinct source strings.
+ */
+static const char *p9_xen_opt_tag(const char *args, char *buf, size_t buflen)
+{
+	const char *p = args;
+
+	while (p && *p) {
+		if (!strncmp(p, "tag=", 4)) {
+			size_t n = strcspn(p + 4, ",");
+
+			if (n == 0 || n >= buflen)
+				return NULL;
+			memcpy(buf, p + 4, n);
+			buf[n] = '\0';
+			return buf;
+		}
+		p = strchr(p, ',');
+		if (p)
+			p++;
+	}
+	return NULL;
+}
+
 static int p9_xen_create(struct p9_client *client, const char *addr, char *args)
 {
 	struct xen_9pfs_front_priv *priv;
+	char tagbuf[64];
+	const char *tag;
 
-	if (addr == NULL)
+	/* Prefer an explicit tag= option so the mount source can differ per
+	 * mount (distinct /proc/mounts device names); fall back to the source.
+	 */
+	tag = p9_xen_opt_tag(args, tagbuf, sizeof(tagbuf));
+	if (!tag)
+		tag = addr;
+	if (tag == NULL)
 		return -EINVAL;
 
 	read_lock(&xen_9pfs_lock);
 	list_for_each_entry(priv, &xen_9pfs_devs, list) {
-		if (!strcmp(priv->tag, addr)) {
+		if (!strcmp(priv->tag, tag)) {
 			priv->client = client;
 			read_unlock(&xen_9pfs_lock);
 			return 0;
@@ -258,6 +291,7 @@ static struct p9_trans_module p9_xen_trans = {
 	.maxsize = 1 << (XEN_9PFS_RING_ORDER + XEN_PAGE_SHIFT - 2),
 	.pooled_rbuffers = false,
 	.def = 1,
+	.share_client = true,
 	.create = p9_xen_create,
 	.close = p9_xen_close,
 	.request = p9_xen_request,
