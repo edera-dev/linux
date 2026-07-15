@@ -53,7 +53,7 @@ enum {
 	Opt_locktimeout,
 
 	/* Client options */
-	Opt_msize, Opt_trans, Opt_legacy, Opt_version,
+	Opt_msize, Opt_trans, Opt_legacy, Opt_version, Opt_tag,
 
 	/* fd transport options */
 	/* Options that take integer arguments */
@@ -103,6 +103,7 @@ const struct fs_parameter_spec v9fs_param_spec[] = {
 	fsparam_flag	("noextend",	Opt_legacy),
 	fsparam_string	("trans",	Opt_trans),
 	fsparam_enum	("version",	Opt_version, p9_versions),
+	fsparam_string	("tag",		Opt_tag),
 
 	/* fd transport options */
 	fsparam_u32	("rfdno",	Opt_rfdno),
@@ -272,6 +273,15 @@ int v9fs_parse_param(struct fs_context *fc, struct fs_parameter *param)
 	case Opt_remotename:
 		kfree(session_opts->aname);
 		session_opts->aname = param->string;
+		param->string = NULL;
+		break;
+	case Opt_tag:
+		/* Explicit transport endpoint id (Xen 9pfs tag), decoupled from
+		 * the mount source so one endpoint can back several mounts that
+		 * each show a distinct source in /proc/mounts.
+		 */
+		kfree(ctx->tag);
+		ctx->tag = param->string;
 		param->string = NULL;
 		break;
 	case Opt_nodevmap:
@@ -641,10 +651,30 @@ static ssize_t caches_show(struct kobject *kobj,
 static struct kobj_attribute v9fs_attr_cache = __ATTR_RO(caches);
 #endif /* CONFIG_9P_FSCACHE */
 
+/*
+ * Capability tokens for userspace to probe, one per line.
+ *
+ * "edera_multi_attach_v1": a transport that sets p9_trans_module.share_client
+ * (e.g. Xen 9pfs) can back several mounts of a single endpoint, each attaching
+ * with its own aname. Userspace can test for this token before mounting subtrees
+ * of one frontend as independent superblocks (distinct st_dev) instead of
+ * bind-mounting from a single mount. The token is vendor-namespaced and
+ * versioned so it never aliases an unrelated upstream feature name, and a future
+ * behavior change can advertise "_v2" instead.
+ */
+static ssize_t features_show(struct kobject *kobj,
+			     struct kobj_attribute *attr, char *buf)
+{
+	return sysfs_emit(buf, "edera_multi_attach_v1\n");
+}
+
+static struct kobj_attribute v9fs_attr_features = __ATTR_RO(features);
+
 static struct attribute *v9fs_attrs[] = {
 #ifdef CONFIG_9P_FSCACHE
 	&v9fs_attr_cache.attr,
 #endif
+	&v9fs_attr_features.attr,
 	NULL,
 };
 
