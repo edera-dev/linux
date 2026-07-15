@@ -24,6 +24,13 @@
  *                   we're less flexible when choosing the response message
  *                   size in this case
  * @def: set if this transport should be considered the default
+ * @share_client: set if one transport endpoint (e.g. a Xen 9pfs frontend,
+ *                keyed by its tag) can back more than one mount. Such an
+ *                endpoint cannot multiplex several p9_clients, so when this is
+ *                set the 9p core hands every mount of the same endpoint a
+ *                single, refcounted p9_client instead of one per mount. Each
+ *                mount still issues its own Tattach (with its own aname), so it
+ *                gets an independent tree and superblock over the shared client.
  * @create: member function to create a new connection on this transport
  * @close: member function to discard a connection on this transport
  * @request: member function to issue a request to the transport
@@ -44,6 +51,7 @@ struct p9_trans_module {
 	int maxsize;		/* max message size of transport */
 	bool pooled_rbuffers;
 	int def;		/* this transport should be default */
+	bool share_client;	/* one endpoint may back many mounts */
 	struct module *owner;
 	int (*create)(struct p9_client *client,
 		      const char *devname, char *args);
