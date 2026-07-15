@@ -123,6 +123,16 @@ struct p9_client {
 	struct idr fids;
 	struct idr reqs;
 
+	/* Client sharing, for transports with p9_trans_module.share_client set:
+	 * all mounts of one endpoint reference a single client. @refcount counts
+	 * those mounts; @shared_list links the client into the shared-client
+	 * registry, keyed by @shared_key (a copy of the endpoint tag/source).
+	 * @shared_key is NULL for ordinary, unshared clients.
+	 */
+	refcount_t refcount;
+	struct list_head shared_list;
+	char *shared_key;
+
 	char name[__NEW_UTS_LEN + 1];
 };
 
