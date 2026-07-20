@@ -4,6 +4,7 @@
 #include <linux/kernel.h>
 #include <linux/mm.h>
 #include <linux/memremap.h>
+#include <linux/numa.h>
 #include <linux/slab.h>
 
 #include <asm/page.h>
@@ -12,11 +13,30 @@
 #include <xen/page.h>
 #include <xen/xen.h>
 
+/*
+ * Free pages are kept on per-node lists indexed by Linux node id.  Each
+ * fill_list() call grabs a fresh section-aligned IOMEM region and
+ * registers it with memremap_pages() against a specific node, so all
+ * struct pages in that section report that node via page_to_nid().
+ * Backends that learn the host node of a foreign frame (via
+ * xenbus_ring_host_node) can request placeholder pages from the
+ * matching pool so page_to_nid agrees with the actual host placement.
+ *
+ * A single mutex covers all per-node lists.  Alloc/free are
+ * connect-time events on the I/O backends and not contention-sensitive.
+ */
 static DEFINE_MUTEX(list_lock);
-static struct page *page_list;
-static unsigned int list_count;
+static struct page *page_list[MAX_NUMNODES];
+static unsigned int list_count[MAX_NUMNODES];
 
 static struct resource *target_resource;
+
+static int xen_unpopulated_clamp_node(int node)
+{
+	if (node == NUMA_NO_NODE || node < 0 || node >= MAX_NUMNODES)
+		return numa_node_id();
+	return node;
+}
 
 /* Pages to subtract from the memory count when setting balloon target. */
 unsigned long xen_unpopulated_pages __initdata;
@@ -34,7 +54,7 @@ int __weak __init arch_xen_unpopulated_init(struct resource **res)
 	return 0;
 }
 
-static int fill_list(unsigned int nr_pages)
+static int fill_list(unsigned int nr_pages, int node)
 {
 	struct dev_pagemap *pgmap;
 	struct resource *res, *tmp_res = NULL;
@@ -121,7 +141,15 @@ static int fill_list(unsigned int nr_pages)
 	}
 #endif
 
-	vaddr = memremap_pages(pgmap, NUMA_NO_NODE);
+	/*
+	 * Register the section against @node so page_to_nid() of any
+	 * page in this section reports that value.  Grant-map operations
+	 * later install foreign MFNs into these slots; as long as the
+	 * caller picks the section matching the foreign MFN's host node
+	 * (which is the contract callers of xen_alloc_unpopulated_pages_node
+	 * are expected to honour), page_to_nid is correct by construction.
+	 */
+	vaddr = memremap_pages(pgmap, node);
 	if (IS_ERR(vaddr)) {
 		pr_err("Cannot remap memory range\n");
 		ret = PTR_ERR(vaddr);
@@ -131,9 +159,9 @@ static int fill_list(unsigned int nr_pages)
 	for (i = 0; i < alloc_pages; i++) {
 		struct page *pg = virt_to_page(vaddr + PAGE_SIZE * i);
 
-		pg->zone_device_data = page_list;
-		page_list = pg;
-		list_count++;
+		pg->zone_device_data = page_list[node];
+		page_list[node] = pg;
+		list_count[node]++;
 	}
 
 	return 0;
@@ -153,12 +181,21 @@ err_resource:
 }
 
 /**
- * xen_alloc_unpopulated_pages - alloc unpopulated pages
+ * xen_alloc_unpopulated_pages_node - alloc unpopulated pages on a node
  * @nr_pages: Number of pages
  * @pages: pages returned
- * @return 0 on success, error otherwise
+ * @node: Preferred Linux node id, or NUMA_NO_NODE for current CPU's node
+ *
+ * The returned pages are drawn from a per-node pool registered with
+ * memremap_pages() against @node, so page_to_nid() reports @node for
+ * every returned page.  Callers that know the host node of a foreign
+ * frame should pass it here to keep page_to_nid in agreement with the
+ * actual host placement after a subsequent grant-map.
+ *
+ * Returns 0 on success, error otherwise.
  */
-int xen_alloc_unpopulated_pages(unsigned int nr_pages, struct page **pages)
+int xen_alloc_unpopulated_pages_node(unsigned int nr_pages, struct page **pages,
+				     int node)
 {
 	unsigned int i;
 	int ret = 0;
@@ -171,19 +208,21 @@ int xen_alloc_unpopulated_pages(unsigned int nr_pages, struct page **pages)
 	if (!target_resource)
 		return xen_alloc_ballooned_pages(nr_pages, pages);
 
+	node = xen_unpopulated_clamp_node(node);
+
 	mutex_lock(&list_lock);
-	if (list_count < nr_pages) {
-		ret = fill_list(nr_pages - list_count);
+	if (list_count[node] < nr_pages) {
+		ret = fill_list(nr_pages - list_count[node], node);
 		if (ret)
 			goto out;
 	}
 
 	for (i = 0; i < nr_pages; i++) {
-		struct page *pg = page_list;
+		struct page *pg = page_list[node];
 
 		BUG_ON(!pg);
-		page_list = pg->zone_device_data;
-		list_count--;
+		page_list[node] = pg->zone_device_data;
+		list_count[node]--;
 		pages[i] = pg;
 
 #ifdef CONFIG_XEN_HAVE_PVMMU
@@ -193,9 +232,9 @@ int xen_alloc_unpopulated_pages(unsigned int nr_pages, struct page **pages)
 				unsigned int j;
 
 				for (j = 0; j <= i; j++) {
-					pages[j]->zone_device_data = page_list;
-					page_list = pages[j];
-					list_count++;
+					pages[j]->zone_device_data = page_list[node];
+					page_list[node] = pages[j];
+					list_count[node]++;
 				}
 				goto out;
 			}
@@ -207,12 +246,32 @@ out:
 	mutex_unlock(&list_lock);
 	return ret;
 }
+EXPORT_SYMBOL(xen_alloc_unpopulated_pages_node);
+
+/**
+ * xen_alloc_unpopulated_pages - alloc unpopulated pages
+ * @nr_pages: Number of pages
+ * @pages: pages returned
+ * @return 0 on success, error otherwise
+ *
+ * Equivalent to xen_alloc_unpopulated_pages_node() with the current
+ * CPU's node as the preference.
+ */
+int xen_alloc_unpopulated_pages(unsigned int nr_pages, struct page **pages)
+{
+	return xen_alloc_unpopulated_pages_node(nr_pages, pages, numa_node_id());
+}
 EXPORT_SYMBOL(xen_alloc_unpopulated_pages);
 
 /**
  * xen_free_unpopulated_pages - return unpopulated pages
  * @nr_pages: Number of pages
  * @pages: pages to return
+ *
+ * Each page returns to the pool of the node it was originally allocated
+ * from, identified via page_to_nid().  Sections registered to a
+ * specific node yield pages whose nid reflects that node, so freed
+ * pages naturally land back in the matching list.
  */
 void xen_free_unpopulated_pages(unsigned int nr_pages, struct page **pages)
 {
@@ -225,9 +284,11 @@ void xen_free_unpopulated_pages(unsigned int nr_pages, struct page **pages)
 
 	mutex_lock(&list_lock);
 	for (i = 0; i < nr_pages; i++) {
-		pages[i]->zone_device_data = page_list;
-		page_list = pages[i];
-		list_count++;
+		int node = xen_unpopulated_clamp_node(page_to_nid(pages[i]));
+
+		pages[i]->zone_device_data = page_list[node];
+		page_list[node] = pages[i];
+		list_count[node]++;
 	}
 	mutex_unlock(&list_lock);
 }
