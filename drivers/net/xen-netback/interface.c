@@ -31,6 +31,7 @@
 #include "common.h"
 
 #include <linux/kthread.h>
+#include <linux/numa.h>
 #include <linux/sched/task.h>
 #include <linux/ethtool.h>
 #include <linux/rtnetlink.h>
@@ -638,19 +639,41 @@ int xenvif_connect_ctrl(struct xenvif *vif, grant_ref_t ring_ref,
 	if (req_prod - rsp_prod > RING_SIZE(&vif->ctrl))
 		goto err_unmap;
 
-	err = bind_interdomain_evtchn_to_irq_lateeoi(xendev, evtchn);
-	if (err < 0)
-		goto err_unmap;
+	{
+		/*
+		 * Resolve the host node before binding the IRQ so the
+		 * desc itself is allocated on the right node (which is
+		 * what irqbalance reads from /proc/irq/N/node when
+		 * deciding affinity).  Steer the threaded IRQ handler
+		 * toward the same node with irq_set_affinity_and_hint so
+		 * a fresh boot without irqbalance also routes correctly.
+		 * Operator writes to /proc/irq/N/smp_affinity still win.
+		 */
+		int node = xenbus_ring_host_node(xendev, vif->ctrl.sring);
 
-	vif->ctrl_irq = err;
+		err = bind_interdomain_evtchn_to_irq_lateeoi_on_node(xendev,
+								     evtchn,
+								     node);
+		if (err < 0)
+			goto err_unmap;
 
-	xenvif_init_hash(vif);
+		vif->ctrl_irq = err;
 
-	err = request_threaded_irq(vif->ctrl_irq, NULL, xenvif_ctrl_irq_fn,
-				   IRQF_ONESHOT, "xen-netback-ctrl", vif);
-	if (err) {
-		pr_warn("Could not setup irq handler for %s\n", dev->name);
-		goto err_deinit;
+		xenvif_init_hash(vif);
+
+		err = request_threaded_irq(vif->ctrl_irq, NULL,
+					   xenvif_ctrl_irq_fn,
+					   IRQF_ONESHOT,
+					   "xen-netback-ctrl", vif);
+		if (err) {
+			pr_warn("Could not setup irq handler for %s\n",
+				dev->name);
+			goto err_deinit;
+		}
+
+		if (node != NUMA_NO_NODE)
+			irq_set_affinity_and_hint(vif->ctrl_irq,
+						  cpumask_of_node(node));
 	}
 
 	return 0;
@@ -686,6 +709,11 @@ static void xenvif_disconnect_queue(struct xenvif_queue *queue)
 	}
 
 	if (queue->tx_irq) {
+		/*
+		 * free_irq() warns if affinity_hint is still set.  Drop the
+		 * hint installed at connect time before tearing the IRQ down.
+		 */
+		irq_update_affinity_hint(queue->tx_irq, NULL);
 		unbind_from_irqhandler(queue->tx_irq, queue);
 		if (queue->tx_irq == queue->rx_irq)
 			queue->rx_irq = 0;
@@ -693,6 +721,7 @@ static void xenvif_disconnect_queue(struct xenvif_queue *queue)
 	}
 
 	if (queue->rx_irq) {
+		irq_update_affinity_hint(queue->rx_irq, NULL);
 		unbind_from_irqhandler(queue->rx_irq, queue);
 		queue->rx_irq = 0;
 	}
@@ -708,6 +737,7 @@ int xenvif_connect_data(struct xenvif_queue *queue,
 {
 	struct xenbus_device *dev = xenvif_to_xenbus_device(queue->vif);
 	struct task_struct *task;
+	int ring_node;
 	int err;
 
 	BUG_ON(queue->tx_irq);
@@ -719,6 +749,16 @@ int xenvif_connect_data(struct xenvif_queue *queue,
 	if (err < 0)
 		goto err;
 
+	/*
+	 * Place the per-queue kthreads and IRQs on the host node hosting
+	 * the ring page.  Most of the per-packet work touches the ring;
+	 * keeping the worker local cuts cross-node interconnect traffic.
+	 * Returns NUMA_NO_NODE on hypervisors without XENMEM_get_mfn_pxms
+	 * or on a kernel built without CONFIG_XEN_BACKEND_NUMA_AFFINITY,
+	 * in which case the code below falls back to today's behaviour.
+	 */
+	ring_node = xenbus_ring_host_node(dev, queue->tx.sring);
+
 	init_waitqueue_head(&queue->wq);
 	init_waitqueue_head(&queue->dealloc_wq);
 	atomic_set(&queue->inflight_packets, 0);
@@ -727,8 +767,14 @@ int xenvif_connect_data(struct xenvif_queue *queue,
 
 	queue->stalled = true;
 
-	task = kthread_run(xenvif_kthread_guest_rx, queue,
-			   "%s-guest-rx", queue->name);
+	/*
+	 * Split kthread create + wake so the task_struct (and its kernel
+	 * stack) is allocated on the target node from the start.  A bare
+	 * set_cpus_allowed_ptr after kthread_run leaves the stack on the
+	 * caller's node.
+	 */
+	task = kthread_create_on_node(xenvif_kthread_guest_rx, queue,
+				      ring_node, "%s-guest-rx", queue->name);
 	if (IS_ERR(task))
 		goto kthread_err;
 	queue->task = task;
@@ -737,43 +783,58 @@ int xenvif_connect_data(struct xenvif_queue *queue,
 	 * if the thread function returns before kthread_stop is called.
 	 */
 	get_task_struct(task);
+	if (ring_node != NUMA_NO_NODE)
+		set_cpus_allowed_ptr(task, cpumask_of_node(ring_node));
+	wake_up_process(task);
 
-	task = kthread_run(xenvif_dealloc_kthread, queue,
-			   "%s-dealloc", queue->name);
+	task = kthread_create_on_node(xenvif_dealloc_kthread, queue,
+				      ring_node, "%s-dealloc", queue->name);
 	if (IS_ERR(task))
 		goto kthread_err;
 	queue->dealloc_task = task;
+	if (ring_node != NUMA_NO_NODE)
+		set_cpus_allowed_ptr(task, cpumask_of_node(ring_node));
+	wake_up_process(task);
 
 	if (tx_evtchn == rx_evtchn) {
 		/* feature-split-event-channels == 0 */
-		err = bind_interdomain_evtchn_to_irqhandler_lateeoi(
+		err = bind_interdomain_evtchn_to_irqhandler_lateeoi_on_node(
 			dev, tx_evtchn, xenvif_interrupt, 0,
-			queue->name, queue);
+			queue->name, queue, ring_node);
 		if (err < 0)
 			goto err;
 		queue->tx_irq = queue->rx_irq = err;
 		disable_irq(queue->tx_irq);
+		if (ring_node != NUMA_NO_NODE)
+			irq_set_affinity_and_hint(queue->tx_irq,
+						  cpumask_of_node(ring_node));
 	} else {
 		/* feature-split-event-channels == 1 */
 		snprintf(queue->tx_irq_name, sizeof(queue->tx_irq_name),
 			 "%s-tx", queue->name);
-		err = bind_interdomain_evtchn_to_irqhandler_lateeoi(
+		err = bind_interdomain_evtchn_to_irqhandler_lateeoi_on_node(
 			dev, tx_evtchn, xenvif_tx_interrupt, 0,
-			queue->tx_irq_name, queue);
+			queue->tx_irq_name, queue, ring_node);
 		if (err < 0)
 			goto err;
 		queue->tx_irq = err;
 		disable_irq(queue->tx_irq);
+		if (ring_node != NUMA_NO_NODE)
+			irq_set_affinity_and_hint(queue->tx_irq,
+						  cpumask_of_node(ring_node));
 
 		snprintf(queue->rx_irq_name, sizeof(queue->rx_irq_name),
 			 "%s-rx", queue->name);
-		err = bind_interdomain_evtchn_to_irqhandler_lateeoi(
+		err = bind_interdomain_evtchn_to_irqhandler_lateeoi_on_node(
 			dev, rx_evtchn, xenvif_rx_interrupt, 0,
-			queue->rx_irq_name, queue);
+			queue->rx_irq_name, queue, ring_node);
 		if (err < 0)
 			goto err;
 		queue->rx_irq = err;
 		disable_irq(queue->rx_irq);
+		if (ring_node != NUMA_NO_NODE)
+			irq_set_affinity_and_hint(queue->rx_irq,
+						  cpumask_of_node(ring_node));
 	}
 
 	return 0;
@@ -820,6 +881,7 @@ void xenvif_disconnect_ctrl(struct xenvif *vif)
 {
 	if (vif->ctrl_irq) {
 		xenvif_deinit_hash(vif);
+		irq_update_affinity_hint(vif->ctrl_irq, NULL);
 		unbind_from_irqhandler(vif->ctrl_irq, vif);
 		vif->ctrl_irq = 0;
 	}
