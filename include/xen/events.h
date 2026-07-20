@@ -18,6 +18,7 @@ unsigned xen_evtchn_nr_channels(void);
 
 int bind_evtchn_to_irq(evtchn_port_t evtchn);
 int bind_evtchn_to_irq_lateeoi(evtchn_port_t evtchn);
+int bind_evtchn_to_irq_lateeoi_on_node(evtchn_port_t evtchn, int node);
 int bind_evtchn_to_irqhandler(evtchn_port_t evtchn,
 			      irq_handler_t handler,
 			      unsigned long irqflags, const char *devname,
@@ -26,6 +27,10 @@ int bind_evtchn_to_irqhandler_lateeoi(evtchn_port_t evtchn,
 			      irq_handler_t handler,
 			      unsigned long irqflags, const char *devname,
 			      void *dev_id);
+int bind_evtchn_to_irqhandler_lateeoi_on_node(evtchn_port_t evtchn,
+			      irq_handler_t handler,
+			      unsigned long irqflags, const char *devname,
+			      void *dev_id, int node);
 int bind_virq_to_irq(unsigned int virq, unsigned int cpu, bool percpu);
 int bind_virq_to_irqhandler(unsigned int virq, unsigned int cpu,
 			    irq_handler_t handler,
@@ -39,12 +44,22 @@ int bind_ipi_to_irqhandler(enum ipi_vector ipi,
 			   void *dev_id);
 int bind_interdomain_evtchn_to_irq_lateeoi(struct xenbus_device *dev,
 					   evtchn_port_t remote_port);
+int bind_interdomain_evtchn_to_irq_lateeoi_on_node(struct xenbus_device *dev,
+						   evtchn_port_t remote_port,
+						   int node);
 int bind_interdomain_evtchn_to_irqhandler_lateeoi(struct xenbus_device *dev,
 						  evtchn_port_t remote_port,
 						  irq_handler_t handler,
 						  unsigned long irqflags,
 						  const char *devname,
 						  void *dev_id);
+int bind_interdomain_evtchn_to_irqhandler_lateeoi_on_node(
+					struct xenbus_device *dev,
+					evtchn_port_t remote_port,
+					irq_handler_t handler,
+					unsigned long irqflags,
+					const char *devname,
+					void *dev_id, int node);
 
 /*
  * Common unbind function for all event sources. Takes IRQ to unbind from.
