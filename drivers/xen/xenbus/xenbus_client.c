@@ -31,6 +31,7 @@
  */
 
 #include <linux/mm.h>
+#include <linux/nodemask.h>
 #include <linux/numa.h>
 #include <linux/slab.h>
 #include <linux/types.h>
@@ -383,32 +384,102 @@ static void xenbus_switch_fatal(struct xenbus_device *dev, int depth, int err,
 }
 
 /*
- * xenbus_setup_ring
+ * xenbus_setup_ring_node
  * @dev: xenbus device
+ * @gfp: GFP flags for the allocation
+ * @node: preferred Linux node id for the ring pages, or NUMA_NO_NODE
  * @vaddr: pointer to starting virtual address of the ring
  * @nr_pages: number of pages to be granted
  * @grefs: grant reference array to be filled in
  *
- * Allocate physically contiguous pages for a shared ring buffer and grant it
- * to the peer of the given device. The ring buffer is initially filled with
- * zeroes. The virtual address of the ring is stored at @vaddr and the
- * grant references are stored in the @grefs array. In case of error @vaddr
- * will be set to NULL and @grefs will be filled with INVALID_GRANT_REF.
+ * Same contract as xenbus_setup_ring(), but the ring pages are drawn
+ * from @node's buddy free list when possible (subject to fallback when
+ * @node has no available memory).  All pages of a single ring come
+ * from one buddy allocation so they remain on a single node by
+ * construction, which is the property frontends rely on to keep
+ * per-queue rings on per-queue nodes.
+ *
+ * The ring buffer is initially filled with zeroes.  The virtual address
+ * of the ring is stored at @vaddr and the grant references are stored
+ * in the @grefs array.  In case of error @vaddr will be set to NULL and
+ * @grefs will be filled with INVALID_GRANT_REF.
  */
-int xenbus_setup_ring(struct xenbus_device *dev, gfp_t gfp, void **vaddr,
-		      unsigned int nr_pages, grant_ref_t *grefs)
+/*
+ * Pick a Linux node id from the set of nodes with online CPUs, cycling
+ * by @index.  Frontends use this to distribute per-queue rings across
+ * guest NUMA nodes so the dom0 backend's per-ring placement lands them
+ * on distinct host nodes.
+ *
+ * cpumask_local_spread(i, NUMA_NO_NODE) is the natural shape this code
+ * wants, but with a NUMA_NO_NODE node argument it falls back to a
+ * straight linear walk of cpu_online_mask (see sched_numa_find_nth_cpu)
+ * which collapses every queue onto the first node's CPUs.  This helper
+ * actually rotates over nodes.
+ */
+int xenbus_node_for_queue(unsigned int index)
+{
+	unsigned int idx = 0;
+	unsigned int n;
+	int node;
+
+	n = num_node_state(N_CPU);
+	if (n == 0)
+		return NUMA_NO_NODE;
+
+	index %= n;
+	for_each_node_state(node, N_CPU) {
+		if (idx == index)
+			return node;
+		idx++;
+	}
+	return NUMA_NO_NODE;
+}
+EXPORT_SYMBOL_GPL(xenbus_node_for_queue);
+
+int xenbus_setup_ring_node(struct xenbus_device *dev, gfp_t gfp, int node,
+			   void **vaddr, unsigned int nr_pages,
+			   grant_ref_t *grefs)
 {
 	unsigned long ring_size = nr_pages * XEN_PAGE_SIZE;
+	unsigned int order;
+	unsigned long nr_alloc;
+	struct page *page;
 	grant_ref_t gref_head;
 	unsigned int i;
 	void *addr;
 	int ret;
 
-	addr = *vaddr = alloc_pages_exact(ring_size, gfp | __GFP_ZERO);
-	if (!*vaddr) {
+	*vaddr = NULL;
+
+	/*
+	 * Mirror the GFP filtering that alloc_pages_exact() does
+	 * internally: split_page() below requires a non-compound page
+	 * and HIGHMEM is incompatible with the direct virt mapping used
+	 * by the grant code.
+	 */
+	gfp &= ~(__GFP_COMP | __GFP_HIGHMEM);
+
+	order = get_order(ring_size);
+	page = alloc_pages_node(node, gfp | __GFP_ZERO, order);
+	if (!page) {
 		ret = -ENOMEM;
 		goto err;
 	}
+
+	/*
+	 * alloc_pages_node returns a single order-N block where only
+	 * the head is refcounted.  split_page makes every subpage
+	 * individually refcounted so free_pages_exact() can release the
+	 * ring page-by-page.  Return any tail pages beyond ring_size to
+	 * the allocator immediately.
+	 */
+	split_page(page, order);
+	nr_alloc = 1UL << order;
+	for (i = DIV_ROUND_UP(ring_size, PAGE_SIZE); i < nr_alloc; i++)
+		__free_page(page + i);
+
+	addr = page_address(page);
+	*vaddr = addr;
 
 	ret = gnttab_alloc_grant_references(nr_pages, &gref_head);
 	if (ret) {
@@ -442,6 +513,20 @@ int xenbus_setup_ring(struct xenbus_device *dev, gfp_t gfp, void **vaddr,
 	*vaddr = NULL;
 
 	return ret;
+}
+EXPORT_SYMBOL_GPL(xenbus_setup_ring_node);
+
+/*
+ * xenbus_setup_ring
+ *
+ * Equivalent to xenbus_setup_ring_node() with no node preference; the
+ * pages come from the current CPU's local node by default GFP policy.
+ */
+int xenbus_setup_ring(struct xenbus_device *dev, gfp_t gfp, void **vaddr,
+		      unsigned int nr_pages, grant_ref_t *grefs)
+{
+	return xenbus_setup_ring_node(dev, gfp, NUMA_NO_NODE, vaddr, nr_pages,
+				      grefs);
 }
 EXPORT_SYMBOL_GPL(xenbus_setup_ring);
 
