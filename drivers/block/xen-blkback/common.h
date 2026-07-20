@@ -297,6 +297,13 @@ struct xen_blkif_ring {
 	/* Thread shutdown wait queue. */
 	wait_queue_head_t	shutdown_wq;
 	struct xen_blkif	*blkif;
+
+	/*
+	 * Linux node id of the host NUMA node hosting blk_ring, or
+	 * NUMA_NO_NODE if unknown.  Resolved at xen_blkif_map() time,
+	 * consumed when starting the per-ring xenblkd kthread.
+	 */
+	int			host_node;
 };
 
 struct xen_blkif {
