@@ -216,6 +216,10 @@ int xenbus_watch_pathfmt(struct xenbus_device *dev, struct xenbus_watch *watch,
 			 const char *pathfmt, ...);
 
 int xenbus_switch_state(struct xenbus_device *dev, enum xenbus_state new_state);
+int xenbus_node_for_queue(unsigned int index);
+int xenbus_setup_ring_node(struct xenbus_device *dev, gfp_t gfp, int node,
+			   void **vaddr, unsigned int nr_pages,
+			   grant_ref_t *grefs);
 int xenbus_setup_ring(struct xenbus_device *dev, gfp_t gfp, void **vaddr,
 		      unsigned int nr_pages, grant_ref_t *grefs);
 void xenbus_teardown_ring(void **vaddr, unsigned int nr_pages,
