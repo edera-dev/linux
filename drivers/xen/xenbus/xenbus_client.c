@@ -31,15 +31,18 @@
  */
 
 #include <linux/mm.h>
+#include <linux/numa.h>
 #include <linux/slab.h>
 #include <linux/types.h>
 #include <linux/spinlock.h>
 #include <linux/vmalloc.h>
 #include <linux/export.h>
+#include <asm/xen/hypercall.h>
 #include <asm/xen/hypervisor.h>
 #include <xen/page.h>
 #include <xen/interface/xen.h>
 #include <xen/interface/event_channel.h>
+#include <xen/interface/memory.h>
 #include <xen/balloon.h>
 #include <xen/events.h>
 #include <xen/grant_table.h>
@@ -674,6 +677,7 @@ static int xenbus_map_ring_hvm(struct xenbus_device *dev,
 {
 	struct xenbus_map_node *node = info->node;
 	int err;
+	int host_node = NUMA_NO_NODE;
 	void *addr;
 	bool leaked = false;
 	unsigned int nr_pages = XENBUS_PAGES(nr_grefs);
@@ -692,6 +696,75 @@ static int xenbus_map_ring_hvm(struct xenbus_device *dev,
 
 	if (err)
 		goto out_free_ballooned_pages;
+
+	/*
+	 * Xen fills dev_bus_addr with the foreign frame's machine
+	 * address on a successful host_map (see grant_table.c in the
+	 * hypervisor).  Resolve the host node now so we know whether the
+	 * placeholders need to be relocated below.
+	 */
+	if (nr_grefs > 0)
+		host_node = xen_mfn_to_node(
+			PFN_DOWN(info->map[0].dev_bus_addr));
+
+	/*
+	 * Placeholder pages came from numa_node_id()'s pool, which only
+	 * matches the foreign frame's node by coincidence.  If they
+	 * disagree, drop the mapping, return the placeholders, and redo
+	 * the map with placeholders drawn from the correct pool.  After
+	 * this, page_to_nid() of every ring page equals the host node of
+	 * its foreign MFN by construction, which keeps grant-mapped pages
+	 * truthful to every NUMA-aware code path that consults page_to_nid.
+	 *
+	 * The cost is one extra grant unmap + map pair per backend
+	 * connect (a rare event) and is paid only when the placeholder
+	 * pool's node disagrees with the foreign frame.  PV mappings and
+	 * cases where Xen cannot supply node info skip the dance entirely.
+	 */
+	if (host_node != NUMA_NO_NODE &&
+	    page_to_nid(node->hvm.pages[0]) != host_node) {
+		int relocate_err;
+
+		relocate_err = xenbus_unmap_ring(dev, node->handles, nr_grefs,
+						 info->addrs);
+		if (relocate_err != GNTST_okay) {
+			/*
+			 * Partial unmap: at least one grant may still be
+			 * live against a placeholder we can no longer
+			 * reach safely.  Mark the pages leaked and fail
+			 * the whole map.
+			 */
+			leaked = true;
+			err = -EIO;
+			goto out_free_ballooned_pages;
+		}
+
+		xen_free_unpopulated_pages(nr_pages, node->hvm.pages);
+
+		err = xen_alloc_unpopulated_pages_node(nr_pages,
+						       node->hvm.pages,
+						       host_node);
+		if (err) {
+			/*
+			 * Pages already gone; clear the array so the
+			 * cleanup path does not try to free them again.
+			 */
+			memset(node->hvm.pages, 0,
+			       nr_pages * sizeof(*node->hvm.pages));
+			node->nr_handles = 0;
+			goto out_err;
+		}
+
+		info->idx = 0;
+		gnttab_foreach_grant(node->hvm.pages, nr_grefs,
+				     xenbus_map_ring_setup_grant_hvm,
+				     info);
+
+		err = __xenbus_map_ring(dev, gnt_ref, nr_grefs, node->handles,
+					info, GNTMAP_host_map, &leaked);
+		if (err)
+			goto out_free_ballooned_pages;
+	}
 
 	addr = vmap(node->hvm.pages, nr_pages, VM_MAP | VM_IOREMAP,
 		    PAGE_KERNEL);
@@ -742,6 +815,29 @@ int xenbus_unmap_ring_vfree(struct xenbus_device *dev, void *vaddr)
 	return ring_ops->unmap(dev, vaddr);
 }
 EXPORT_SYMBOL_GPL(xenbus_unmap_ring_vfree);
+
+int xenbus_ring_host_node(struct xenbus_device *dev, void *vaddr)
+{
+	struct page *page;
+
+	/*
+	 * PV mappings install foreign MFNs directly in the PTEs and have
+	 * no struct page in dom0's mem_map for the foreign frame.  PVH
+	 * dom0 keeps a placeholder struct page (allocated from the
+	 * matching per-node pool of xen_alloc_unpopulated_pages_node)
+	 * whose page_to_nid() reports the host node of the foreign frame
+	 * by construction.
+	 */
+	if (xen_pv_domain())
+		return NUMA_NO_NODE;
+
+	page = vmalloc_to_page(vaddr);
+	if (!page)
+		return NUMA_NO_NODE;
+
+	return page_to_nid(page);
+}
+EXPORT_SYMBOL_GPL(xenbus_ring_host_node);
 
 #ifdef CONFIG_XEN_PV
 static int map_ring_apply(pte_t *pte, unsigned long addr, void *data)
