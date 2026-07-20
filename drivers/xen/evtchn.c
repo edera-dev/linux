@@ -189,8 +189,37 @@ static irqreturn_t evtchn_interrupt(int irq, void *data)
 			kill_fasync(&u->evtchn_async_queue,
 				    SIGIO, POLL_IN);
 		}
-	} else
+	} else {
+		unsigned int cons_now;
+
+		/*
+		 * Diagnostic: the READ_ONCE of ring_cons above has no
+		 * acquire pairing with the WRITE_ONCE in evtchn_read --
+		 * the producer holds ring_prod_lock and the consumer
+		 * holds ring_cons_mutex, so they don't synchronize on
+		 * ring_cons.  On weakly-ordered hardware (and within
+		 * the x86 store-buffer drain window) the producer can
+		 * observe a stale ring_cons and conclude the ring is
+		 * full when it actually has room.  Re-read with a full
+		 * barrier before declaring overflow and tag the log as
+		 * SPURIOUS when the post-barrier read shows the ring
+		 * had room -- that pins the cause on the cons
+		 * visibility race rather than a real fill-to-capacity
+		 * or a broken per-port masking invariant.
+		 */
+		smp_mb();
+		cons_now = READ_ONCE(u->ring_cons);
+
+		pr_warn_ratelimited(
+			"xen-evtchn overflow on %s: port=%u prod=%u cons=%u cons_after_mb=%u depth=%u depth_after_mb=%u ring_size=%u nr_evtchns=%u enabled=%d unbinding=%d%s\n",
+			u->name, evtchn->port, prod, cons, cons_now,
+			prod - cons, prod - cons_now,
+			u->ring_size, u->nr_evtchns,
+			(int)evtchn->enabled, (int)evtchn->unbinding,
+			(prod - cons_now) < u->ring_size ? " SPURIOUS" : "");
+
 		u->ring_overflow = 1;
+	}
 
 	spin_unlock(&u->ring_prod_lock);
 
