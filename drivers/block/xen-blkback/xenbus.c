@@ -10,6 +10,7 @@
 
 #include <linux/module.h>
 #include <linux/kthread.h>
+#include <linux/numa.h>
 #include <linux/pagemap.h>
 #include <xen/events.h>
 #include <xen/grant_table.h>
@@ -108,7 +109,17 @@ static void xen_update_blkif_status(struct xen_blkif *blkif)
 
 	for (i = 0; i < blkif->nr_rings; i++) {
 		ring = &blkif->rings[i];
-		ring->xenblkd = kthread_run(xen_blkif_schedule, ring, "%s-%d", name, i);
+		/*
+		 * Allocate the task_struct (including its kernel stack) on
+		 * the node hosting the ring so that subsequent kernel-mode
+		 * accesses on this thread stay local.  set_cpus_allowed_ptr
+		 * after kthread_create_on_node hard-pins to that node's CPUs;
+		 * an operator may still override with taskset.  NUMA_NO_NODE
+		 * leaves placement to the default scheduler.
+		 */
+		ring->xenblkd = kthread_create_on_node(xen_blkif_schedule, ring,
+						       ring->host_node,
+						       "%s-%d", name, i);
 		if (IS_ERR(ring->xenblkd)) {
 			err = PTR_ERR(ring->xenblkd);
 			ring->xenblkd = NULL;
@@ -116,6 +127,10 @@ static void xen_update_blkif_status(struct xen_blkif *blkif)
 					"start %s-%d xenblkd", name, i);
 			goto out;
 		}
+		if (ring->host_node != NUMA_NO_NODE)
+			set_cpus_allowed_ptr(ring->xenblkd,
+					     cpumask_of_node(ring->host_node));
+		wake_up_process(ring->xenblkd);
 	}
 	return;
 
@@ -150,6 +165,7 @@ static int xen_blkif_alloc_rings(struct xen_blkif *blkif)
 		init_waitqueue_head(&ring->pending_free_wq);
 		init_waitqueue_head(&ring->shutdown_wq);
 		ring->blkif = blkif;
+		ring->host_node = NUMA_NO_NODE;
 		ring->st_print = jiffies;
 		ring->active = true;
 	}
@@ -207,6 +223,15 @@ static int xen_blkif_map(struct xen_blkif_ring *ring, grant_ref_t *gref,
 	if (err < 0)
 		return err;
 
+	/*
+	 * Stash the host node now while the mapping is fresh.  The
+	 * xenblkd kthread is created later from xen_update_blkif_status()
+	 * and consumes this value to place the worker on the node that
+	 * owns the ring.  NUMA_NO_NODE leaves placement to the default
+	 * scheduler.
+	 */
+	ring->host_node = xenbus_ring_host_node(blkif->be->dev, ring->blk_ring);
+
 	sring_common = (struct blkif_common_sring *)ring->blk_ring;
 	rsp_prod = READ_ONCE(sring_common->rsp_prod);
 	req_prod = READ_ONCE(sring_common->req_prod);
@@ -250,11 +275,22 @@ static int xen_blkif_map(struct xen_blkif_ring *ring, grant_ref_t *gref,
 	if (req_prod - rsp_prod > size)
 		goto fail;
 
-	err = bind_interdomain_evtchn_to_irqhandler_lateeoi(blkif->be->dev,
-			evtchn, xen_blkif_be_int, 0, "blkif-backend", ring);
+	err = bind_interdomain_evtchn_to_irqhandler_lateeoi_on_node(
+			blkif->be->dev, evtchn, xen_blkif_be_int, 0,
+			"blkif-backend", ring, ring->host_node);
 	if (err < 0)
 		goto fail;
 	ring->irq = err;
+
+	/*
+	 * Route the event channel toward the ring's host node.  Writes
+	 * both the actual affinity (relied on at boot when irqbalance is
+	 * absent) and the hint (so irqbalance agrees if it is running).
+	 * Operator writes to /proc/irq/N/smp_affinity still win.
+	 */
+	if (ring->host_node != NUMA_NO_NODE)
+		irq_set_affinity_and_hint(ring->irq,
+					  cpumask_of_node(ring->host_node));
 
 	return 0;
 
@@ -293,6 +329,12 @@ static int xen_blkif_disconnect(struct xen_blkif *blkif)
 		}
 
 		if (ring->irq) {
+			/*
+			 * free_irq() warns if affinity_hint is still set.
+			 * Drop the hint installed at map time before tearing
+			 * the IRQ down.
+			 */
+			irq_update_affinity_hint(ring->irq, NULL);
 			unbind_from_irqhandler(ring->irq, ring);
 			ring->irq = 0;
 		}
