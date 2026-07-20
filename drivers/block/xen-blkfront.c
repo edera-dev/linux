@@ -35,12 +35,14 @@
  * IN THE SOFTWARE.
  */
 
+#include <linux/cpumask.h>
 #include <linux/interrupt.h>
 #include <linux/blkdev.h>
 #include <linux/blk-mq.h>
 #include <linux/hdreg.h>
 #include <linux/cdrom.h>
 #include <linux/module.h>
+#include <linux/numa.h>
 #include <linux/slab.h>
 #include <linux/major.h>
 #include <linux/mutex.h>
@@ -1293,8 +1295,14 @@ free_shadow:
 	xenbus_teardown_ring((void **)&rinfo->ring.sring, info->nr_ring_pages,
 			     rinfo->ring_ref);
 
-	if (rinfo->irq)
+	if (rinfo->irq) {
+		/*
+		 * free_irq() warns if affinity_hint is still set.  Drop the
+		 * hint installed at setup time before tearing the IRQ down.
+		 */
+		irq_update_affinity_hint(rinfo->irq, NULL);
 		unbind_from_irqhandler(rinfo->irq, rinfo);
+	}
 	rinfo->evtchn = rinfo->irq = 0;
 }
 
@@ -1684,9 +1692,29 @@ static int setup_blkring(struct xenbus_device *dev,
 	int err;
 	struct blkfront_info *info = rinfo->dev_info;
 	unsigned long ring_size = info->nr_ring_pages * XEN_PAGE_SIZE;
+	unsigned int ring_idx;
+	int node;
 
-	err = xenbus_setup_ring(dev, GFP_NOIO, (void **)&sring,
-				info->nr_ring_pages, rinfo->ring_ref);
+	/*
+	 * Recover the ring index from its slot in info->rinfo.  The same
+	 * arithmetic is used by get_rinfo() and for_each_rinfo() (the
+	 * struct has a flex array so sizeof() is not the stride).
+	 */
+	ring_idx = ((unsigned long)rinfo - (unsigned long)info->rinfo) /
+		   info->rinfo_size;
+
+	/*
+	 * Distribute rings across guest NUMA nodes by rotating over
+	 * nodes-with-CPUs.  blk-mq's default hctx-to-CPU map is also
+	 * NUMA-balanced (blk_mq_map_queues uses NUMA-aware distribution
+	 * when topology is present), so a submitter on a node-N CPU
+	 * lands on the hctx whose ring is on node N.  No XPS-equivalent
+	 * steering needed on the block side -- blk-mq already does it.
+	 */
+	node = xenbus_node_for_queue(ring_idx);
+
+	err = xenbus_setup_ring_node(dev, GFP_NOIO, node, (void **)&sring,
+				     info->nr_ring_pages, rinfo->ring_ref);
 	if (err)
 		goto fail;
 
@@ -1696,14 +1724,29 @@ static int setup_blkring(struct xenbus_device *dev,
 	if (err)
 		goto fail;
 
-	err = bind_evtchn_to_irqhandler_lateeoi(rinfo->evtchn, blkif_interrupt,
-						0, "blkif", rinfo);
+	err = bind_evtchn_to_irqhandler_lateeoi_on_node(rinfo->evtchn,
+							blkif_interrupt, 0,
+							"blkif", rinfo, node);
 	if (err <= 0) {
 		xenbus_dev_fatal(dev, err,
 				 "bind_evtchn_to_irqhandler failed");
 		goto fail;
 	}
 	rinfo->irq = err;
+
+	/*
+	 * Route the ring's evtchn IRQ toward the same node the ring
+	 * lives on.  blk-mq completes requests on the submitting CPU
+	 * via the request_irq path; firing the IRQ on the ring's node
+	 * keeps the wake-up on the right node before blk-mq routes the
+	 * completion onward.  Sets both actual affinity and hint.
+	 */
+	if (node != NUMA_NO_NODE) {
+		const struct cpumask *mask = cpumask_of_node(node);
+
+		if (!cpumask_empty(mask))
+			irq_set_affinity_and_hint(rinfo->irq, mask);
+	}
 
 	return 0;
 fail:
