@@ -89,6 +89,22 @@ static inline void xen_free_unpopulated_pages(unsigned int nr_pages,
 }
 #endif
 
+/*
+ * Resolve a foreign frame's host MFN to the Linux node id of the memory
+ * backing it, via XENMEM_get_mfn_pxms.  NUMA_NO_NODE for any failure
+ * mode (hypercall unsupported or refused, MFN unknown to Xen, PXM not
+ * in the ACPI namespace) -- callers degrade to node-oblivious behaviour.
+ */
+#include <linux/numa.h>
+#ifdef CONFIG_XEN_BACKEND_NUMA_AFFINITY
+int xen_mfn_to_node(unsigned long mfn);
+#else
+static inline int xen_mfn_to_node(unsigned long mfn)
+{
+	return NUMA_NO_NODE;
+}
+#endif
+
 #if defined(CONFIG_XEN_DOM0) && defined(CONFIG_ACPI) && defined(CONFIG_X86)
 bool __init xen_processor_present(uint32_t acpi_id);
 #else
