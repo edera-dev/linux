@@ -969,15 +969,23 @@ EXPORT_SYMBOL_GPL(xen_mfn_to_node);
 #endif /* CONFIG_XEN_BACKEND_NUMA_AFFINITY */
 
 /**
- * gnttab_alloc_pages - alloc pages suitable for grant mapping into
+ * gnttab_alloc_pages_node - alloc pages suitable for grant mapping into,
+ * drawn from a specific NUMA node's placeholder pool
  * @nr_pages: number of pages to alloc
  * @pages: returns the pages
+ * @node: node to draw the pages from, or NUMA_NO_NODE for the caller's
+ * local node
+ *
+ * A caller that knows the host node of the foreign frames it is about
+ * to map can request placeholders whose page_to_nid() matches; the
+ * generic gnttab_alloc_pages() below has no such knowledge and settles
+ * for the local node.
  */
-int gnttab_alloc_pages(int nr_pages, struct page **pages)
+int gnttab_alloc_pages_node(int nr_pages, struct page **pages, int node)
 {
 	int ret;
 
-	ret = xen_alloc_unpopulated_pages(nr_pages, pages);
+	ret = xen_alloc_unpopulated_pages_node(nr_pages, pages, node);
 	if (ret < 0)
 		return ret;
 
@@ -986,6 +994,17 @@ int gnttab_alloc_pages(int nr_pages, struct page **pages)
 		gnttab_free_pages(nr_pages, pages);
 
 	return ret;
+}
+EXPORT_SYMBOL_GPL(gnttab_alloc_pages_node);
+
+/**
+ * gnttab_alloc_pages - alloc pages suitable for grant mapping into
+ * @nr_pages: number of pages to alloc
+ * @pages: returns the pages
+ */
+int gnttab_alloc_pages(int nr_pages, struct page **pages)
+{
+	return gnttab_alloc_pages_node(nr_pages, pages, NUMA_NO_NODE);
 }
 EXPORT_SYMBOL_GPL(gnttab_alloc_pages);
 
