@@ -993,7 +993,7 @@ void netvsc_dma_unmap(struct hv_device *hv_dev,
 {
 	int i;
 
-	if (!hv_is_isolation_supported())
+	if (!hv_is_isolation_supported() && !hyperv_nested_on_xen)
 		return;
 
 	if (!packet->dma_range)
@@ -1033,7 +1033,12 @@ static int netvsc_dma_map(struct hv_device *hv_dev,
 	dma_addr_t dma;
 	int i;
 
-	if (!hv_is_isolation_supported())
+	/*
+	 * A Xen PV dom0 nested under Hyper-V must also DMA-map packet pages so
+	 * the host receives machine (bus) addresses (via swiotlb-xen), not the
+	 * guest's pseudo-physical PFNs.
+	 */
+	if (!hv_is_isolation_supported() && !hyperv_nested_on_xen)
 		return 0;
 
 	packet->dma_range = kcalloc(page_count,
