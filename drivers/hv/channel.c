@@ -114,7 +114,12 @@ static inline u64 hv_gpadl_hvpfn(enum hv_gpadl_type type, void *kbuffer,
 		break;
 	}
 
-	return virt_to_hvpfn(kbuffer + delta + (HV_HYP_PAGE_SIZE * i));
+	/*
+	 * The host consumes these as machine (L1-physical) frames; on a Xen PV
+	 * dom0 that differs from the guest pseudo-physical frame.
+	 */
+	return hv_nested_hostpfn(virt_to_hvpfn(kbuffer + delta +
+					       (HV_HYP_PAGE_SIZE * i)));
 }
 
 /*
