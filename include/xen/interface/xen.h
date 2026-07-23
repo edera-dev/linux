@@ -102,6 +102,13 @@
 /* Architecture-specific VIRQ definitions. */
 #define VIRQ_ARCH_0    16
 #define VIRQ_ARCH_1    17
+/*
+ * Relayed Hyper-V VMBus synthetic interrupt, for a Xen dom0 running nested
+ * under Hyper-V: Xen owns the L0 SynIC and forwards VMBus messages to dom0 via
+ * this per-vcpu VIRQ.  Must match the Xen definition.  NB: VIRQ_ARCH_0 is
+ * VIRQ_MCA (used by xen_mcelog), so VMBus uses VIRQ_ARCH_1.
+ */
+#define VIRQ_HYPERV_VMBUS VIRQ_ARCH_1
 #define VIRQ_ARCH_2    18
 #define VIRQ_ARCH_3    19
 #define VIRQ_ARCH_4    20
