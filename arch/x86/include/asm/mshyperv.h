@@ -64,13 +64,39 @@ DECLARE_STATIC_CALL(hv_hypercall, hv_std_hypercall);
 #define HV_AP_SEGMENT_LIMIT		0xffffffff
 
 /*
+ * Nested Hyper-V-on-Xen host-address translation.  Shared include-guard with
+ * asm-generic/mshyperv.h so this is defined exactly once regardless of include
+ * order/arch.  A Xen PV dom0 nested under Hyper-V must hand the host machine
+ * (L1-physical) frames, not its own pseudo-physical frames.
+ */
+#ifndef __HV_NESTED_ON_XEN_DEFINED
+#define __HV_NESTED_ON_XEN_DEFINED
+#ifdef CONFIG_XEN_PV
+extern bool hyperv_nested_on_xen;
+unsigned long hv_nested_hostpfn(unsigned long pfn);
+u64 hv_nested_hostpa(void *va);
+void __init hyperv_init_nested_on_xen(void);
+int hyperv_setup_xen_vmbus_irq(void (*isr)(void));
+#else
+#define hyperv_nested_on_xen false
+/* Never called (the caller's hyperv_nested_on_xen test is a build-time false). */
+static inline unsigned long hv_nested_hostpfn(unsigned long pfn) { return pfn; }
+static inline u64 hv_nested_hostpa(void *va) { return 0; }
+static inline void hyperv_init_nested_on_xen(void) {}
+static inline int hyperv_setup_xen_vmbus_irq(void (*isr)(void)) { return -ENODEV; }
+#endif
+#endif /* __HV_NESTED_ON_XEN_DEFINED */
+
+/*
  * If the hypercall involves no input or output parameters, the hypervisor
  * ignores the corresponding GPA pointer.
  */
 static inline u64 hv_do_hypercall(u64 control, void *input, void *output)
 {
-	u64 input_address = input ? virt_to_phys(input) : 0;
-	u64 output_address = output ? virt_to_phys(output) : 0;
+	u64 input_address = input ?
+		(hyperv_nested_on_xen ? hv_nested_hostpa(input) : virt_to_phys(input)) : 0;
+	u64 output_address = output ?
+		(hyperv_nested_on_xen ? hv_nested_hostpa(output) : virt_to_phys(output)) : 0;
 
 #ifdef CONFIG_X86_64
 	return static_call_mod(hv_hypercall)(control, input_address, output_address);
