@@ -430,6 +430,18 @@ static void __init hv_stimer_setup_percpu_clockev(void)
 }
 
 /*
+ * True when running as a Xen PV dom0 that is itself nested under Hyper-V (L0).
+ * Set by the Xen guest code (arch/x86/xen/) after it detects the underlying
+ * Hyper-V.  In this mode Linux stays a Xen guest (x86_hyper_type == XEN_PV) but
+ * additionally brings up the VMBus stack to drive the L0 host's synthetic
+ * devices, with Xen proxying the Hyper-V enlightenments.
+ */
+#ifdef CONFIG_XEN_PV
+bool hyperv_nested_on_xen __ro_after_init;
+EXPORT_SYMBOL_GPL(hyperv_nested_on_xen);
+#endif
+
+/*
  * This function is to be invoked early in the boot sequence after the
  * hypervisor has been detected.
  *
@@ -608,6 +620,83 @@ common_free:
 }
 
 /*
+ * Minimal Hyper-V bring-up for a Xen PV dom0 nested under Hyper-V.
+ *
+ * Unlike hyperv_init(), this deliberately does NOT touch the APIC, timers, TSC
+ * reference page, PCI, syscore or isolation machinery -- Xen owns all of those
+ * for a PV guest.  We set up only what the VMBus stack needs: the per-cpu input
+ * pages (hv_common_init + hv_cpu_init via cpuhp), the guest OS id, and the
+ * hypercall page.  Xen intercepts the GUEST_OS_ID / HYPERCALL MSR writes and
+ * fills the hypercall page with its own trap stub, and proxies the SynIC MSRs
+ * that vmbus_bus_init() subsequently programs.
+ *
+ * Must run after cpuhp is up and before hv_acpi_init() (subsys_initcall).
+ */
+#ifdef CONFIG_XEN_PV
+void __init hyperv_init_nested_on_xen(void)
+{
+	union hv_x64_msr_hypercall_contents hypercall_msr;
+	u64 guest_id;
+
+	if (!hyperv_nested_on_xen)
+		return;
+
+	/* Extract the L0 host's features and hints (subset of ms_hyperv_init). */
+	ms_hyperv.features = cpuid_eax(HYPERV_CPUID_FEATURES);
+	ms_hyperv.priv_high = cpuid_ebx(HYPERV_CPUID_FEATURES);
+	ms_hyperv.ext_features = cpuid_ecx(HYPERV_CPUID_FEATURES);
+	ms_hyperv.misc_features = cpuid_edx(HYPERV_CPUID_FEATURES);
+	ms_hyperv.hints = cpuid_eax(HYPERV_CPUID_ENLIGHTMENT_INFO);
+	ms_hyperv.max_vp_index = cpuid_eax(HYPERV_CPUID_IMPLEMENT_LIMITS);
+	ms_hyperv.max_lp_index = cpuid_ebx(HYPERV_CPUID_IMPLEMENT_LIMITS);
+
+	if (hv_common_init())
+		return;
+
+	guest_id = hv_generate_guest_id(LINUX_VERSION_CODE);
+	wrmsrq(HV_X64_MSR_GUEST_OS_ID, guest_id);
+
+	hv_hypercall_pg = __vmalloc_node_range(PAGE_SIZE, 1, MODULES_VADDR,
+			MODULES_END, GFP_KERNEL, PAGE_KERNEL_ROX,
+			VM_FLUSH_RESET_PERMS, NUMA_NO_NODE,
+			__builtin_return_address(0));
+	if (!hv_hypercall_pg)
+		goto clean_guest_os_id;
+
+	rdmsrq(HV_X64_MSR_HYPERCALL, hypercall_msr.as_uint64);
+	hypercall_msr.enable = 1;
+	/*
+	 * Hand Xen the machine frame so it fills the correct page: for a PV
+	 * guest the pseudo-physical PFN differs from the machine (L1-physical)
+	 * frame the hypervisor uses.
+	 */
+	hypercall_msr.guest_physical_address =
+		hv_nested_hostpfn(vmalloc_to_pfn(hv_hypercall_pg));
+	wrmsrq(HV_X64_MSR_HYPERCALL, hypercall_msr.as_uint64);
+	hv_set_hypercall_pg(hv_hypercall_pg);
+
+	/*
+	 * Bring up the per-cpu input pages (VP assist is left NULL: it is a
+	 * lazy-EOI optimisation the PV dom0 does not need).
+	 */
+	if (cpuhp_setup_state(CPUHP_AP_HYPERV_ONLINE, "x86/hyperv_init:online",
+			      hv_cpu_init, hv_cpu_die) < 0)
+		goto clean_hypercall_pg;
+
+	return;
+
+clean_hypercall_pg:
+	hv_set_hypercall_pg(NULL);
+	vfree(hv_hypercall_pg);
+	hv_hypercall_pg = NULL;
+clean_guest_os_id:
+	wrmsrq(HV_X64_MSR_GUEST_OS_ID, 0);
+	hyperv_nested_on_xen = false;
+	hv_common_free();
+}
+#endif /* CONFIG_XEN_PV */
+
+/*
  * This routine is called before kexec/kdump, it does the required cleanup.
  */
 void hyperv_cleanup(void)
@@ -675,9 +764,10 @@ bool hv_is_hyperv_initialized(void)
 
 	/*
 	 * Ensure that we're really on Hyper-V, and not a KVM or Xen
-	 * emulation of Hyper-V
+	 * emulation of Hyper-V.  The exception is a Xen PV dom0 nested under
+	 * Hyper-V, which drives VMBus with Xen proxying the enlightenments.
 	 */
-	if (x86_hyper_type != X86_HYPER_MS_HYPERV)
+	if (x86_hyper_type != X86_HYPER_MS_HYPERV && !hyperv_nested_on_xen)
 		return false;
 
 	/* A TDX VM with no paravisor uses TDX GHCI call rather than hv_hypercall_pg */

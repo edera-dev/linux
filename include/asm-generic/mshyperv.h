@@ -363,6 +363,28 @@ static inline enum hv_isolation_type hv_get_isolation_type(void)
 }
 #endif /* CONFIG_HYPERV */
 
+/*
+ * Nested Hyper-V-on-Xen host-address translation.  Shared include-guard with
+ * arch/x86/include/asm/mshyperv.h (which defines this first on x86, ahead of
+ * hv_do_hypercall()); this copy serves other arches.
+ */
+#ifndef __HV_NESTED_ON_XEN_DEFINED
+#define __HV_NESTED_ON_XEN_DEFINED
+#ifdef CONFIG_XEN_PV
+extern bool hyperv_nested_on_xen;
+unsigned long hv_nested_hostpfn(unsigned long pfn);
+u64 hv_nested_hostpa(void *va);
+void __init hyperv_init_nested_on_xen(void);
+int hyperv_setup_xen_vmbus_irq(void (*isr)(void));
+#else
+#define hyperv_nested_on_xen false
+static inline unsigned long hv_nested_hostpfn(unsigned long pfn) { return pfn; }
+static inline u64 hv_nested_hostpa(void *va) { return 0; }
+static inline void hyperv_init_nested_on_xen(void) {}
+static inline int hyperv_setup_xen_vmbus_irq(void (*isr)(void)) { return -ENODEV; }
+#endif
+#endif /* __HV_NESTED_ON_XEN_DEFINED */
+
 #if IS_ENABLED(CONFIG_MSHV_ROOT)
 static inline bool hv_root_partition(void)
 {
