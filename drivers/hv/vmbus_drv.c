@@ -1495,7 +1495,19 @@ static int vmbus_bus_init(void)
 			goto err_kthread;
 	}
 
-	if (vmbus_irq == -1) {
+	if (hyperv_nested_on_xen) {
+		/*
+		 * A Xen PV dom0 nested under Hyper-V receives the relayed VMBus
+		 * interrupt as a Xen event channel (VIRQ_HYPERV_VMBUS), not as
+		 * the native SINT vector, so use the Xen-side bridge.
+		 */
+		ret = hyperv_setup_xen_vmbus_irq(vmbus_isr);
+		if (ret) {
+			pr_err("Can't set up Xen VMbus interrupt bridge, Err %d\n",
+					ret);
+			goto err_setup;
+		}
+	} else if (vmbus_irq == -1) {
 		hv_setup_vmbus_handler(vmbus_isr);
 	} else {
 		ret = request_percpu_irq(vmbus_irq, vmbus_percpu_isr,
