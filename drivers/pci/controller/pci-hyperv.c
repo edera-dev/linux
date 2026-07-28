@@ -586,12 +586,26 @@ static int hv_pci_irqchip_init(void)
 
 static struct irq_domain *hv_pci_get_root_domain(void)
 {
+	/*
+	 * Nested under Hyper-V in a Xen PV dom0 the host delivers these MSIs to
+	 * a vector Xen owns, on a VP that is Xen's, so x86_vector_domain has
+	 * nothing to allocate here - Xen provides the vector and the parent
+	 * domain.  See hyperv_xen_vpci_root_domain().
+	 */
+	if (hyperv_nested_on_xen)
+		return hyperv_xen_vpci_root_domain();
+
 	return x86_vector_domain;
 }
 
 static unsigned int hv_msi_get_int_vector(struct irq_data *data)
 {
-	struct irq_cfg *cfg = irqd_cfg(data);
+	struct irq_cfg *cfg;
+
+	if (hyperv_nested_on_xen)
+		return hyperv_xen_vpci_vector();
+
+	cfg = irqd_cfg(data);
 
 	return cfg->vector;
 }
@@ -2123,6 +2137,15 @@ static bool hv_pcie_init_dev_msi_info(struct device *dev, struct irq_domain *dom
 
 	if (IS_ENABLED(CONFIG_X86))
 		chip->flags |= IRQCHIP_MOVE_DEFERRED;
+
+	/*
+	 * Nested under Hyper-V in a Xen PV dom0 all vPCI MSIs share the single
+	 * vector Xen relays on, so there is no contiguous block of vectors to
+	 * back a multi-message MSI allocation.  MSI-X (what NVMe and MANA use)
+	 * is unaffected.
+	 */
+	if (hyperv_nested_on_xen)
+		info->flags &= ~MSI_FLAG_MULTI_PCI_MSI;
 
 	return true;
 }
@@ -3806,7 +3829,15 @@ static int hv_pci_probe(struct hv_device *hdev,
 	hbus->bridge->domain_nr = dom;
 #ifdef CONFIG_X86
 	hbus->sysdata.domain = dom;
-	hbus->use_calls = !!(ms_hyperv.hints & HV_X64_USE_MMIO_HYPERCALLS);
+	/*
+	 * The MMIO hypercalls return data through an output page, which Xen
+	 * would have to marshal on our behalf when nested in a PV dom0.  Take
+	 * the trapped-MMIO path instead (as arm64 does unconditionally): the
+	 * config window's machine address is mapped directly, so the host
+	 * intercepts the access with no hypervisor involvement.
+	 */
+	hbus->use_calls = !hyperv_nested_on_xen &&
+			  !!(ms_hyperv.hints & HV_X64_USE_MMIO_HYPERCALLS);
 #elif defined(CONFIG_ARM64)
 	/*
 	 * Set the PCI bus parent to be the corresponding VMbus
