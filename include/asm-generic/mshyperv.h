@@ -370,18 +370,23 @@ static inline enum hv_isolation_type hv_get_isolation_type(void)
  */
 #ifndef __HV_NESTED_ON_XEN_DEFINED
 #define __HV_NESTED_ON_XEN_DEFINED
+struct irq_domain;
 #ifdef CONFIG_XEN_PV
 extern bool hyperv_nested_on_xen;
 unsigned long hv_nested_hostpfn(unsigned long pfn);
 u64 hv_nested_hostpa(void *va);
 void __init hyperv_init_nested_on_xen(void);
 int hyperv_setup_xen_vmbus_irq(void (*isr)(void));
+unsigned int hyperv_xen_vpci_vector(void);
+struct irq_domain *hyperv_xen_vpci_root_domain(void);
 #else
 #define hyperv_nested_on_xen false
 static inline unsigned long hv_nested_hostpfn(unsigned long pfn) { return pfn; }
 static inline u64 hv_nested_hostpa(void *va) { return 0; }
 static inline void hyperv_init_nested_on_xen(void) {}
 static inline int hyperv_setup_xen_vmbus_irq(void (*isr)(void)) { return -ENODEV; }
+static inline unsigned int hyperv_xen_vpci_vector(void) { return 0; }
+static inline struct irq_domain *hyperv_xen_vpci_root_domain(void) { return NULL; }
 #endif
 #endif /* __HV_NESTED_ON_XEN_DEFINED */
 
