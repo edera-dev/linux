@@ -297,6 +297,20 @@ struct physdev_dbgp_op {
 };
 
 /*
+ * Query the interrupt vector Xen receives Hyper-V vPCI (VMBus-assigned PCI
+ * device) MSIs on, for a hardware domain running nested under Hyper-V.  Such a
+ * device's MSI is composed by the host and delivered to the VP - which is Xen's,
+ * not ours - so we must compose every vPCI MSI with this vector and take the
+ * resulting interrupts as VIRQ_HYPERV_VPCI.  Fails with -ENODEV if Xen is not
+ * relaying Hyper-V enlightenments to this domain.
+ */
+#define PHYSDEVOP_hyperv_vpci_vector    33
+struct physdev_hyperv_vpci_vector {
+    /* OUT */
+    uint32_t vector;
+};
+
+/*
  * Notify that some PIRQ-bound event channels have been unmasked.
  * ** This command is obsolete since interface version 0x00030202 and is **
  * ** unsupported by newer versions of Xen.				 **
