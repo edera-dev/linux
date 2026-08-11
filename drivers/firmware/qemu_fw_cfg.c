@@ -38,6 +38,7 @@
 #include <linux/delay.h>
 #include <linux/crash_dump.h>
 #include <linux/vmcore_info.h>
+#include <xen/xen.h>
 
 MODULE_AUTHOR("Gabriel L. Somlo <somlo@cmu.edu>");
 MODULE_DESCRIPTION("QEMU fw_cfg sysfs support");
@@ -70,6 +71,17 @@ static void fw_cfg_sel_endianness(u16 key)
 #ifdef CONFIG_VMCORE_INFO
 static inline bool fw_cfg_dma_enabled(void)
 {
+	/*
+	 * The DMA interface hands the device a virt_to_phys() address.
+	 * In a Xen PV domain that is a pseudo-physical address, so the
+	 * device writes the completion somewhere else entirely and
+	 * fw_cfg_wait_for_control() spins forever.
+	 * Reads go through the data register and are unaffected, so only
+	 * the DMA interface is refused.
+	 */
+	if (xen_pv_domain())
+		return false;
+
 	return (fw_cfg_rev & FW_CFG_VERSION_DMA) && fw_cfg_reg_dma;
 }
 
