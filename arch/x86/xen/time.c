@@ -567,6 +567,13 @@ static void __init xen_init_time_common(void)
 	paravirt_set_sched_clock(xen_sched_clock);
 
 	x86_platform.calibrate_tsc = xen_tsc_khz;
+	/*
+	 * Xen reports the TSC frequency, so there is nothing for the early CPU
+	 * calibration to find out -- and no way for it to. It would try CPUID
+	 * 0x16, then MSR_PLATFORM_INFO, and then spend its whole 50ms timeout in
+	 * quick_pit_calibrate() waiting on a PIT that a PVH guest does not have.
+	 */
+	x86_platform.calibrate_cpu = xen_tsc_khz;
 	x86_platform.get_wallclock = xen_get_wallclock;
 }
 
