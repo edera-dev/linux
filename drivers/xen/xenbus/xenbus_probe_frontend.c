@@ -17,6 +17,7 @@
 #include <linux/mutex.h>
 #include <linux/io.h>
 #include <linux/module.h>
+#include <linux/delay.h>
 
 #include <asm/page.h>
 #include <asm/xen/hypervisor.h>
@@ -278,7 +279,17 @@ static bool wait_loop(unsigned long start, unsigned int max_delay,
 		}
 	}
 
-	schedule_timeout_interruptible(HZ/10);
+	/*
+	 * Polled about every millisecond rather than every HZ/10. This runs
+	 * once, at boot, with every frontend's backend already sitting in
+	 * InitWait, so what it waits on is the frontend handshake finishing --
+	 * a few milliseconds. A jiffy-based sleep cannot see that: at HZ=100 the
+	 * old HZ/10 put a tenth of a second between the last device connecting
+	 * and init starting, and even one jiffy would round to 10-20ms. The
+	 * reporting above is jiffy-based and does not care how often it is
+	 * reached.
+	 */
+	usleep_range(1000, 2000);
 
 	return false;
 }
