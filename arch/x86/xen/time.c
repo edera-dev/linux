@@ -570,6 +570,7 @@ static void __init xen_init_time_common(void)
 	paravirt_set_sched_clock(xen_sched_clock);
 
 	x86_platform.calibrate_tsc = xen_tsc_khz;
+	x86_platform.calibrate_cpu = xen_tsc_khz;
 	x86_platform.get_wallclock = xen_get_wallclock;
 }
 
