@@ -325,4 +325,30 @@ struct xen_mem_acquire_resource {
 };
 DEFINE_GUEST_HANDLE_STRUCT(xen_mem_acquire_resource);
 
+/*
+ * XENMEM_get_mfn_pxms: resolve a batch of host MFNs to their firmware
+ * proximity-domain identifiers (host PXM on x86 ACPI).
+ *
+ * Returned values are in the host PXM namespace (the same value space
+ * dom0's own SRAT uses), not Xen's internal node id.  Callers convert
+ * to a Linux node id with pxm_to_node().  Slots Xen has no node info
+ * for receive XEN_INVALID_NUMA_ID rather than failing the whole batch.
+ *
+ * Restricted to the hardware domain.  On hypervisors that do not
+ * provide this op (older or non-Edera Xen, or builds without
+ * CONFIG_NUMA), the hypercall returns -ENOSYS; callers treat that as
+ * "feature unavailable" and fall back to NUMA-oblivious behaviour.
+ */
+#define XENMEM_get_mfn_pxms 40
+
+#define XEN_INVALID_NUMA_ID (~(uint32_t)0)
+
+struct xen_get_mfn_pxms {
+	GUEST_HANDLE(xen_pfn_t) mfns;
+	GUEST_HANDLE(uint32_t) pxms;
+	uint32_t nr_mfns;
+	uint32_t flags;
+};
+DEFINE_GUEST_HANDLE_STRUCT(xen_get_mfn_pxms);
+
 #endif /* __XEN_PUBLIC_MEMORY_H__ */

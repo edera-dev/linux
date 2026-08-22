@@ -88,14 +88,14 @@ static int __amd_smn_rw(u8 i_off, u8 d_off, u16 node, u32 address, u32 *value, b
 	struct pci_dev *root;
 	int err = -ENODEV;
 
+	if (!smn_exclusive)
+		return err;
+
 	if (node >= amd_num_nodes())
 		return err;
 
 	root = amd_roots[node];
 	if (!root)
-		return err;
-
-	if (!smn_exclusive)
 		return err;
 
 	guard(mutex)(&smn_mutex);
@@ -282,6 +282,17 @@ static int __init amd_smn_init(void)
 		return -ENODEV;
 
 	num_nodes = amd_num_nodes();
+
+	if (!num_nodes)
+		return -ENODEV;
+
+	/* Possibly a virtualized environment (e.g. Xen) where we will get
+	 * roots_per_node=0 if the number of roots is fewer than number of
+	 * nodes
+	 */
+	if (num_roots < num_nodes)
+		return -ENODEV;
+
 	amd_roots = kcalloc(num_nodes, sizeof(*amd_roots), GFP_KERNEL);
 	if (!amd_roots)
 		return -ENOMEM;

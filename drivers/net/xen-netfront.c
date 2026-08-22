@@ -31,10 +31,12 @@
 
 #define pr_fmt(fmt) KBUILD_MODNAME ": " fmt
 
+#include <linux/cpumask.h>
 #include <linux/module.h>
 #include <linux/kernel.h>
 #include <linux/netdevice.h>
 #include <linux/etherdevice.h>
+#include <linux/numa.h>
 #include <linux/skbuff.h>
 #include <linux/ethtool.h>
 #include <linux/if_ether.h>
@@ -1824,9 +1826,17 @@ static void xennet_disconnect_backend(struct netfront_info *info)
 
 		timer_delete_sync(&queue->rx_refill_timer);
 
-		if (queue->tx_irq && (queue->tx_irq == queue->rx_irq))
+		/*
+		 * free_irq() warns if affinity_hint is still set.  Drop the
+		 * hint installed at connect time before tearing the IRQ down.
+		 */
+		if (queue->tx_irq && (queue->tx_irq == queue->rx_irq)) {
+			irq_update_affinity_hint(queue->tx_irq, NULL);
 			unbind_from_irqhandler(queue->tx_irq, queue);
+		}
 		if (queue->tx_irq && (queue->tx_irq != queue->rx_irq)) {
+			irq_update_affinity_hint(queue->tx_irq, NULL);
+			irq_update_affinity_hint(queue->rx_irq, NULL);
 			unbind_from_irqhandler(queue->tx_irq, queue);
 			unbind_from_irqhandler(queue->rx_irq, queue);
 		}
@@ -1902,7 +1912,7 @@ static int xen_net_read_mac(struct xenbus_device *dev, u8 mac[])
 	return 0;
 }
 
-static int setup_netfront_single(struct netfront_queue *queue)
+static int setup_netfront_single(struct netfront_queue *queue, int node)
 {
 	int err;
 
@@ -1910,10 +1920,10 @@ static int setup_netfront_single(struct netfront_queue *queue)
 	if (err < 0)
 		goto fail;
 
-	err = bind_evtchn_to_irqhandler_lateeoi(queue->tx_evtchn,
-						xennet_interrupt, 0,
-						queue->info->netdev->name,
-						queue);
+	err = bind_evtchn_to_irqhandler_lateeoi_on_node(queue->tx_evtchn,
+							xennet_interrupt, 0,
+							queue->info->netdev->name,
+							queue, node);
 	if (err < 0)
 		goto bind_fail;
 	queue->rx_evtchn = queue->tx_evtchn;
@@ -1928,7 +1938,7 @@ fail:
 	return err;
 }
 
-static int setup_netfront_split(struct netfront_queue *queue)
+static int setup_netfront_split(struct netfront_queue *queue, int node)
 {
 	int err;
 
@@ -1941,18 +1951,20 @@ static int setup_netfront_split(struct netfront_queue *queue)
 
 	snprintf(queue->tx_irq_name, sizeof(queue->tx_irq_name),
 		 "%s-tx", queue->name);
-	err = bind_evtchn_to_irqhandler_lateeoi(queue->tx_evtchn,
-						xennet_tx_interrupt, 0,
-						queue->tx_irq_name, queue);
+	err = bind_evtchn_to_irqhandler_lateeoi_on_node(queue->tx_evtchn,
+							xennet_tx_interrupt, 0,
+							queue->tx_irq_name,
+							queue, node);
 	if (err < 0)
 		goto bind_tx_fail;
 	queue->tx_irq = err;
 
 	snprintf(queue->rx_irq_name, sizeof(queue->rx_irq_name),
 		 "%s-rx", queue->name);
-	err = bind_evtchn_to_irqhandler_lateeoi(queue->rx_evtchn,
-						xennet_rx_interrupt, 0,
-						queue->rx_irq_name, queue);
+	err = bind_evtchn_to_irqhandler_lateeoi_on_node(queue->rx_evtchn,
+							xennet_rx_interrupt, 0,
+							queue->rx_irq_name,
+							queue, node);
 	if (err < 0)
 		goto bind_rx_fail;
 	queue->rx_irq = err;
@@ -1977,6 +1989,7 @@ static int setup_netfront(struct xenbus_device *dev,
 {
 	struct xen_netif_tx_sring *txs;
 	struct xen_netif_rx_sring *rxs;
+	int node;
 	int err;
 
 	queue->tx_ring_ref = INVALID_GRANT_REF;
@@ -1984,31 +1997,87 @@ static int setup_netfront(struct xenbus_device *dev,
 	queue->rx.sring = NULL;
 	queue->tx.sring = NULL;
 
-	err = xenbus_setup_ring(dev, GFP_NOIO | __GFP_HIGH, (void **)&txs,
-				1, &queue->tx_ring_ref);
+	/*
+	 * Distribute queues across guest NUMA nodes by rotating over
+	 * nodes-with-CPUs.  On a single-vnode guest every queue lands
+	 * on node 0 and behaviour matches the legacy default.  On a
+	 * multi-vnode guest, queues spread across nodes and pair up
+	 * naturally with the dom0 backend's per-queue node-affinity
+	 * placement.
+	 */
+	node = xenbus_node_for_queue(queue->id);
+
+	err = xenbus_setup_ring_node(dev, GFP_NOIO | __GFP_HIGH, node,
+				     (void **)&txs, 1, &queue->tx_ring_ref);
 	if (err)
 		goto fail;
 
 	XEN_FRONT_RING_INIT(&queue->tx, txs, XEN_PAGE_SIZE);
 
-	err = xenbus_setup_ring(dev, GFP_NOIO | __GFP_HIGH, (void **)&rxs,
-				1, &queue->rx_ring_ref);
+	err = xenbus_setup_ring_node(dev, GFP_NOIO | __GFP_HIGH, node,
+				     (void **)&rxs, 1, &queue->rx_ring_ref);
 	if (err)
 		goto fail;
 
 	XEN_FRONT_RING_INIT(&queue->rx, rxs, XEN_PAGE_SIZE);
 
 	if (feature_split_evtchn)
-		err = setup_netfront_split(queue);
+		err = setup_netfront_split(queue, node);
 	/* setup single event channel if
 	 *  a) feature-split-event-channels == 0
 	 *  b) feature-split-event-channels == 1 but failed to setup
 	 */
 	if (!feature_split_evtchn || err)
-		err = setup_netfront_single(queue);
+		err = setup_netfront_single(queue, node);
 
 	if (err)
 		goto fail;
+
+	/*
+	 * Route each per-queue evtchn IRQ toward the same node the ring
+	 * lives on.  NAPI runs in softirq on the CPU that took the IRQ;
+	 * landing IRQ + NAPI + ring on one node keeps the receive path
+	 * NUMA-local.  Sets both actual affinity and hint so behaviour
+	 * is correct on guests without irqbalance.  Operator writes to
+	 * /proc/irq/N/smp_affinity continue to win.
+	 */
+	if (node != NUMA_NO_NODE) {
+		const struct cpumask *mask = cpumask_of_node(node);
+
+		if (!cpumask_empty(mask)) {
+			irq_set_affinity_and_hint(queue->tx_irq, mask);
+			if (queue->rx_irq != queue->tx_irq)
+				irq_set_affinity_and_hint(queue->rx_irq, mask);
+		}
+	}
+
+	/*
+	 * Steer senders toward this queue based on the same node the
+	 * rings live on.  __netdev_pick_tx consults the XPS map first;
+	 * a sender on a CPU in `node` will pick `queue->id`, whose
+	 * rings are on `node`, and dom0's matching backend kthread is
+	 * pinned to the host node that hosts those rings.  Without
+	 * this, the kernel's default hash-based queue selection lets a
+	 * sender on any node land on any queue, defeating the per-queue
+	 * NUMA-locality story.  An operator write to xps_cpus
+	 * overrides on subsequent writes.
+	 *
+	 * netif_set_xps_queue silently returns 0 if CONFIG_XPS is off;
+	 * an empty cpumask (e.g. memory-only NUMA node) is skipped to
+	 * avoid programming an effectively-unusable map.
+	 */
+	if (node != NUMA_NO_NODE) {
+		const struct cpumask *mask = cpumask_of_node(node);
+
+		if (!cpumask_empty(mask)) {
+			int xps_err = netif_set_xps_queue(queue->info->netdev,
+							  mask, queue->id);
+			if (xps_err)
+				netdev_warn(queue->info->netdev,
+					    "XPS setup failed for queue %u: %d\n",
+					    queue->id, xps_err);
+		}
+	}
 
 	return 0;
 

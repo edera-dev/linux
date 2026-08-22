@@ -96,6 +96,31 @@ config XEN_BACKEND
 	  Support for backend device drivers that provide I/O services
 	  to other virtual machines.
 
+config XEN_BACKEND_NUMA_AFFINITY
+	bool "NUMA affinity for Xen backend drivers"
+	depends on XEN_BACKEND && NUMA && ACPI_NUMA && XEN_UNPOPULATED_ALLOC
+	default y
+	help
+	  Allow Xen backend drivers (netback, blkback, gntdev consumers)
+	  to discover the host NUMA node that hosts a grant-mapped ring
+	  page, and to place their service threads and IRQs on that node.
+
+	  XEN_UNPOPULATED_ALLOC provides the per-node placeholder-page pool
+	  the relocation logic in xenbus_map_ring_valloc() draws from.
+	  Without it, placeholders come from the generic balloon allocator,
+	  whose page_to_nid() reflects only where dom0's free RAM happened
+	  to be -- not the host node of the foreign frame the placeholder
+	  will end up backing.  In that configuration the per-ring
+	  placement decisions would be confidently wrong rather than just
+	  absent, so the Kconfig hard-depends on XEN_UNPOPULATED_ALLOC
+	  rather than silently degrading.
+
+	  Requires hypervisor support for the XENMEM_get_mfn_pxms
+	  hypercall.  Without that support the feature is silently a
+	  no-op, equivalent to NUMA-oblivious behaviour.
+
+	  If unsure, say Y.
+
 config XENFS
 	tristate "Xen filesystem"
 	select XEN_PRIVCMD

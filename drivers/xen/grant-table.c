@@ -67,6 +67,10 @@
 
 #include <asm/sync_bitops.h>
 
+#ifdef CONFIG_XEN_BACKEND_NUMA_AFFINITY
+#include <acpi/acpi_numa.h>
+#endif
+
 #define GNTTAB_LIST_END 0xffffffff
 
 static grant_ref_t **gnttab_list;
@@ -881,16 +885,106 @@ int gnttab_pages_set_private(int nr_pages, struct page **pages)
 }
 EXPORT_SYMBOL_GPL(gnttab_pages_set_private);
 
+#ifdef CONFIG_XEN_BACKEND_NUMA_AFFINITY
+/*
+ * Tri-state cache for XENMEM_get_mfn_pxms availability.  -ENOSYS
+ * (hypervisor without the hypercall) or -EPERM (Xen restricts the
+ * query to the hardware domain) from the first attempt latches
+ * "unsupported", short-circuiting future calls.  Any positive ACK
+ * (including the legitimate XEN_INVALID_NUMA_ID answer for an MFN Xen
+ * does not know about) latches "supported".
+ *
+ * Lock-free: at most one transition each direction, and "unsupported"
+ * is a stable terminal state once entered.  A racing reader might
+ * issue one redundant hypercall before observing the cached state,
+ * which is harmless.
+ */
+#define XEN_MFN_PXM_UNKNOWN     0
+#define XEN_MFN_PXM_SUPPORTED   1
+#define XEN_MFN_PXM_UNSUPPORTED 2
+
+static int xen_mfn_pxm_state = XEN_MFN_PXM_UNKNOWN;
+
+/*
+ * Resolve one foreign MFN to a Linux node id.  Returns NUMA_NO_NODE
+ * for any failure mode: hypercall unsupported, MFN unknown to Xen,
+ * PXM not registered with the dom0 ACPI namespace.
+ *
+ * Three NUMA identifier namespaces are involved here.  Xen returns
+ * host PXM (firmware-supplied).  pxm_to_node() translates to a Linux
+ * dom0 node id.  Callers then use the result against Linux helpers
+ * like cpumask_of_node() and kthread_create_on_node().
+ */
+int xen_mfn_to_node(unsigned long mfn)
+{
+	struct xen_get_mfn_pxms req;
+	xen_pfn_t mfn_arg = mfn;
+	uint32_t pxm = XEN_INVALID_NUMA_ID;
+	int rc;
+
+	/*
+	 * Xen answers this query only for the hardware domain.  A domU
+	 * mapping a foreign ring (a driver domain, say) would just earn
+	 * an -EPERM per connect; skip the doomed hypercall and stay
+	 * node-oblivious, which is the only honest answer for a guest
+	 * with no view of host topology anyway.
+	 */
+	if (!xen_initial_domain())
+		return NUMA_NO_NODE;
+
+	if (READ_ONCE(xen_mfn_pxm_state) == XEN_MFN_PXM_UNSUPPORTED)
+		return NUMA_NO_NODE;
+
+	memset(&req, 0, sizeof(req));
+	set_xen_guest_handle(req.mfns, &mfn_arg);
+	set_xen_guest_handle(req.pxms, &pxm);
+	req.nr_mfns = 1;
+
+	rc = HYPERVISOR_memory_op(XENMEM_get_mfn_pxms, &req);
+	if (rc < 0) {
+		/*
+		 * Both errnos are stable properties of this boot: -ENOSYS
+		 * means the hypervisor lacks the hypercall (no CONFIG_NUMA
+		 * or too old), -EPERM that it refuses us despite the
+		 * initial-domain check above (XSM policy, or a late
+		 * hardware domain).  Latch either so we never retry.
+		 */
+		if (rc == -ENOSYS || rc == -EPERM) {
+			WRITE_ONCE(xen_mfn_pxm_state, XEN_MFN_PXM_UNSUPPORTED);
+			pr_info("XENMEM_get_mfn_pxms unavailable (%d), NUMA affinity for grant mappings disabled\n",
+				rc);
+		}
+		return NUMA_NO_NODE;
+	}
+
+	WRITE_ONCE(xen_mfn_pxm_state, XEN_MFN_PXM_SUPPORTED);
+
+	if (pxm == XEN_INVALID_NUMA_ID)
+		return NUMA_NO_NODE;
+
+	return pxm_to_node(pxm);
+}
+EXPORT_SYMBOL_GPL(xen_mfn_to_node);
+#endif /* CONFIG_XEN_BACKEND_NUMA_AFFINITY */
+
 /**
- * gnttab_alloc_pages - alloc pages suitable for grant mapping into
+ * gnttab_alloc_pages_node - alloc pages suitable for grant mapping into,
+ * drawn from a specific NUMA node's placeholder pool
  * @nr_pages: number of pages to alloc
  * @pages: returns the pages
+ * @node: node to draw the pages from, or NUMA_NO_NODE for the caller's
+ * local node
+ *
+ * A caller that knows the host node of the foreign frames it is about
+ * to map can request placeholders whose page_to_nid() matches; the
+ * generic gnttab_alloc_pages() below has no such knowledge and settles
+ * for the local node.
  */
-int gnttab_alloc_pages(int nr_pages, struct page **pages)
+int gnttab_alloc_pages_node(int nr_pages, struct page **pages, int node)
 {
 	int ret;
 
-	ret = xen_alloc_unpopulated_pages(nr_pages, pages);
+	ret = xen_alloc_unpopulated_pages_node(nr_pages, pages, node);
 	if (ret < 0)
 		return ret;
 
@@ -899,6 +993,17 @@ int gnttab_alloc_pages(int nr_pages, struct page **pages)
 		gnttab_free_pages(nr_pages, pages);
 
 	return ret;
+}
+EXPORT_SYMBOL_GPL(gnttab_alloc_pages_node);
+
+/**
+ * gnttab_alloc_pages - alloc pages suitable for grant mapping into
+ * @nr_pages: number of pages to alloc
+ * @pages: returns the pages
+ */
+int gnttab_alloc_pages(int nr_pages, struct page **pages)
+{
+	return gnttab_alloc_pages_node(nr_pages, pages, NUMA_NO_NODE);
 }
 EXPORT_SYMBOL_GPL(gnttab_alloc_pages);
 

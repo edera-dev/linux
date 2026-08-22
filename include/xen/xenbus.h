@@ -216,6 +216,10 @@ int xenbus_watch_pathfmt(struct xenbus_device *dev, struct xenbus_watch *watch,
 			 const char *pathfmt, ...);
 
 int xenbus_switch_state(struct xenbus_device *dev, enum xenbus_state new_state);
+int xenbus_node_for_queue(unsigned int index);
+int xenbus_setup_ring_node(struct xenbus_device *dev, gfp_t gfp, int node,
+			   void **vaddr, unsigned int nr_pages,
+			   grant_ref_t *grefs);
 int xenbus_setup_ring(struct xenbus_device *dev, gfp_t gfp, void **vaddr,
 		      unsigned int nr_pages, grant_ref_t *grefs);
 void xenbus_teardown_ring(void **vaddr, unsigned int nr_pages,
@@ -224,6 +228,19 @@ int xenbus_map_ring_valloc(struct xenbus_device *dev, grant_ref_t *gnt_refs,
 			   unsigned int nr_grefs, void **vaddr);
 
 int xenbus_unmap_ring_vfree(struct xenbus_device *dev, void *vaddr);
+
+/*
+ * Return the host NUMA node (Linux node id) of the foreign frame
+ * backing the first page of a mapping previously established by
+ * xenbus_map_ring_valloc().  Returns NUMA_NO_NODE if the hypervisor
+ * cannot provide the information, the mapping is not found, or the
+ * kernel was built without CONFIG_XEN_BACKEND_NUMA_AFFINITY.
+ *
+ * Intended for backends placing their service threads and IRQs on
+ * the node hosting the ring.  The value is resolved at map time and
+ * cached on the mapping, so this call is a cheap lookup.
+ */
+int xenbus_ring_host_node(struct xenbus_device *dev, void *vaddr);
 
 int xenbus_alloc_evtchn(struct xenbus_device *dev, evtchn_port_t *port);
 int xenbus_free_evtchn(struct xenbus_device *dev, evtchn_port_t port);

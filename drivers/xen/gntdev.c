@@ -327,6 +327,119 @@ static int find_grant_ptes(pte_t *pte, unsigned long addr, void *data)
 	return 0;
 }
 
+/*
+ * Relocate a freshly mapped map's placeholder pages onto the NUMA node
+ * hosting the foreign frames, so that page_to_nid() of a grant-mapped
+ * page reports the frame's true home -- the same dance
+ * xenbus_map_ring_hvm() performs for kernel ring mappings.  Userspace
+ * can then recover the node of a mapping it created with
+ * get_mempolicy(MPOL_F_ADDR | MPOL_F_NODE) and place its I/O threads
+ * and buffers accordingly.
+ *
+ * Runs after the first successful gnttab_map_refs() and before the
+ * pages are visible outside the map (gntdev_mmap() inserts them into
+ * the VMA only after gntdev_map_grant_pages() returns, and map->in_use
+ * limits a map to a single mmap), so the unmap/remap below cannot race
+ * a user access.
+ *
+ * Best-effort while nothing has moved: any failure to learn or improve
+ * the placement leaves the original mapping untouched and returns 0.  A
+ * failure while moving the mapping poisons the map and returns an
+ * error, since a half-relocated map must not be exposed.
+ */
+static int gntdev_relocate_map(struct gntdev_grant_map *map)
+{
+	struct page **pages;
+	int node, i, err;
+
+#ifdef CONFIG_XEN_GRANT_DMA_ALLOC
+	/* DMA-allocated backing must keep its physical placement. */
+	if (map->dma_vaddr)
+		return 0;
+#endif
+
+	/* Only relocate a fully successful map. */
+	for (i = 0; i < map->count; i++)
+		if (map->map_ops[i].status != GNTST_okay)
+			return 0;
+
+	/*
+	 * Xen filled dev_bus_addr with the foreign frame's machine
+	 * address on the successful host_map.  The frames of one map
+	 * overwhelmingly share a node (they are rings or buffers the
+	 * granting guest allocated together), so follow the first frame,
+	 * as the xenbus ring path does.
+	 */
+	node = xen_mfn_to_node(PFN_DOWN(map->map_ops[0].dev_bus_addr));
+	if (node == NUMA_NO_NODE || node == page_to_nid(map->pages[0]))
+		return 0;
+
+	pages = kvcalloc(map->count, sizeof(pages[0]), GFP_KERNEL);
+	if (!pages)
+		return 0;
+	if (gnttab_alloc_pages_node(map->count, pages, node)) {
+		kvfree(pages);
+		return 0;
+	}
+
+	for (i = 0; i < map->count; i++) {
+		map->unmap_ops[i].handle = map->map_ops[i].handle;
+		if (map->flags & GNTMAP_device_map)
+			map->unmap_ops[i].dev_bus_addr =
+				map->map_ops[i].dev_bus_addr;
+	}
+	err = gnttab_unmap_refs(map->unmap_ops, map->kunmap_ops, map->pages,
+				map->count);
+	if (err) {
+		/*
+		 * The old placeholders may still carry live foreign
+		 * mappings; freeing them would hand foreign-mapped frames
+		 * back to the allocator.  Swap in the clean replacements
+		 * so teardown frees those instead, deliberately leak the
+		 * old pages, and fail the map.
+		 */
+		pr_err("relocate unmap failed (%d); leaking %d pages\n",
+		       err, map->count);
+		memcpy(map->pages, pages, map->count * sizeof(pages[0]));
+		kvfree(pages);
+		goto poison;
+	}
+
+	gnttab_free_pages(map->count, map->pages);
+	memcpy(map->pages, pages, map->count * sizeof(pages[0]));
+	kvfree(pages);
+
+	for (i = 0; i < map->count; i++) {
+		unsigned long addr = (unsigned long)
+			pfn_to_kaddr(page_to_pfn(map->pages[i]));
+		gnttab_set_map_op(&map->map_ops[i], addr, map->flags,
+				  map->grants[i].ref, map->grants[i].domid);
+		gnttab_set_unmap_op(&map->unmap_ops[i], addr, map->flags,
+				    INVALID_GRANT_HANDLE);
+	}
+	err = gnttab_map_refs(map->map_ops, map->kmap_ops, map->pages,
+			      map->count);
+	if (err) {
+		pr_err("relocate remap on node %d failed (%d)\n", node, err);
+		goto poison;
+	}
+
+	return 0;
+
+poison:
+	/*
+	 * Present the map as wholly failed: no handle survives for the
+	 * caller's status loop to account, or for teardown to unmap a
+	 * second time.
+	 */
+	for (i = 0; i < map->count; i++) {
+		map->map_ops[i].status = GNTST_general_error;
+		map->map_ops[i].handle = INVALID_GRANT_HANDLE;
+		map->unmap_ops[i].handle = INVALID_GRANT_HANDLE;
+	}
+	return err;
+}
+
 int gntdev_map_grant_pages(struct gntdev_grant_map *map)
 {
 	size_t alloced = 0;
@@ -376,6 +489,16 @@ int gntdev_map_grant_pages(struct gntdev_grant_map *map)
 	pr_debug("map %d+%d\n", map->index, map->count);
 	err = gnttab_map_refs(map->map_ops, map->kmap_ops, map->pages,
 			map->count);
+
+	/*
+	 * Auto-translated placeholders came from the local node's pool,
+	 * which matches the foreign frames' node only by coincidence;
+	 * move them to the frames' real home while nothing can observe
+	 * the map.  PV installs foreign MFNs directly in the PTEs and has
+	 * no dom0 struct page to relocate.
+	 */
+	if (!err && !xen_pv_domain())
+		err = gntdev_relocate_map(map);
 
 	for (i = 0; i < map->count; i++) {
 		if (map->map_ops[i].status == GNTST_okay) {

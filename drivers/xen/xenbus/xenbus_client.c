@@ -31,15 +31,19 @@
  */
 
 #include <linux/mm.h>
+#include <linux/nodemask.h>
+#include <linux/numa.h>
 #include <linux/slab.h>
 #include <linux/types.h>
 #include <linux/spinlock.h>
 #include <linux/vmalloc.h>
 #include <linux/export.h>
+#include <asm/xen/hypercall.h>
 #include <asm/xen/hypervisor.h>
 #include <xen/page.h>
 #include <xen/interface/xen.h>
 #include <xen/interface/event_channel.h>
+#include <xen/interface/memory.h>
 #include <xen/balloon.h>
 #include <xen/events.h>
 #include <xen/grant_table.h>
@@ -375,32 +379,102 @@ static void xenbus_switch_fatal(struct xenbus_device *dev, int depth, int err,
 }
 
 /*
- * xenbus_setup_ring
+ * xenbus_setup_ring_node
  * @dev: xenbus device
+ * @gfp: GFP flags for the allocation
+ * @node: preferred Linux node id for the ring pages, or NUMA_NO_NODE
  * @vaddr: pointer to starting virtual address of the ring
  * @nr_pages: number of pages to be granted
  * @grefs: grant reference array to be filled in
  *
- * Allocate physically contiguous pages for a shared ring buffer and grant it
- * to the peer of the given device. The ring buffer is initially filled with
- * zeroes. The virtual address of the ring is stored at @vaddr and the
- * grant references are stored in the @grefs array. In case of error @vaddr
- * will be set to NULL and @grefs will be filled with INVALID_GRANT_REF.
+ * Same contract as xenbus_setup_ring(), but the ring pages are drawn
+ * from @node's buddy free list when possible (subject to fallback when
+ * @node has no available memory).  All pages of a single ring come
+ * from one buddy allocation so they remain on a single node by
+ * construction, which is the property frontends rely on to keep
+ * per-queue rings on per-queue nodes.
+ *
+ * The ring buffer is initially filled with zeroes.  The virtual address
+ * of the ring is stored at @vaddr and the grant references are stored
+ * in the @grefs array.  In case of error @vaddr will be set to NULL and
+ * @grefs will be filled with INVALID_GRANT_REF.
  */
-int xenbus_setup_ring(struct xenbus_device *dev, gfp_t gfp, void **vaddr,
-		      unsigned int nr_pages, grant_ref_t *grefs)
+/*
+ * Pick a Linux node id from the set of nodes with online CPUs, cycling
+ * by @index.  Frontends use this to distribute per-queue rings across
+ * guest NUMA nodes so the dom0 backend's per-ring placement lands them
+ * on distinct host nodes.
+ *
+ * cpumask_local_spread(i, NUMA_NO_NODE) is the natural shape this code
+ * wants, but with a NUMA_NO_NODE node argument it falls back to a
+ * straight linear walk of cpu_online_mask (see sched_numa_find_nth_cpu)
+ * which collapses every queue onto the first node's CPUs.  This helper
+ * actually rotates over nodes.
+ */
+int xenbus_node_for_queue(unsigned int index)
+{
+	unsigned int idx = 0;
+	unsigned int n;
+	int node;
+
+	n = num_node_state(N_CPU);
+	if (n == 0)
+		return NUMA_NO_NODE;
+
+	index %= n;
+	for_each_node_state(node, N_CPU) {
+		if (idx == index)
+			return node;
+		idx++;
+	}
+	return NUMA_NO_NODE;
+}
+EXPORT_SYMBOL_GPL(xenbus_node_for_queue);
+
+int xenbus_setup_ring_node(struct xenbus_device *dev, gfp_t gfp, int node,
+			   void **vaddr, unsigned int nr_pages,
+			   grant_ref_t *grefs)
 {
 	unsigned long ring_size = nr_pages * XEN_PAGE_SIZE;
+	unsigned int order;
+	unsigned long nr_alloc;
+	struct page *page;
 	grant_ref_t gref_head;
 	unsigned int i;
 	void *addr;
 	int ret;
 
-	addr = *vaddr = alloc_pages_exact(ring_size, gfp | __GFP_ZERO);
-	if (!*vaddr) {
+	*vaddr = NULL;
+
+	/*
+	 * Mirror the GFP filtering that alloc_pages_exact() does
+	 * internally: split_page() below requires a non-compound page
+	 * and HIGHMEM is incompatible with the direct virt mapping used
+	 * by the grant code.
+	 */
+	gfp &= ~(__GFP_COMP | __GFP_HIGHMEM);
+
+	order = get_order(ring_size);
+	page = alloc_pages_node(node, gfp | __GFP_ZERO, order);
+	if (!page) {
 		ret = -ENOMEM;
 		goto err;
 	}
+
+	/*
+	 * alloc_pages_node returns a single order-N block where only
+	 * the head is refcounted.  split_page makes every subpage
+	 * individually refcounted so free_pages_exact() can release the
+	 * ring page-by-page.  Return any tail pages beyond ring_size to
+	 * the allocator immediately.
+	 */
+	split_page(page, order);
+	nr_alloc = 1UL << order;
+	for (i = DIV_ROUND_UP(ring_size, PAGE_SIZE); i < nr_alloc; i++)
+		__free_page(page + i);
+
+	addr = page_address(page);
+	*vaddr = addr;
 
 	ret = gnttab_alloc_grant_references(nr_pages, &gref_head);
 	if (ret) {
@@ -434,6 +508,20 @@ int xenbus_setup_ring(struct xenbus_device *dev, gfp_t gfp, void **vaddr,
 	*vaddr = NULL;
 
 	return ret;
+}
+EXPORT_SYMBOL_GPL(xenbus_setup_ring_node);
+
+/*
+ * xenbus_setup_ring
+ *
+ * Equivalent to xenbus_setup_ring_node() with no node preference; the
+ * pages come from the current CPU's local node by default GFP policy.
+ */
+int xenbus_setup_ring(struct xenbus_device *dev, gfp_t gfp, void **vaddr,
+		      unsigned int nr_pages, grant_ref_t *grefs)
+{
+	return xenbus_setup_ring_node(dev, gfp, NUMA_NO_NODE, vaddr, nr_pages,
+				      grefs);
 }
 EXPORT_SYMBOL_GPL(xenbus_setup_ring);
 
@@ -674,6 +762,7 @@ static int xenbus_map_ring_hvm(struct xenbus_device *dev,
 {
 	struct xenbus_map_node *node = info->node;
 	int err;
+	int host_node = NUMA_NO_NODE;
 	void *addr;
 	bool leaked = false;
 	unsigned int nr_pages = XENBUS_PAGES(nr_grefs);
@@ -692,6 +781,75 @@ static int xenbus_map_ring_hvm(struct xenbus_device *dev,
 
 	if (err)
 		goto out_free_ballooned_pages;
+
+	/*
+	 * Xen fills dev_bus_addr with the foreign frame's machine
+	 * address on a successful host_map (see grant_table.c in the
+	 * hypervisor).  Resolve the host node now so we know whether the
+	 * placeholders need to be relocated below.
+	 */
+	if (nr_grefs > 0)
+		host_node = xen_mfn_to_node(
+			PFN_DOWN(info->map[0].dev_bus_addr));
+
+	/*
+	 * Placeholder pages came from numa_node_id()'s pool, which only
+	 * matches the foreign frame's node by coincidence.  If they
+	 * disagree, drop the mapping, return the placeholders, and redo
+	 * the map with placeholders drawn from the correct pool.  After
+	 * this, page_to_nid() of every ring page equals the host node of
+	 * its foreign MFN by construction, which keeps grant-mapped pages
+	 * truthful to every NUMA-aware code path that consults page_to_nid.
+	 *
+	 * The cost is one extra grant unmap + map pair per backend
+	 * connect (a rare event) and is paid only when the placeholder
+	 * pool's node disagrees with the foreign frame.  PV mappings and
+	 * cases where Xen cannot supply node info skip the dance entirely.
+	 */
+	if (host_node != NUMA_NO_NODE &&
+	    page_to_nid(node->hvm.pages[0]) != host_node) {
+		int relocate_err;
+
+		relocate_err = xenbus_unmap_ring(dev, node->handles, nr_grefs,
+						 info->addrs);
+		if (relocate_err != GNTST_okay) {
+			/*
+			 * Partial unmap: at least one grant may still be
+			 * live against a placeholder we can no longer
+			 * reach safely.  Mark the pages leaked and fail
+			 * the whole map.
+			 */
+			leaked = true;
+			err = -EIO;
+			goto out_free_ballooned_pages;
+		}
+
+		xen_free_unpopulated_pages(nr_pages, node->hvm.pages);
+
+		err = xen_alloc_unpopulated_pages_node(nr_pages,
+						       node->hvm.pages,
+						       host_node);
+		if (err) {
+			/*
+			 * Pages already gone; clear the array so the
+			 * cleanup path does not try to free them again.
+			 */
+			memset(node->hvm.pages, 0,
+			       nr_pages * sizeof(*node->hvm.pages));
+			node->nr_handles = 0;
+			goto out_err;
+		}
+
+		info->idx = 0;
+		gnttab_foreach_grant(node->hvm.pages, nr_grefs,
+				     xenbus_map_ring_setup_grant_hvm,
+				     info);
+
+		err = __xenbus_map_ring(dev, gnt_ref, nr_grefs, node->handles,
+					info, GNTMAP_host_map, &leaked);
+		if (err)
+			goto out_free_ballooned_pages;
+	}
 
 	addr = vmap(node->hvm.pages, nr_pages, VM_MAP | VM_IOREMAP,
 		    PAGE_KERNEL);
@@ -742,6 +900,29 @@ int xenbus_unmap_ring_vfree(struct xenbus_device *dev, void *vaddr)
 	return ring_ops->unmap(dev, vaddr);
 }
 EXPORT_SYMBOL_GPL(xenbus_unmap_ring_vfree);
+
+int xenbus_ring_host_node(struct xenbus_device *dev, void *vaddr)
+{
+	struct page *page;
+
+	/*
+	 * PV mappings install foreign MFNs directly in the PTEs and have
+	 * no struct page in dom0's mem_map for the foreign frame.  PVH
+	 * dom0 keeps a placeholder struct page (allocated from the
+	 * matching per-node pool of xen_alloc_unpopulated_pages_node)
+	 * whose page_to_nid() reports the host node of the foreign frame
+	 * by construction.
+	 */
+	if (xen_pv_domain())
+		return NUMA_NO_NODE;
+
+	page = vmalloc_to_page(vaddr);
+	if (!page)
+		return NUMA_NO_NODE;
+
+	return page_to_nid(page);
+}
+EXPORT_SYMBOL_GPL(xenbus_ring_host_node);
 
 #ifdef CONFIG_XEN_PV
 static int map_ring_apply(pte_t *pte, unsigned long addr, void *data)

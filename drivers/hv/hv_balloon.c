@@ -2131,6 +2131,20 @@ static  struct hv_driver balloon_drv = {
 
 static int __init init_balloon_drv(void)
 {
+	/*
+	 * Dynamic memory cannot work when Linux is a Xen PV dom0 running
+	 * nested under Hyper-V.  Ballooning reports the page frames it has
+	 * withdrawn directly to the host, but a PV guest's frame numbers are
+	 * pseudo-physical; the host reads them as machine frames and reclaims
+	 * whatever Xen placed there, silently destroying memory belonging to
+	 * dom0 or to another domain.  Translating them would not make this
+	 * correct either: dom0's memory is Xen's to give back, not ours.
+	 */
+	if (hyperv_nested_on_xen) {
+		pr_info("nested under Xen, not registering: dynamic memory is unsupported\n");
+		return -ENODEV;
+	}
+
 	return vmbus_driver_register(&balloon_drv);
 }
 

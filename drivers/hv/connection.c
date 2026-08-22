@@ -101,17 +101,24 @@ int vmbus_negotiate_version(struct vmbus_channel_msginfo *msginfo, u32 version)
 		msg->msg_vtl = ms_hyperv.vtl;
 		vmbus_connection.msg_conn_id = VMBUS_MESSAGE_CONNECTION_ID_4;
 	} else {
-		msg->interrupt_page = virt_to_phys(vmbus_connection.int_page);
+		msg->interrupt_page = hyperv_nested_on_xen ?
+			hv_nested_hostpa(vmbus_connection.int_page) :
+			virt_to_phys(vmbus_connection.int_page);
 		vmbus_connection.msg_conn_id = VMBUS_MESSAGE_CONNECTION_ID;
 	}
 
 	/*
 	 * shared_gpa_boundary is zero in non-SNP VMs, so it's safe to always
-	 * bitwise OR it
+	 * bitwise OR it.  On a Xen PV dom0 the host needs machine (L1-physical)
+	 * addresses for the monitor pages.
 	 */
-	msg->monitor_page1 = virt_to_phys(vmbus_connection.monitor_pages[0]) |
+	msg->monitor_page1 = (hyperv_nested_on_xen ?
+			hv_nested_hostpa(vmbus_connection.monitor_pages[0]) :
+			virt_to_phys(vmbus_connection.monitor_pages[0])) |
 				ms_hyperv.shared_gpa_boundary;
-	msg->monitor_page2 = virt_to_phys(vmbus_connection.monitor_pages[1]) |
+	msg->monitor_page2 = (hyperv_nested_on_xen ?
+			hv_nested_hostpa(vmbus_connection.monitor_pages[1]) :
+			virt_to_phys(vmbus_connection.monitor_pages[1])) |
 				ms_hyperv.shared_gpa_boundary;
 
 	msg->target_vcpu = hv_cpu_number_to_vp_number(VMBUS_CONNECT_CPU);

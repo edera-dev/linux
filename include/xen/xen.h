@@ -70,6 +70,8 @@ extern u64 xen_saved_max_mem_size;
 
 #ifdef CONFIG_XEN_UNPOPULATED_ALLOC
 extern unsigned long xen_unpopulated_pages;
+int xen_alloc_unpopulated_pages_node(unsigned int nr_pages, struct page **pages,
+				     int node);
 int xen_alloc_unpopulated_pages(unsigned int nr_pages, struct page **pages);
 void xen_free_unpopulated_pages(unsigned int nr_pages, struct page **pages);
 #include <linux/ioport.h>
@@ -77,6 +79,11 @@ int arch_xen_unpopulated_init(struct resource **res);
 #else
 #define xen_unpopulated_pages 0UL
 #include <xen/balloon.h>
+static inline int xen_alloc_unpopulated_pages_node(unsigned int nr_pages,
+		struct page **pages, int node)
+{
+	return xen_alloc_ballooned_pages(nr_pages, pages);
+}
 static inline int xen_alloc_unpopulated_pages(unsigned int nr_pages,
 		struct page **pages)
 {
@@ -86,6 +93,22 @@ static inline void xen_free_unpopulated_pages(unsigned int nr_pages,
 		struct page **pages)
 {
 	xen_free_ballooned_pages(nr_pages, pages);
+}
+#endif
+
+/*
+ * Resolve a foreign frame's host MFN to the Linux node id of the memory
+ * backing it, via XENMEM_get_mfn_pxms.  NUMA_NO_NODE for any failure
+ * mode (hypercall unsupported or refused, MFN unknown to Xen, PXM not
+ * in the ACPI namespace) -- callers degrade to node-oblivious behaviour.
+ */
+#include <linux/numa.h>
+#ifdef CONFIG_XEN_BACKEND_NUMA_AFFINITY
+int xen_mfn_to_node(unsigned long mfn);
+#else
+static inline int xen_mfn_to_node(unsigned long mfn)
+{
+	return NUMA_NO_NODE;
 }
 #endif
 
