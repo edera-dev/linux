@@ -85,10 +85,17 @@ static int xenbus_uevent_frontend(const struct device *_dev,
 }
 
 
+/* Condition for wait_for_devices(): bumped on every backend state change. */
+static atomic_t frontend_wait_seq = ATOMIC_INIT(0);
+static DECLARE_WAIT_QUEUE_HEAD(frontend_wait_wq);
+
 static void backend_changed(struct xenbus_watch *watch,
 			    const char *path, const char *token)
 {
 	xenbus_otherend_changed(watch, path, token, 1);
+
+	atomic_inc(&frontend_wait_seq);
+	wake_up(&frontend_wait_wq);
 }
 
 static void xenbus_frontend_delayed_restore(struct work_struct *w)
@@ -265,7 +272,7 @@ static int print_device_status(struct device *dev, void *data)
 static int ready_to_wait_for_devices;
 
 static bool wait_loop(unsigned long start, unsigned int max_delay,
-		     unsigned int *seconds_waited)
+		     unsigned int *seconds_waited, unsigned int seq)
 {
 	if (time_after(jiffies, start + (*seconds_waited+5)*HZ)) {
 		if (!*seconds_waited)
@@ -278,7 +285,8 @@ static bool wait_loop(unsigned long start, unsigned int max_delay,
 		}
 	}
 
-	schedule_timeout_interruptible(HZ/10);
+	wait_event_interruptible_timeout(frontend_wait_wq,
+			atomic_read(&frontend_wait_seq) != seq, HZ/10);
 
 	return false;
 }
@@ -301,18 +309,28 @@ static void wait_for_devices(struct xenbus_driver *xendrv)
 	unsigned long start = jiffies;
 	struct device_driver *drv = xendrv ? &xendrv->driver : NULL;
 	unsigned int seconds_waited = 0;
+	unsigned int seq;
 
 	if (!ready_to_wait_for_devices || !xen_domain())
 		return;
 
-	while (exists_non_essential_connecting_device(drv))
-		if (wait_loop(start, 30, &seconds_waited))
+	/* Sample the sequence before checking, so a change in between wakes us. */
+	for (;;) {
+		seq = atomic_read(&frontend_wait_seq);
+		if (!exists_non_essential_connecting_device(drv))
 			break;
+		if (wait_loop(start, 30, &seconds_waited, seq))
+			break;
+	}
 
 	/* Skips PVKB and PVFB check.*/
-	while (exists_essential_connecting_device(drv))
-		if (wait_loop(start, 270, &seconds_waited))
+	for (;;) {
+		seq = atomic_read(&frontend_wait_seq);
+		if (!exists_essential_connecting_device(drv))
 			break;
+		if (wait_loop(start, 270, &seconds_waited, seq))
+			break;
+	}
 
 	if (seconds_waited)
 		printk("\n");
