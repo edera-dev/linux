@@ -30,6 +30,8 @@
 #include <linux/dma-direct.h>
 #include <linux/dma-map-ops.h>
 #include <linux/export.h>
+#include <linux/gfp.h>
+#include <linux/vmalloc.h>
 #include <xen/swiotlb-xen.h>
 #include <xen/page.h>
 #include <xen/xen-ops.h>
@@ -195,6 +197,121 @@ xen_swiotlb_free_coherent(struct device *dev, size_t size, void *vaddr,
 }
 #endif /* CONFIG_X86 */
 
+#if defined(CONFIG_X86) && defined(CONFIG_CONTIG_ALLOC)
+/*
+ * swiotlb hands out bounce buffers from fixed IO_TLB_SEGSIZE segments, so it
+ * cannot serve a mapping larger than swiotlb_max_mapping_size().  A PV guest
+ * has no IOMMU of its own to stitch scattered machine frames together either,
+ * so such a mapping fails outright and the driver gets nothing.
+ *
+ * Make the caller's own pages machine contiguous instead of bouncing.  A
+ * bounce buffer is not usable here: a driver may map a buffer and only then
+ * write it, without a dma_sync_single_for_device() in between, and would then
+ * hand the device stale bytes.  Exchanging in place keeps one copy of the data,
+ * so what the CPU writes is what the device reads.
+ *
+ * XENMEM_exchange works in whole orders, so the pages between the end of the
+ * mapping and the end of the order have to be ours for the duration.  Claim
+ * them with alloc_contig_range() and hand them back once the exchange is done;
+ * their frames stay contiguous with the mapping, which costs nothing.
+ */
+static bool xen_contig_inplace = true;
+static int __init xen_contig_inplace_setup(char *s)
+{
+	return kstrtobool(s, &xen_contig_inplace);
+}
+early_param("xen_contig_inplace", xen_contig_inplace_setup);
+
+static dma_addr_t xen_make_range_contiguous(struct device *dev, phys_addr_t phys,
+					    size_t size)
+{
+	unsigned long nr = PFN_UP(size);
+	unsigned int order = order_base_2(nr);
+	unsigned long count = 1UL << order;
+	unsigned long pad = count - nr;
+	struct page *filler = NULL;
+	unsigned long *pfns, i;
+	dma_addr_t dma_addr;
+	void *saved;
+	int rc;
+
+	if (!xen_contig_inplace)
+		return DMA_MAPPING_ERROR;
+
+	/* Page migration and the exchange hypercall both sleep. */
+	if (!preemptible())
+		return DMA_MAPPING_ERROR;
+
+	if (!PAGE_ALIGNED(phys) || !pfn_valid(PHYS_PFN(phys)))
+		return DMA_MAPPING_ERROR;
+
+	pfns = kvmalloc_array(count, sizeof(*pfns), GFP_KERNEL);
+	if (!pfns)
+		return DMA_MAPPING_ERROR;
+
+	for (i = 0; i < nr; i++)
+		pfns[i] = PHYS_PFN(phys) + i;
+
+	/*
+	 * Pad up to the order with pages of our own, so the exchange never
+	 * touches memory the caller does not own.
+	 */
+	if (pad) {
+		filler = alloc_contig_pages(pad, GFP_KERNEL | __GFP_NOWARN,
+					    dev_to_node(dev), NULL);
+		if (!filler) {
+			dev_warn_once(dev, "no %lu page range free to pad a %zu byte mapping\n",
+				      pad, size);
+			goto free_pfns;
+		}
+		for (i = 0; i < pad; i++)
+			pfns[nr + i] = page_to_pfn(filler) + i;
+	}
+
+	/* The exchange scrubs the frames, so carry the caller's data across. */
+	saved = vmalloc(size);
+	if (!saved)
+		goto free_filler;
+	memcpy(saved, phys_to_virt(phys), size);
+
+	rc = xen_remap_pfns_contiguous(pfns, count, fls64(dma_get_mask(dev)),
+				       &dma_addr);
+	if (rc) {
+		dev_warn_once(dev,
+			      "cannot make an order-%u region contiguous (%d); Xen's memop-max-order may be lower than that\n",
+			      order, rc);
+		goto free_saved;
+	}
+
+	memcpy(phys_to_virt(phys), saved, size);
+	vfree(saved);
+	if (filler)
+		free_contig_range(page_to_pfn(filler), pad);
+	kvfree(pfns);
+
+	if (!dma_capable(dev, dma_addr, size, true))
+		return DMA_MAPPING_ERROR;
+
+	dev_info(dev, "made a %zu byte mapping contiguous in place\n", size);
+	return dma_addr;
+
+free_saved:
+	vfree(saved);
+free_filler:
+	if (filler)
+		free_contig_range(page_to_pfn(filler), pad);
+free_pfns:
+	kvfree(pfns);
+	return DMA_MAPPING_ERROR;
+}
+#else
+static dma_addr_t xen_make_range_contiguous(struct device *dev, phys_addr_t phys,
+					    size_t size)
+{
+	return DMA_MAPPING_ERROR;
+}
+#endif /* CONFIG_X86 && CONFIG_CONTIG_ALLOC */
+
 /*
  * Map a single buffer of the indicated size for DMA in streaming mode.  The
  * physical address to use is returned.
@@ -227,6 +344,15 @@ static dma_addr_t xen_swiotlb_map_page(struct device *dev, struct page *page,
 	 * Oh well, have to allocate and map a bounce buffer.
 	 */
 	trace_swiotlb_bounced(dev, dev_addr, size);
+
+	if (size > swiotlb_max_mapping_size(dev)) {
+		dma_addr_t contig = xen_make_range_contiguous(dev, phys, size);
+
+		if (contig != DMA_MAPPING_ERROR) {
+			dev_addr = contig;
+			goto done;
+		}
+	}
 
 	map = swiotlb_tbl_map_single(dev, phys, size, 0, dir, attrs);
 	if (map == (phys_addr_t)DMA_MAPPING_ERROR)

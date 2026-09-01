@@ -2358,6 +2358,103 @@ static int xen_exchange_memory(unsigned long extents_in, unsigned int order_in,
 	return success;
 }
 
+/*
+ * Exchange the frames behind a list of pages for one machine-contiguous extent
+ * covering all of them, in the order listed.  XENMEM_exchange only hands out
+ * whole orders, so @count must be a power of two -- but the pages themselves
+ * need not be adjacent, which lets a caller pad a short range with pages of its
+ * own rather than having to claim whichever pages happen to follow it.
+ *
+ * The outgoing frames are scrubbed before they go back to Xen, so the caller is
+ * responsible for carrying any data it cares about across the call.
+ */
+int xen_remap_pfns_contiguous(const unsigned long *pfns, unsigned long count,
+			      unsigned int address_bits, dma_addr_t *dma_handle)
+{
+	unsigned int order = order_base_2(count);
+	unsigned long *in_frames, out_frame;
+	struct multicall_space mcs;
+	unsigned long flags, i;
+	int success;
+
+	if (count != (1UL << order))
+		return -EINVAL;
+
+	if (unlikely(order > discontig_frames_order)) {
+		if (!discontig_frames_dyn)
+			return -ENOMEM;
+
+		if (alloc_discontig_frames(order))
+			return -ENOMEM;
+	}
+
+	for (i = 0; i < count; i++)
+		memset(pfn_to_kaddr(pfns[i]), 0, PAGE_SIZE);
+
+	spin_lock_irqsave(&xen_reservation_lock, flags);
+
+	in_frames = discontig_frames;
+
+	/* 1. Zap the current PTEs, remembering the frames. */
+	xen_mc_batch();
+	for (i = 0; i < count; i++) {
+		unsigned long vaddr = (unsigned long)pfn_to_kaddr(pfns[i]);
+
+		mcs = __xen_mc_entry(0);
+		in_frames[i] = pfn_to_mfn(pfns[i]);
+		MULTI_update_va_mapping(mcs.mc, vaddr, VOID_PTE, 0);
+		__set_phys_to_machine(pfns[i], INVALID_P2M_ENTRY);
+	}
+	xen_mc_issue(0);
+
+	/* 2. Get one contiguous extent in their place. */
+	out_frame = pfns[0];
+	success = xen_exchange_memory(count, 0, in_frames, 1, order, &out_frame,
+				      address_bits);
+
+	/* 3. Map the new extent, in order, over the same pages. */
+	xen_mc_batch();
+	for (i = 0; i < count; i++) {
+		unsigned long vaddr = (unsigned long)pfn_to_kaddr(pfns[i]);
+		unsigned long mfn = success ? out_frame + i : in_frames[i];
+		unsigned int uvmf = 0;
+
+		if (i == count - 1)
+			uvmf = UVMF_TLB_FLUSH | UVMF_ALL;
+
+		mcs = __xen_mc_entry(0);
+		MULTI_update_va_mapping(mcs.mc, vaddr,
+					mfn_pte(mfn, PAGE_KERNEL), uvmf);
+		set_phys_to_machine(pfns[i], mfn);
+	}
+	xen_mc_issue(0);
+
+	/*
+	 * 4. Xen took the single gpfn handed to it as the base of the whole
+	 * extent, so it recorded the frames as backing consecutive pages from
+	 * there -- true only of the leading run.  Point each frame back at the
+	 * page it really backs, or the m2p lies about every padding page and
+	 * pte_pfn() resolves to the wrong page once one is reused.
+	 */
+	if (success) {
+		xen_mc_batch();
+		for (i = 0; i < count; i++) {
+			struct mmu_update u;
+
+			u.ptr = ((uint64_t)(out_frame + i) << PAGE_SHIFT) |
+				MMU_MACHPHYS_UPDATE;
+			u.val = pfns[i];
+			xen_extend_mmu_update(&u);
+		}
+		xen_mc_issue(0);
+	}
+
+	spin_unlock_irqrestore(&xen_reservation_lock, flags);
+
+	*dma_handle = (dma_addr_t)pfn_to_mfn(pfns[0]) << PAGE_SHIFT;
+	return success ? 0 : -ENOMEM;
+}
+
 int xen_create_contiguous_region(phys_addr_t pstart, unsigned int order,
 				 unsigned int address_bits,
 				 dma_addr_t *dma_handle)

@@ -7,5 +7,7 @@ int xen_create_contiguous_region(phys_addr_t pstart, unsigned int order,
 				unsigned int address_bits,
 				dma_addr_t *dma_handle);
 void xen_destroy_contiguous_region(phys_addr_t pstart, unsigned int order);
+int xen_remap_pfns_contiguous(const unsigned long *pfns, unsigned long count,
+			      unsigned int address_bits, dma_addr_t *dma_handle);
 
 #endif /* _ASM_X86_SWIOTLB_XEN_H */
