@@ -119,6 +119,16 @@ static struct iommu_device *xen_iommu_probe_device(struct device *dev)
 	if (!dev_is_pci(dev))
 		return ERR_PTR(-ENODEV);
 
+	/*
+	 * Dom0 sees the real topology, bridges included, and Xen tracks all of
+	 * it. A guest only gets the endpoints vPCI assigned to it; the bridge
+	 * above them is emulated and has no device for Xen to attach a context
+	 * to, so leave it alone rather than fail the attach later.
+	 */
+	if (!xen_initial_domain() &&
+	    to_pci_dev(dev)->hdr_type != PCI_HEADER_TYPE_NORMAL)
+		return ERR_PTR(-ENODEV);
+
 	return &xen_iommu_device;
 }
 
