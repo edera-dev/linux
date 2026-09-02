@@ -14,6 +14,8 @@
 #include <linux/module.h>
 #include <linux/iommu.h>
 
+#include <xen/pci.h>
+
 #include "iommu-priv.h"
 #include <linux/pci.h>
 #include <linux/printk.h>
@@ -134,6 +136,29 @@ static struct iommu_domain *xen_iommu_domain_alloc_paging(struct device *dev)
 	return &domain->domain;
 }
 
+/*
+ * Name a device the way the hypervisor knows it. With vPCI the SBDF this domain
+ * sees is one Xen assigned and can translate. A PV guest's comes from pciback
+ * instead and means nothing to Xen, so use the machine BDF pciback published
+ * alongside it.
+ */
+static void xen_iommu_set_dev(struct physdev_pci_device *out,
+			      struct pci_dev *pdev)
+{
+	u32 sbdf;
+
+	if (!pcifront_machine_sbdf(pdev, &sbdf)) {
+		out->seg = sbdf >> 16;
+		out->bus = (sbdf >> 8) & 0xff;
+		out->devfn = sbdf & 0xff;
+		return;
+	}
+
+	out->seg = pci_domain_nr(pdev->bus);
+	out->bus = pdev->bus->number;
+	out->devfn = pdev->devfn;
+}
+
 static struct iommu_device *xen_iommu_probe_device(struct device *dev)
 {
 	if (!dev_is_pci(dev))
@@ -242,9 +267,7 @@ static int xen_iommu_attach_dev(struct iommu_domain *domain, struct device *dev,
 
 	pdev = to_pci_dev(dev);
 
-	reattach.dev.seg = pci_domain_nr(pdev->bus);
-	reattach.dev.bus = pdev->bus->number;
-	reattach.dev.devfn = pdev->devfn;
+	xen_iommu_set_dev(&reattach.dev, pdev);
 
 	return HYPERVISOR_iommu_op(IOMMU_reattach_device, &reattach);
 }
@@ -305,9 +328,7 @@ static void xen_iommu_get_resv_regions(struct device *dev, struct list_head *hea
 	map.nr_entries = 0;
 	map.flags = 0;
 
-	map.dev.pci.seg = pci_domain_nr(pdev->bus);
-	map.dev.pci.bus = pdev->bus->number;
-	map.dev.pci.devfn = pdev->devfn;
+	xen_iommu_set_dev(&map.dev.pci, pdev);
 
 	ret = HYPERVISOR_memory_op(XENMEM_reserved_device_memory_map, &map);
 
