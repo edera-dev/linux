@@ -13,6 +13,8 @@
 #include <linux/err.h>
 #include <linux/module.h>
 #include <linux/iommu.h>
+
+#include "iommu-priv.h"
 #include <linux/pci.h>
 #include <linux/printk.h>
 #include <linux/stddef.h>
@@ -373,6 +375,11 @@ static struct iommu_ops xen_iommu_ops = {
 		.free = xen_iommu_free,
 	},
 };
+
+bool xen_iommu_manages_iova(struct device *dev)
+{
+	return dev->iommu && dev_iommu_ops(dev) == &xen_iommu_ops;
+}
 
 static int __init xen_iommu_init(void)
 {
