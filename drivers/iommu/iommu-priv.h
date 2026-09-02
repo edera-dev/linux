@@ -7,6 +7,15 @@
 #include <linux/iommu.h>
 #include <linux/msi.h>
 
+#ifdef CONFIG_XEN_IOMMU
+bool xen_iommu_manages_iova(struct device *dev);
+#else
+static inline bool xen_iommu_manages_iova(struct device *dev)
+{
+	return false;
+}
+#endif
+
 static inline const struct iommu_ops *dev_iommu_ops(struct device *dev)
 {
 	/*
