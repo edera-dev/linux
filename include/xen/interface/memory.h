@@ -10,6 +10,7 @@
 #ifndef __XEN_PUBLIC_MEMORY_H__
 #define __XEN_PUBLIC_MEMORY_H__
 
+#include <xen/interface/physdev.h>
 #include <linux/spinlock.h>
 
 /*
@@ -215,6 +216,38 @@ struct xen_add_to_physmap_range {
 DEFINE_GUEST_HANDLE_STRUCT(xen_add_to_physmap_range);
 
 /*
+ * With some legacy devices, certain guest-physical addresses cannot safely
+ * be used for other purposes, e.g. to map guest RAM.  This hypercall
+ * enumerates those regions so the toolstack can avoid using them.
+ */
+#define XENMEM_reserved_device_memory_map   27
+struct xen_reserved_device_memory {
+    xen_pfn_t start_pfn;
+    xen_ulong_t nr_pages;
+};
+DEFINE_GUEST_HANDLE_STRUCT(xen_reserved_device_memory);
+
+struct xen_reserved_device_memory_map {
+#define XENMEM_RDM_ALL 1 /* Request all regions (ignore dev union). */
+    /* IN */
+    uint32_t flags;
+    /*
+     * IN/OUT
+     *
+     * Gets set to the required number of entries when too low,
+     * signaled by error code -ERANGE.
+     */
+    unsigned int nr_entries;
+    /* OUT */
+    GUEST_HANDLE(xen_reserved_device_memory) buffer;
+    /* IN */
+    union {
+        struct physdev_pci_device pci;
+    } dev;
+};
+DEFINE_GUEST_HANDLE_STRUCT(xen_reserved_device_memory_map);
+
+/*
  * Returns the pseudo-physical memory map as it was when the domain
  * was started (specified by XENMEM_set_memory_map).
  * arg == addr of struct xen_memory_map.
@@ -324,5 +357,31 @@ struct xen_mem_acquire_resource {
     GUEST_HANDLE(xen_pfn_t) frame_list;
 };
 DEFINE_GUEST_HANDLE_STRUCT(xen_mem_acquire_resource);
+
+/*
+ * XENMEM_get_mfn_pxms: resolve a batch of host MFNs to their firmware
+ * proximity-domain identifiers (host PXM on x86 ACPI).
+ *
+ * Returned values are in the host PXM namespace (the same value space
+ * dom0's own SRAT uses), not Xen's internal node id.  Callers convert
+ * to a Linux node id with pxm_to_node().  Slots Xen has no node info
+ * for receive XEN_INVALID_NUMA_ID rather than failing the whole batch.
+ *
+ * Restricted to the hardware domain.  On hypervisors that do not
+ * provide this op (older or non-Edera Xen, or builds without
+ * CONFIG_NUMA), the hypercall returns -ENOSYS; callers treat that as
+ * "feature unavailable" and fall back to NUMA-oblivious behaviour.
+ */
+#define XENMEM_get_mfn_pxms 40
+
+#define XEN_INVALID_NUMA_ID (~(uint32_t)0)
+
+struct xen_get_mfn_pxms {
+	GUEST_HANDLE(xen_pfn_t) mfns;
+	GUEST_HANDLE(uint32_t) pxms;
+	uint32_t nr_mfns;
+	uint32_t flags;
+};
+DEFINE_GUEST_HANDLE_STRUCT(xen_get_mfn_pxms);
 
 #endif /* __XEN_PUBLIC_MEMORY_H__ */
