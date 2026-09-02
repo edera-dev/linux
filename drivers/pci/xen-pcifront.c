@@ -8,6 +8,7 @@
 #include <linux/init.h>
 #include <linux/mm.h>
 #include <xen/xenbus.h>
+#include <xen/pci.h>
 #include <xen/events.h>
 #include <xen/grant_table.h>
 #include <xen/page.h>
@@ -403,6 +404,64 @@ static int pcifront_claim_resource(struct pci_dev *dev, void *data)
 
 	return 0;
 }
+
+/*
+ * pciback names every assigned device twice in its xenstore directory: dev-N is
+ * the machine BDF and vdev-N is the BDF this domain sees. Only the former means
+ * anything to the hypervisor, so hand it back to callers that have to name a
+ * device to Xen -- the PV-IOMMU driver -- since the BDF a PV guest sees was
+ * invented in the backend and never reached Xen at all.
+ *
+ * Returns the machine SBDF packed as Xen expects it: seg << 16 | bus << 8 |
+ * devfn.
+ */
+int pcifront_machine_sbdf(const struct pci_dev *dev, u32 *sbdf)
+{
+	unsigned int domain, bus, slot, func;
+	struct pcifront_device *pdev;
+	int i, num_devs;
+	char str[64];
+
+	if (dev->bus->ops != &pcifront_bus_ops)
+		return -ENODEV;
+
+	pdev = pcifront_get_pdev(dev->bus->sysdata);
+	if (!pdev)
+		return -ENODEV;
+
+	if (xenbus_scanf(XBT_NIL, pdev->xdev->otherend, "num_devs", "%d",
+			 &num_devs) != 1)
+		return -ENODEV;
+
+	for (i = 0; i < num_devs; i++) {
+		if (snprintf(str, sizeof(str), "vdev-%d", i) >= sizeof(str) - 1)
+			return -ENODEV;
+
+		if (xenbus_scanf(XBT_NIL, pdev->xdev->otherend, str,
+				 "%x:%x:%x.%x", &domain, &bus, &slot,
+				 &func) != 4)
+			continue;
+
+		if (domain != pci_domain_nr(dev->bus) ||
+		    bus != dev->bus->number ||
+		    PCI_DEVFN(slot, func) != dev->devfn)
+			continue;
+
+		if (snprintf(str, sizeof(str), "dev-%d", i) >= sizeof(str) - 1)
+			return -ENODEV;
+
+		if (xenbus_scanf(XBT_NIL, pdev->xdev->otherend, str,
+				 "%x:%x:%x.%x", &domain, &bus, &slot,
+				 &func) != 4)
+			return -ENODEV;
+
+		*sbdf = (domain << 16) | (bus << 8) | PCI_DEVFN(slot, func);
+		return 0;
+	}
+
+	return -ENODEV;
+}
+EXPORT_SYMBOL_GPL(pcifront_machine_sbdf);
 
 static int pcifront_scan_bus(struct pcifront_device *pdev,
 				unsigned int domain, unsigned int bus,
