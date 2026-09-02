@@ -43,7 +43,25 @@ struct xen_iommu_domain {
 static struct iommu_device xen_iommu_device;
 static struct pv_iommu_capabilities caps;
 
-static struct xen_iommu_domain xen_iommu_identity_domain;
+static int xen_iommu_attach_dev(struct iommu_domain *domain,
+				struct device *dev,
+				struct iommu_domain *old);
+
+static const struct iommu_domain_ops xen_iommu_identity_ops = {
+	.attach_dev = xen_iommu_attach_dev,
+};
+
+/*
+ * A statically allocated domain has to name its own type and ops; the core
+ * only fills those in for domains it allocated itself. Leaving type at 0 makes
+ * this an IOMMU_DOMAIN_BLOCKED domain with no ops at all.
+ */
+static struct xen_iommu_domain xen_iommu_identity_domain = {
+	.domain = {
+		.type = IOMMU_DOMAIN_IDENTITY,
+		.ops = &xen_iommu_identity_ops,
+	},
+};
 static unsigned long xen_iommu_pgsize_bitmap = XEN_PAGE_SIZE;
 static bool map_single_pages = false;
 
