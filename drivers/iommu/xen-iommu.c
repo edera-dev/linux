@@ -158,6 +158,22 @@ static void xen_iommu_set_dev(struct physdev_pci_device *out,
 	out->devfn = pdev->devfn;
 }
 
+/*
+ * A PV guest reaches its devices through xen-swiotlb, which hands them machine
+ * addresses. Putting a device in a translated context as well leaves two
+ * translations disagreeing about every address, and the DMA layer refuses the
+ * combination outright -- dma_supported() warns and fails once a device both
+ * uses iommu-dma and has dma_map_ops, which every PV guest does. Default to
+ * the identity context there and let translated ones be asked for explicitly.
+ */
+static int xen_iommu_def_domain_type(struct device *dev)
+{
+	if (xen_pv_domain())
+		return IOMMU_DOMAIN_IDENTITY;
+
+	return 0;
+}
+
 static struct iommu_device *xen_iommu_probe_device(struct device *dev)
 {
 	if (!dev_is_pci(dev))
@@ -386,6 +402,7 @@ static struct iommu_ops xen_iommu_ops = {
 	.probe_device = xen_iommu_probe_device,
 	.device_group = pci_device_group,
 	.get_resv_regions = xen_iommu_get_resv_regions,
+	.def_domain_type = xen_iommu_def_domain_type,
 	.default_domain_ops = &(const struct iommu_domain_ops) {
 		.map_pages = xen_iommu_map_pages,
 		.unmap_pages = xen_iommu_unmap_pages,
