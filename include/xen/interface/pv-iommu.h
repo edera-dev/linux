@@ -36,6 +36,7 @@ enum {
     IOMMU_flush_nested,     /* if IOMMUCAP_nested */
     IOMMU_attach_pasid,     /* if IOMMUCAP_pasid */
     IOMMU_detach_pasid,     /* if IOMMUCAP_pasid */
+    IOMMU_flush_pages,      /* if IOMMUCAP_deferred_flush */
 };
 
 /**
@@ -64,6 +65,11 @@ enum {
  * Support for IOMMU_ALLOC_identity
  */
 #define IOMMUCAP_identity (1 << 4)
+
+/**
+ * Support for IOMMU_MAP_no_flush and IOMMU_flush_pages.
+ */
+#define IOMMUCAP_deferred_flush (1 << 5)
 
 /**
  * IOMMU_query_capabilities
@@ -163,6 +169,12 @@ DEFINE_GUEST_HANDLE_STRUCT(pv_iommu_free_t);
 /* Enforce DMA coherency */
 #define IOMMU_MAP_cache (1 << 2)
 
+/*
+ * Don't flush the IOTLB for this call. The caller must issue IOMMU_flush_pages
+ * over the range before a device uses it.
+ */
+#define IOMMU_MAP_no_flush (1 << 3)
+
 /**
  * IOMMU_map_pages
  * Map pages on a IOMMU context.
@@ -192,6 +204,26 @@ struct pv_iommu_map_pages {
 
     /* OUT: Number of pages actually mapped */
     uint32_t mapped;
+};
+
+/**
+ * IOMMU_flush_pages
+ * Flush the IOTLB over a device frame range on a IOMMU context.
+ *
+ * Pairs with IOMMU_MAP_no_flush.
+ */
+struct pv_iommu_flush_pages {
+    /* IN: IOMMU context number */
+    uint16_t ctx_no;
+
+    /* IN: Device frame number */
+    uint64_aligned_t dfn;
+
+    /* IN: Size of pages to flush */
+    uint32_t pgsize;
+
+    /* IN: Number of pages to flush */
+    uint32_t nr_pages;
 };
 typedef struct pv_iommu_map_pages pv_iommu_map_pages_t;
 DEFINE_GUEST_HANDLE_STRUCT(pv_iommu_map_pages_t);
