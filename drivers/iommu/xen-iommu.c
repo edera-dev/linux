@@ -65,6 +65,9 @@ static struct xen_iommu_domain xen_iommu_identity_domain = {
 		.ops = &xen_iommu_identity_ops,
 	},
 };
+/* PCI base class 08h, sub-class 06h: IOMMU. */
+#define XEN_IOMMU_PCI_CLASS 0x0806
+
 static unsigned long xen_iommu_pgsize_bitmap = XEN_PAGE_SIZE;
 static bool map_single_pages = false;
 module_param(map_single_pages, bool, 0444);
@@ -190,6 +193,14 @@ static struct iommu_device *xen_iommu_probe_device(struct device *dev)
 	 */
 	if (!xen_initial_domain() &&
 	    to_pci_dev(dev)->hdr_type != PCI_HEADER_TYPE_NORMAL)
+		return ERR_PTR(-ENODEV);
+
+	/*
+	 * An IOMMU does not sit behind itself, so Xen has no device for it and
+	 * a context can never be attached. Claiming it fails the first attach,
+	 * which the IOMMU core treats as fatal to registering the driver.
+	 */
+	if ((to_pci_dev(dev)->class >> 8) == XEN_IOMMU_PCI_CLASS)
 		return ERR_PTR(-ENODEV);
 
 	return &xen_iommu_device;
