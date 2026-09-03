@@ -401,7 +401,24 @@ static void xen_teardown_msi_irqs(struct pci_dev *dev)
 
 static void xen_pv_teardown_msi_irqs(struct pci_dev *dev)
 {
-	if (dev->msix_enabled)
+	struct msi_desc *desc;
+	bool msix = false;
+
+	/*
+	 * pci_disable_msix() clears msix_enabled in pci_msix_shutdown() before
+	 * freeing the irqs brings us here, so it cannot say which of the two
+	 * the device was using. Ask a descriptor instead: getting this wrong
+	 * leaves the backend with MSI-X still enabled on the real device, and
+	 * the next attempt to enable it fails with -EALREADY.
+	 *
+	 * The descriptor lock is already held by pci_disable_msix().
+	 */
+	msi_for_each_desc(desc, &dev->dev, MSI_DESC_ALL) {
+		msix = desc->pci.msi_attrib.is_msix;
+		break;
+	}
+
+	if (msix)
 		xen_pci_frontend_disable_msix(dev);
 	else
 		xen_pci_frontend_disable_msi(dev);
