@@ -67,6 +67,9 @@ static struct xen_iommu_domain xen_iommu_identity_domain = {
 };
 static unsigned long xen_iommu_pgsize_bitmap = XEN_PAGE_SIZE;
 static bool map_single_pages = false;
+module_param(map_single_pages, bool, 0444);
+MODULE_PARM_DESC(map_single_pages,
+		 "Issue one hypercall per page instead of per contiguous run");
 
 static inline struct xen_iommu_domain *to_xen_iommu_domain(struct iommu_domain *dom)
 {
@@ -221,7 +224,6 @@ static int xen_iommu_map_pages(struct iommu_domain *domain, unsigned long iova,
 
 	if (map_single_pages) {
 		size_t i = 0;
-		map.nr_pages = 1;
 
 		for (; i < pgcount; i++) {
 			map.gfn = pfn_to_gfn(pfn0 + i);
@@ -234,11 +236,33 @@ static int xen_iommu_map_pages(struct iommu_domain *domain, unsigned long iova,
 				break;
 		}
 	} else {
-		map.nr_pages = pgcount;
-		map.gfn = pfn_to_gfn(pfn0);
-		map.dfn = dfn0;
+		size_t done = 0;
 
-		ret = HYPERVISOR_iommu_op(IOMMU_map_pages, &map);
+		/*
+		 * A subop covers a run of pages contiguous in both dfn and gfn.
+		 * In a PV domain pfn_to_gfn(x + 1) != pfn_to_gfn(x) + 1 in
+		 * general, so walk the request and issue one subop per maximal
+		 * run rather than assuming the whole of it is contiguous.
+		 */
+		while (done < pgcount) {
+			uint64_t gfn0 = pfn_to_gfn(pfn0 + done);
+			size_t run = 1;
+
+			while (done + run < pgcount &&
+			       pfn_to_gfn(pfn0 + done + run) == gfn0 + run)
+				run++;
+
+			map.gfn = gfn0;
+			map.dfn = dfn0 + done;
+			map.nr_pages = run;
+
+			ret = HYPERVISOR_iommu_op(IOMMU_map_pages, &map);
+
+			if (ret)
+				break;
+
+			done += run;
+		}
 	}
 
 	if (mapped)
@@ -474,20 +498,6 @@ static int __init xen_iommu_init(void)
 	}
 
 	xen_iommu_pgsize_bitmap = caps.pgsize_mask;
-
-	if (xen_domain_type == XEN_PV_DOMAIN)
-		/* TODO: In PV domain, due to the existing pfn-gfn mapping we need to
-		 * consider that under certains circonstances, we have :
-		 *   pfn_to_gfn(x + 1) != pfn_to_gfn(x) + 1
-		 *
-		 * In these cases, we would want to separate the subop into several calls.
-		 * (only doing the grouped operation when the mapping is actually contigous)
-		 * Only map operation would be affected, as unmap actually uses dfn which
-		 * doesn't have this kind of mapping.
-		 *
-		 * Force single-page operations to work arround this issue for now.
-		 */
-		map_single_pages = true;
 
 	/* Initialize identity domain */
 	xen_iommu_identity_domain.ctx_no = 0;
