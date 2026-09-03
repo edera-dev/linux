@@ -12,6 +12,8 @@
 #include <linux/irq.h>
 #include <linux/irqdomain.h>
 
+#include <xen/xen.h>
+
 #include "../pci.h"
 #include "msi.h"
 
@@ -214,6 +216,15 @@ static inline void pci_write_msg_msix(struct msi_desc *desc, struct msi_msg *msg
 
 	if (desc->pci.msi_attrib.is_virtual)
 		return;
+
+	/*
+	 * A PV guest never owns the MSI-X table.  Xen programs it when mapping
+	 * the pirq and maps it read-only, so the masking and message writes
+	 * below would fault; vfio-pci refreshes the message unconditionally.
+	 */
+	if (xen_pv_domain())
+		return;
+
 	/*
 	 * The specification mandates that the entry is masked
 	 * when the message is modified:
