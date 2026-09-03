@@ -69,6 +69,8 @@ static struct xen_iommu_domain xen_iommu_identity_domain = {
 #define XEN_IOMMU_PCI_CLASS 0x0806
 
 static unsigned long xen_iommu_pgsize_bitmap = XEN_PAGE_SIZE;
+static bool deferred_flush;
+
 static bool map_single_pages = false;
 module_param(map_single_pages, bool, 0444);
 MODULE_PARM_DESC(map_single_pages,
@@ -233,6 +235,14 @@ static int xen_iommu_map_pages(struct iommu_domain *domain, unsigned long iova,
 	if (prot & IOMMU_CACHE)
 		map.map_flags |= IOMMU_MAP_cache;
 
+	/*
+	 * A scattered buffer costs one subop per run of contiguous frames, and
+	 * each one flushes. Leave the flush to iotlb_sync_map(), which pays it
+	 * once for the whole mapping.
+	 */
+	if (deferred_flush)
+		map.map_flags |= IOMMU_MAP_no_flush;
+
 	if (map_single_pages) {
 		size_t i = 0;
 
@@ -283,6 +293,23 @@ static int xen_iommu_map_pages(struct iommu_domain *domain, unsigned long iova,
 				prot, gfp, &_mapped);
 
 	return ret;
+}
+
+static int xen_iommu_sync_map(struct iommu_domain *domain, unsigned long iova,
+			      size_t size)
+{
+	struct xen_iommu_domain *dom = to_xen_iommu_domain(domain);
+	struct pv_iommu_flush_pages flush = {
+		.ctx_no = dom->ctx_no,
+		.dfn = addr_to_pfn(iova),
+		.pgsize = PAGE_SIZE,
+		.nr_pages = size >> PAGE_SHIFT,
+	};
+
+	if (!deferred_flush)
+		return 0;
+
+	return HYPERVISOR_iommu_op(IOMMU_flush_pages, &flush);
 }
 
 static size_t xen_iommu_unmap_pages(struct iommu_domain *domain, unsigned long iova,
@@ -440,6 +467,7 @@ static struct iommu_ops xen_iommu_ops = {
 	.def_domain_type = xen_iommu_def_domain_type,
 	.default_domain_ops = &(const struct iommu_domain_ops) {
 		.map_pages = xen_iommu_map_pages,
+		.iotlb_sync_map = xen_iommu_sync_map,
 		.unmap_pages = xen_iommu_unmap_pages,
 		.attach_dev = xen_iommu_attach_dev,
 		.iova_to_phys = xen_iommu_iova_to_phys,
@@ -502,6 +530,9 @@ static int __init xen_iommu_init(void)
 	pr_info("pgsize_mask=%d\n", caps.pgsize_mask);
 	pr_info("default_identity=%c\n", (caps.cap_flags & IOMMUCAP_default_identity) ? 'y' : 'n');
 	pr_info("cache=%c\n", (caps.cap_flags & IOMMUCAP_cache) ? 'y' : 'n');
+
+	deferred_flush = caps.cap_flags & IOMMUCAP_deferred_flush;
+	pr_info("deferred_flush=%c\n", deferred_flush ? 'y' : 'n');
 
 	if (caps.max_ctx_no == 0) {
 		pr_err("Unable to use IOMMU PV driver (no context available ?)\n");
