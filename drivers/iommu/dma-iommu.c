@@ -29,6 +29,8 @@
 #include <linux/of_iommu.h>
 #include <linux/pci.h>
 #include <linux/pci-p2pdma.h>
+
+#include "iommu-priv.h"
 #include <linux/scatterlist.h>
 #include <linux/spinlock.h>
 #include <linux/swiotlb.h>
@@ -559,7 +561,17 @@ static int iova_reserve_iommu_regions(struct device *dev,
 	LIST_HEAD(resv_regions);
 	int ret = 0;
 
-	if (dev_is_pci(dev)) {
+	/*
+	 * A PCI host bridge's windows are reserved so that an IOVA cannot
+	 * collide with an address the bridge would route to MMIO. Under a
+	 * paravirtual IOMMU the IOVA space belongs to the hypervisor and is not
+	 * the bridge's address space at all, and the windows a Xen guest sees
+	 * are invented -- pcifront hands out iomem_resource itself, and a PVH
+	 * guest with no host bridge _CRS gets Linux's catch-all default. There
+	 * is nothing meaningful to reserve, and reserving it leaves no usable
+	 * IOVA space whatsoever.
+	 */
+	if (dev_is_pci(dev) && !xen_iommu_manages_iova(dev)) {
 		ret = iova_reserve_pci_windows(to_pci_dev(dev), iovad);
 		if (ret)
 			return ret;

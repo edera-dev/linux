@@ -363,6 +363,18 @@ config VIRTIO_IOMMU
 
 	  Say Y here if you intend to run this kernel as a guest.
 
+config XEN_IOMMU
+	bool "Xen IOMMU driver"
+	depends on XEN
+	select IOMMU_API
+	select IOMMU_IO_PGTABLE
+	help
+		Xen PV-IOMMU driver.
+
+		Say Y here if you intend to run this kernel under Xen, either as
+		Dom0 or as a guest whose passed-through devices come through
+		vPCI.
+
 config SPRD_IOMMU
 	tristate "Unisoc IOMMU Support"
 	depends on ARCH_SPRD || COMPILE_TEST
