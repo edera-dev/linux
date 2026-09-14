@@ -311,9 +311,75 @@ static struct resource xen_resource = {
 	.name = "Xen unused space",
 };
 
+static int __init xen_fdt_find_hypervisor(unsigned long node,
+					 const char *uname, int depth,
+					 void *data)
+{
+	if (depth != 1 || strcmp(uname, "hypervisor") != 0 ||
+	    !of_flat_dt_is_compatible(node, "xen,xen"))
+		return 0;
+
+	*(unsigned long *)data = node;
+	return 1;
+}
+
+/*
+ * Read the extended regions out of the flat device tree.
+ *
+ * A domain booted with ACPI never unflattens the tree, so the of_* accessors
+ * below have nothing to walk -- but it is still handed a tree, and Xen puts
+ * the extended regions in the hypervisor node of it whichever way the machine
+ * is described.  The early scan that chose ACPI over the device tree has
+ * already read this very node, to know it was not real hardware.
+ */
+static int __init xen_fdt_ext_regions(struct resource **out, unsigned int *nr_out)
+{
+	unsigned long node = 0;
+	const __be32 *reg;
+	struct resource *regs;
+	unsigned int i, nr, entry_cells;
+	int len;
+
+	if (!of_scan_flat_dt(xen_fdt_find_hypervisor, &node) || !node)
+		return -ENODEV;
+
+	reg = of_get_flat_dt_prop(node, "reg", &len);
+	if (!reg)
+		return -ENODEV;
+
+	entry_cells = dt_root_addr_cells + dt_root_size_cells;
+	if (!entry_cells)
+		return -EINVAL;
+
+	nr = len / (entry_cells * sizeof(__be32));
+	/* Entry 0 is the grant table; the rest are the extended regions. */
+	if (nr <= EXT_REGION_INDEX)
+		return -EINVAL;
+	nr -= EXT_REGION_INDEX;
+
+	regs = kcalloc(nr, sizeof(*regs), GFP_KERNEL);
+	if (!regs)
+		return -ENOMEM;
+
+	reg += EXT_REGION_INDEX * entry_cells;
+	for (i = 0; i < nr; i++) {
+		u64 start = dt_mem_next_cell(dt_root_addr_cells, &reg);
+		u64 size = dt_mem_next_cell(dt_root_size_cells, &reg);
+
+		regs[i].start = start;
+		regs[i].end = start + size - 1;
+		regs[i].flags = IORESOURCE_MEM;
+	}
+
+	*out = regs;
+	*nr_out = nr;
+
+	return 0;
+}
+
 int __init arch_xen_unpopulated_init(struct resource **res)
 {
-	struct device_node *np;
+	struct device_node *np = NULL;
 	struct resource *regs, *tmp_res;
 	uint64_t min_gpaddr = -1, max_gpaddr = 0;
 	unsigned int i, nr_reg = 0;
@@ -322,38 +388,47 @@ int __init arch_xen_unpopulated_init(struct resource **res)
 	if (!xen_domain())
 		return -ENODEV;
 
-	if (!acpi_disabled)
-		return -ENODEV;
+	if (!acpi_disabled) {
+		rc = xen_fdt_ext_regions(&regs, &nr_reg);
+		if (rc) {
+			pr_err("No extended regions are found\n");
+			return rc;
+		}
+	} else {
+		np = of_find_compatible_node(NULL, NULL, "xen,xen");
+		if (WARN_ON(!np))
+			return -ENODEV;
 
-	np = of_find_compatible_node(NULL, NULL, "xen,xen");
-	if (WARN_ON(!np))
-		return -ENODEV;
+		/* Skip region 0 which is reserved for grant table space */
+		while (of_get_address(np, nr_reg + EXT_REGION_INDEX, NULL, NULL))
+			nr_reg++;
 
-	/* Skip region 0 which is reserved for grant table space */
-	while (of_get_address(np, nr_reg + EXT_REGION_INDEX, NULL, NULL))
-		nr_reg++;
+		if (!nr_reg) {
+			pr_err("No extended regions are found\n");
+			of_node_put(np);
+			return -EINVAL;
+		}
 
-	if (!nr_reg) {
-		pr_err("No extended regions are found\n");
-		of_node_put(np);
-		return -EINVAL;
+		regs = kcalloc(nr_reg, sizeof(*regs), GFP_KERNEL);
+		if (!regs) {
+			of_node_put(np);
+			return -ENOMEM;
+		}
+
+		/*
+		 * Create resource from extended regions provided by the
+		 * hypervisor to be used as unused address space for Xen
+		 * scratch pages.
+		 */
+		for (i = 0; i < nr_reg; i++) {
+			rc = of_address_to_resource(np, i + EXT_REGION_INDEX,
+						    &regs[i]);
+			if (rc)
+				goto err;
+		}
 	}
 
-	regs = kcalloc(nr_reg, sizeof(*regs), GFP_KERNEL);
-	if (!regs) {
-		of_node_put(np);
-		return -ENOMEM;
-	}
-
-	/*
-	 * Create resource from extended regions provided by the hypervisor to be
-	 * used as unused address space for Xen scratch pages.
-	 */
 	for (i = 0; i < nr_reg; i++) {
-		rc = of_address_to_resource(np, i + EXT_REGION_INDEX, &regs[i]);
-		if (rc)
-			goto err;
-
 		if (max_gpaddr < regs[i].end)
 			max_gpaddr = regs[i].end;
 		if (min_gpaddr > regs[i].start)
