@@ -66,7 +66,7 @@
  * Whether the host must be told about resource backing pages by DMA address
  * rather than guest-physical address.
  *
- * This mirrors vring_use_dma_api() in drivers/virtio/virtio_ring.c, including
+ * This mirrors vring_use_map_api() in drivers/virtio/virtio_ring.c, including
  * its xen_domain() case.
  */
 static inline bool virtio_gpu_use_dma_api(const struct virtio_device *vdev)
