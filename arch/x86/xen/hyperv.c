@@ -96,6 +96,7 @@ arch_initcall(xen_hyperv_init);
  */
 static void (*xen_vmbus_handler)(void);
 static DEFINE_PER_CPU(int, xen_vmbus_irq);
+static int xen_vmbus_cpuhp_state;
 
 static irqreturn_t xen_hyperv_vmbus_isr(int irq, void *dev_id)
 {
@@ -144,8 +145,25 @@ int hyperv_setup_xen_vmbus_irq(void (*isr)(void))
 
 	ret = cpuhp_setup_state(CPUHP_AP_ONLINE_DYN, "xen/hyperv-vmbus:online",
 				xen_hyperv_vmbus_cpu_up, xen_hyperv_vmbus_cpu_down);
+	if (ret < 0) {
+		xen_vmbus_handler = NULL;
+		return ret;
+	}
 
-	return ret < 0 ? ret : 0;
+	xen_vmbus_cpuhp_state = ret;
+
+	return 0;
+}
+
+void hyperv_remove_xen_vmbus_irq(void)
+{
+	if (!xen_vmbus_cpuhp_state)
+		return;
+
+	/* Runs xen_hyperv_vmbus_cpu_down() on each cpu, unbinding the VIRQ. */
+	cpuhp_remove_state(xen_vmbus_cpuhp_state);
+	xen_vmbus_cpuhp_state = 0;
+	xen_vmbus_handler = NULL;
 }
 
 /*
