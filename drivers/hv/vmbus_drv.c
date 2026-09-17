@@ -1519,7 +1519,9 @@ err_connect:
 	cpuhp_remove_state(hyperv_cpuhp_online);
 err_alloc:
 	hv_synic_free();
-	if (vmbus_irq == -1) {
+	if (hyperv_nested_on_xen) {
+		hyperv_remove_xen_vmbus_irq();
+	} else if (vmbus_irq == -1) {
 		hv_remove_vmbus_handler();
 	} else {
 		free_percpu_irq(vmbus_irq, vmbus_evt);
@@ -3033,7 +3035,9 @@ static void __exit vmbus_exit(void)
 	vmbus_connection.conn_state = DISCONNECTED;
 	hv_stimer_global_cleanup();
 	vmbus_disconnect();
-	if (vmbus_irq == -1) {
+	if (hyperv_nested_on_xen) {
+		hyperv_remove_xen_vmbus_irq();
+	} else if (vmbus_irq == -1) {
 		hv_remove_vmbus_handler();
 	} else {
 		free_percpu_irq(vmbus_irq, vmbus_evt);
