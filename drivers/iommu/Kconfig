@@ -373,7 +373,7 @@ config VIRTIO_IOMMU
 
 config XEN_IOMMU
 	bool "Xen IOMMU driver"
-	depends on XEN
+	depends on X86 && XEN
 	select IOMMU_API
 	select IOMMU_IO_PGTABLE
 	help
