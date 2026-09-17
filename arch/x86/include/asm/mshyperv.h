@@ -78,6 +78,7 @@ unsigned long hv_nested_hostpfn(unsigned long pfn);
 u64 hv_nested_hostpa(void *va);
 void __init hyperv_init_nested_on_xen(void);
 int hyperv_setup_xen_vmbus_irq(void (*isr)(void));
+void hyperv_remove_xen_vmbus_irq(void);
 /*
  * The vector vPCI device MSIs must be composed with, and the parent irq domain
  * for them: the host delivers such an MSI to a vector Xen owns and relays it to
@@ -92,6 +93,7 @@ static inline unsigned long hv_nested_hostpfn(unsigned long pfn) { return pfn; }
 static inline u64 hv_nested_hostpa(void *va) { return 0; }
 static inline void hyperv_init_nested_on_xen(void) {}
 static inline int hyperv_setup_xen_vmbus_irq(void (*isr)(void)) { return -ENODEV; }
+static inline void hyperv_remove_xen_vmbus_irq(void) {}
 static inline unsigned int hyperv_xen_vpci_vector(void) { return 0; }
 static inline struct irq_domain *hyperv_xen_vpci_root_domain(void) { return NULL; }
 #endif
