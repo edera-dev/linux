@@ -2291,6 +2291,114 @@ static void xen_remap_exchanged_ptes(unsigned long vaddr, int order,
 }
 
 /*
+ * A p2m leaf covers this many pfns, so a run touches one leaf per stride plus
+ * whichever leaf its last pfn falls in.
+ */
+#define P2M_PFNS_PER_LEAF (PAGE_SIZE / sizeof(unsigned long))
+
+/*
+ * Make every p2m leaf that a run of @count pfns from @pfn writes through
+ * present, so that xen_remap_contig_pfns() over the run cannot fail for want
+ * of one. Callers run this before asking Xen to populate the run, while a
+ * failure is still easy to back out of.
+ */
+int xen_prealloc_p2m_range(unsigned long pfn, unsigned long count)
+{
+	unsigned long i;
+	int ret;
+
+	for (i = 0; i < count; i += P2M_PFNS_PER_LEAF) {
+		ret = xen_alloc_p2m_entry(pfn + i);
+		if (ret < 0)
+			return ret;
+	}
+
+	return xen_alloc_p2m_entry(pfn + count - 1);
+}
+EXPORT_SYMBOL_GPL(xen_prealloc_p2m_range);
+
+/* PTE updates per mmu_update hypercall, few enough to batch on the stack. */
+#define CONTIG_PTE_BATCH	32UL
+
+/*
+ * Point the direct map PTEs of @count contiguous pfns from @pfn at the frames
+ * counting up from @mfn when @map, or clear them when not, and set their p2m
+ * entries to match. Returns 0, or the error for the first PTE or p2m entry
+ * that could not be written.
+ */
+static int xen_set_contig_ptes(unsigned long pfn, unsigned long mfn,
+			       unsigned long count, bool map)
+{
+	struct mmu_update u[CONTIG_PTE_BATCH];
+
+	while (count) {
+		unsigned long vaddr = (unsigned long)__va(pfn << PAGE_SHIFT);
+		unsigned long batch = min(count, CONTIG_PTE_BATCH);
+		unsigned long i;
+		unsigned int level;
+		pte_t *ptep;
+		int ret;
+
+		/* Stay within one PTE page, so that its entries are consecutive. */
+		batch = min(batch, (PMD_SIZE - (vaddr & ~PMD_MASK)) >> PAGE_SHIFT);
+
+		ptep = lookup_address(vaddr, &level);
+		if (!ptep || level != PG_LEVEL_4K)
+			return -EINVAL;
+
+		for (i = 0; i < batch; i++) {
+			unsigned long frame = map ? mfn + i : INVALID_P2M_ENTRY;
+			pte_t pte = map ? mfn_pte(frame, PAGE_KERNEL) : VOID_PTE;
+
+			if (!__set_phys_to_machine(pfn + i, frame))
+				return -ENOMEM;
+
+			u[i].ptr = virt_to_machine(ptep + i).maddr |
+				   MMU_NORMAL_PT_UPDATE;
+			u[i].val = pte_val_ma(pte);
+		}
+
+		ret = HYPERVISOR_mmu_update(u, batch, NULL, DOMID_SELF);
+		if (ret < 0)
+			return ret;
+
+		pfn += batch;
+		mfn += batch;
+		count -= batch;
+	}
+
+	return 0;
+}
+
+/*
+ * Point a run of @count contiguous pfns from @pfn at the equally contiguous
+ * machine frames from @mfn. The caller must have run xen_prealloc_p2m_range()
+ * over the same run.
+ *
+ * No TLB flush is done: a run is only ever mapped over PTEs that
+ * xen_zap_contig_pfns() already cleared, so there is no stale entry to shoot
+ * down.
+ */
+int xen_remap_contig_pfns(unsigned long pfn, unsigned long mfn,
+			  unsigned long count)
+{
+	return xen_set_contig_ptes(pfn, mfn, count, true);
+}
+EXPORT_SYMBOL_GPL(xen_remap_contig_pfns);
+
+/*
+ * Unmap a run of @count contiguous pfns from @pfn and invalidate their p2m
+ * entries. Writing an invalid entry never needs a new leaf, so unlike the
+ * remap above this needs no preallocation. The caller flushes the TLB before
+ * the frames are handed back to Xen.
+ */
+int xen_zap_contig_pfns(unsigned long pfn, unsigned long count)
+{
+	return xen_set_contig_ptes(pfn, INVALID_P2M_ENTRY, count, false);
+}
+EXPORT_SYMBOL_GPL(xen_zap_contig_pfns);
+
+/*
  * Perform the hypercall to exchange a region of our pages to point to memory
  * with the required contiguous alignment.  Takes as input the mfns to trade
  * in (mfns_in) and the pfns where the new pages are to appear (fns_inout),
