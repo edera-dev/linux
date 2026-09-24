@@ -115,6 +115,14 @@ static const struct ctl_table balloon_table[] = {
 #define BALLOON_BLOCK_ORDER	(BALLOON_BLOCK_XEN_ORDER - EXTENT_ORDER)
 #define BALLOON_BLOCK_NR_PAGES	(1UL << BALLOON_BLOCK_ORDER)
 
+/*
+ * Most blocks populated by one deflate. On PV each block also costs a page
+ * table update per page, batched but done under balloon_mutex. Capping the
+ * batch keeps a large target change from holding the mutex against a later
+ * target update, or against the OOM notifier, which can only trylock it.
+ */
+#define BALLOON_BLOCK_BATCH	32
+
 static bool __read_mostly balloon_superpages = true;
 module_param(balloon_superpages, bool, 0444);
 
@@ -229,6 +237,15 @@ static struct page *balloon_retrieve_block(void)
 		__ClearPageOffline(head + i);
 
 	return head;
+}
+
+static struct page *balloon_next_block(struct page *head)
+{
+	struct list_head *next = head->lru.next;
+
+	if (next == &ballooned_blocks)
+		return NULL;
+	return list_entry(next, struct page, lru);
 }
 
 /*
@@ -527,6 +544,94 @@ static enum bp_state increase_reservation(unsigned long nr_pages)
 	return BP_DONE;
 }
 
+/*
+ * Populate whole parked blocks, one order-9 extent each, so that Xen backs
+ * each block with a single machine-contiguous 2 MiB run. On PVH Xen maps that
+ * run with one 2 MiB EPT entry rather than 512 4 KiB ones.
+ */
+static enum bp_state increase_reservation_blocks(unsigned long nr_blocks)
+{
+	struct page *head;
+	unsigned long i, j;
+	int rc;
+
+	if (nr_blocks > BALLOON_BLOCK_BATCH)
+		nr_blocks = BALLOON_BLOCK_BATCH;
+
+	head = list_first_entry_or_null(&ballooned_blocks, struct page, lru);
+	for (i = 0; i < nr_blocks; i++) {
+		if (!head) {
+			nr_blocks = i;
+			break;
+		}
+
+		/*
+		 * Has to happen before the hypercall: mapping the block in
+		 * below cannot allocate, and once Xen has populated an extent
+		 * there is no way to hand it back. A short batch is fine; what
+		 * is left is deflated on a later pass.
+		 */
+		if (xenmem_reservation_p2m_prealloc(BALLOON_BLOCK_NR_PAGES,
+						    head)) {
+			nr_blocks = i;
+			break;
+		}
+
+		frame_list[i] = page_to_xen_pfn(head);
+		head = balloon_next_block(head);
+	}
+
+	if (!nr_blocks)
+		return BP_EAGAIN;
+
+	rc = xenmem_reservation_increase_order(nr_blocks, frame_list,
+					       BALLOON_BLOCK_ORDER);
+	if (rc <= 0)
+		return BP_EAGAIN;
+
+	for (i = 0; i < rc; i++) {
+		head = balloon_retrieve_block();
+		BUG_ON(head == NULL);
+
+		/*
+		 * A PV domain gets back only the base machine frame of each
+		 * extent, the rest of the block following it; on PVH there is
+		 * nothing to map.
+		 */
+		xenmem_reservation_va_mapping_update_contig(
+				BALLOON_BLOCK_NR_PAGES, head, frame_list[i]);
+
+		for (j = 0; j < BALLOON_BLOCK_NR_PAGES; j++)
+			free_reserved_page(head + j);
+	}
+
+	balloon_stats.current_pages += rc * BALLOON_BLOCK_NR_PAGES;
+
+	return BP_DONE;
+}
+
+/*
+ * Deflate by whole blocks while Xen can supply a 2 MiB extent, a page at a
+ * time otherwise. Xen refuses a block when the host has no free 2 MiB run,
+ * or when the domain is less than 2 MiB below its max_pages ceiling, and
+ * neither must stop the guest growing by what it can still get.
+ */
+static enum bp_state balloon_deflate(unsigned long nr_pages)
+{
+	if (balloon_blocks_usable() && balloon_stats.balloon_blocks &&
+	    nr_pages >= BALLOON_BLOCK_NR_PAGES) {
+		unsigned long before = balloon_stats.current_pages;
+		enum bp_state state;
+
+		state = increase_reservation_blocks(nr_pages >>
+						    BALLOON_BLOCK_ORDER);
+		if (balloon_stats.current_pages != before)
+			return state;
+	}
+
+	return increase_reservation(nr_pages);
+}
+
 static enum bp_state decrease_reservation(unsigned long nr_pages, gfp_t gfp)
 {
 	enum bp_state state = BP_DONE;
@@ -724,7 +829,7 @@ static int balloon_thread(void *unused)
 
 		if (credit > 0) {
 			if (balloon_is_inflated())
-				balloon_state = increase_reservation(credit);
+				balloon_state = balloon_deflate(credit);
 			else
 				balloon_state = reserve_additional_memory();
 		}
@@ -984,6 +1089,8 @@ static int __init balloon_init(void)
 	BUILD_BUG_ON(BALLOON_BLOCK_ORDER > MAX_PAGE_ORDER);
 	/* Inflating a block takes one frame_list entry per page. */
 	BUILD_BUG_ON(BALLOON_BLOCK_NR_PAGES > ARRAY_SIZE(frame_list));
+	/* Deflating takes one frame_list entry per block. */
+	BUILD_BUG_ON(BALLOON_BLOCK_BATCH > ARRAY_SIZE(frame_list));
 
 	pr_info("Initialising balloon driver\n");
 
