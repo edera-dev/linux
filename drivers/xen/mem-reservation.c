@@ -80,6 +80,43 @@ void __xenmem_reservation_va_mapping_reset(unsigned long count,
 	}
 }
 EXPORT_SYMBOL_GPL(__xenmem_reservation_va_mapping_reset);
+
+void __xenmem_reservation_va_mapping_update_contig(unsigned long count,
+						   struct page *page,
+						   xen_pfn_t frame)
+{
+	BUILD_BUG_ON(XEN_PAGE_SIZE != PAGE_SIZE);
+
+	/*
+	 * Fatal, as in the per-page helper: callers treat the run as mapped
+	 * once this returns, and a page without a mapping faults wherever it
+	 * is next used, far from here.
+	 */
+	BUG_ON(xen_remap_contig_pfns(page_to_pfn(page), frame, count));
+}
+EXPORT_SYMBOL_GPL(__xenmem_reservation_va_mapping_update_contig);
+
+void __xenmem_reservation_va_mapping_reset_contig(unsigned long count,
+						  struct page *page)
+{
+	BUILD_BUG_ON(XEN_PAGE_SIZE != PAGE_SIZE);
+
+	/*
+	 * Unlike the per-page helper, only a warning: a frame left mapped is a
+	 * leak, but Xen will not hand it to another domain while any mapping
+	 * of it remains.
+	 */
+	WARN_ON_ONCE(xen_zap_contig_pfns(page_to_pfn(page), count));
+}
+EXPORT_SYMBOL_GPL(__xenmem_reservation_va_mapping_reset_contig);
+
+int __xenmem_reservation_p2m_prealloc(unsigned long count, struct page *page)
+{
+	BUILD_BUG_ON(XEN_PAGE_SIZE != PAGE_SIZE);
+
+	return xen_prealloc_p2m_range(page_to_pfn(page), count);
+}
+EXPORT_SYMBOL_GPL(__xenmem_reservation_p2m_prealloc);
 #endif /* CONFIG_XEN_HAVE_PVMMU */
 
 /*
