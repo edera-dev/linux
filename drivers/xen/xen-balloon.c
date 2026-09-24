@@ -145,6 +145,7 @@ EXPORT_SYMBOL_GPL(xen_balloon_init);
 BALLOON_SHOW(current_kb, "%lu\n", PAGES2KB(balloon_stats.current_pages));
 BALLOON_SHOW(low_kb, "%lu\n", PAGES2KB(balloon_stats.balloon_low));
 BALLOON_SHOW(high_kb, "%lu\n", PAGES2KB(balloon_stats.balloon_high));
+BALLOON_SHOW(blocks, "%lu\n", balloon_stats.balloon_blocks);
 
 static DEVICE_ULONG_ATTR(schedule_delay, 0444, balloon_stats.schedule_delay);
 static DEVICE_ULONG_ATTR(max_schedule_delay, 0644, balloon_stats.max_schedule_delay);
@@ -223,6 +224,7 @@ static struct attribute *balloon_info_attrs[] = {
 	&dev_attr_current_kb.attr,
 	&dev_attr_low_kb.attr,
 	&dev_attr_high_kb.attr,
+	&dev_attr_blocks.attr,
 	NULL
 };
 
