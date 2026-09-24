@@ -15,6 +15,8 @@ struct balloon_stats {
 	/* Number of pages in high- and low-memory balloons. */
 	unsigned long balloon_low;
 	unsigned long balloon_high;
+	/* Number of whole superpage blocks parked on the balloon. */
+	unsigned long balloon_blocks;
 	unsigned long total_pages;
 	unsigned long schedule_delay;
 	unsigned long max_schedule_delay;
