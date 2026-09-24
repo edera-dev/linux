@@ -82,12 +82,18 @@ void __xenmem_reservation_va_mapping_reset(unsigned long count,
 EXPORT_SYMBOL_GPL(__xenmem_reservation_va_mapping_reset);
 #endif /* CONFIG_XEN_HAVE_PVMMU */
 
-/* @frames is an array of PFNs */
-int xenmem_reservation_increase(int count, xen_pfn_t *frames)
+/*
+ * @frames is an array of PFNs, one per extent.  Each extent covers
+ * 1 << @order native pages.  For a PV domain Xen reports back only the base
+ * machine frame of each extent; the rest of the extent follows it
+ * contiguously.
+ */
+int xenmem_reservation_increase_order(int count, xen_pfn_t *frames,
+				      unsigned int order)
 {
 	struct xen_memory_reservation reservation = {
 		.address_bits = 0,
-		.extent_order = EXTENT_ORDER,
+		.extent_order = EXTENT_ORDER + order,
 		.domid        = DOMID_SELF
 	};
 
@@ -95,6 +101,13 @@ int xenmem_reservation_increase(int count, xen_pfn_t *frames)
 	set_xen_guest_handle(reservation.extent_start, frames);
 	reservation.nr_extents = count;
 	return HYPERVISOR_memory_op(XENMEM_populate_physmap, &reservation);
+}
+EXPORT_SYMBOL_GPL(xenmem_reservation_increase_order);
+
+/* @frames is an array of PFNs */
+int xenmem_reservation_increase(int count, xen_pfn_t *frames)
+{
+	return xenmem_reservation_increase_order(count, frames, 0);
 }
 EXPORT_SYMBOL_GPL(xenmem_reservation_increase);
 
