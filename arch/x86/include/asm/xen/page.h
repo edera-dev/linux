@@ -55,6 +55,11 @@ extern unsigned long  xen_max_p2m_pfn;
 
 extern int xen_alloc_p2m_entry(unsigned long pfn);
 
+extern int xen_prealloc_p2m_range(unsigned long pfn, unsigned long count);
+extern int xen_remap_contig_pfns(unsigned long pfn, unsigned long mfn,
+				 unsigned long count);
+extern int xen_zap_contig_pfns(unsigned long pfn, unsigned long count);
+
 extern unsigned long get_phys_to_machine(unsigned long pfn);
 extern bool set_phys_to_machine(unsigned long pfn, unsigned long mfn);
 extern bool __set_phys_to_machine(unsigned long pfn, unsigned long mfn);
