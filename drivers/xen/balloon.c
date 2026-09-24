@@ -998,10 +998,10 @@ static int balloon_oom_notify(struct notifier_block *nb, unsigned long dummy,
 
 	/* runs XENMEM_populate_physmap, updates current_pages */
 	if (nr > 0)
-		increase_reservation(nr);
+		balloon_deflate(nr);
 
 	/*
-	 * increase_reservation() bumped current_pages by however many Xen
+	 * balloon_deflate() bumped current_pages by however many Xen
 	 * actually populated (possibly fewer than asked, or zero if the host is
 	 * out or we are already at max_pages). Report that to the OOM killer so
 	 * it retries instead of killing when we made progress.
