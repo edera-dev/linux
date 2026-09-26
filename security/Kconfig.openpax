@@ -6,7 +6,7 @@ menu "OpenPaX options"
 
 config OPENPAX
 	bool "Enable OpenPaX features"
-	default y
+	default n
 	help
 	  This configuration setting enables OpenPaX features.
 	  OpenPaX adds memory safety-related defenses to the kernel which
@@ -14,6 +14,7 @@ config OPENPAX
 
 config OPENPAX_SOFTMODE
 	bool "Support PaX soft mode"
+	depends on OPENPAX
 	default y
 	help
 	  Enabling this option will allow you to configure OpenPaX
