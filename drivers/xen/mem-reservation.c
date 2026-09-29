@@ -80,14 +80,57 @@ void __xenmem_reservation_va_mapping_reset(unsigned long count,
 	}
 }
 EXPORT_SYMBOL_GPL(__xenmem_reservation_va_mapping_reset);
+
+void __xenmem_reservation_va_mapping_update_contig(unsigned long count,
+						   struct page *page,
+						   xen_pfn_t frame)
+{
+	BUILD_BUG_ON(XEN_PAGE_SIZE != PAGE_SIZE);
+
+	/*
+	 * Fatal, as in the per-page helper: callers treat the run as mapped
+	 * once this returns, and a page without a mapping faults wherever it
+	 * is next used, far from here.
+	 */
+	BUG_ON(xen_remap_contig_pfns(page_to_pfn(page), frame, count));
+}
+EXPORT_SYMBOL_GPL(__xenmem_reservation_va_mapping_update_contig);
+
+void __xenmem_reservation_va_mapping_reset_contig(unsigned long count,
+						  struct page *page)
+{
+	BUILD_BUG_ON(XEN_PAGE_SIZE != PAGE_SIZE);
+
+	/*
+	 * Unlike the per-page helper, only a warning: a frame left mapped is a
+	 * leak, but Xen will not hand it to another domain while any mapping
+	 * of it remains.
+	 */
+	WARN_ON_ONCE(xen_zap_contig_pfns(page_to_pfn(page), count));
+}
+EXPORT_SYMBOL_GPL(__xenmem_reservation_va_mapping_reset_contig);
+
+int __xenmem_reservation_p2m_prealloc(unsigned long count, struct page *page)
+{
+	BUILD_BUG_ON(XEN_PAGE_SIZE != PAGE_SIZE);
+
+	return xen_prealloc_p2m_range(page_to_pfn(page), count);
+}
+EXPORT_SYMBOL_GPL(__xenmem_reservation_p2m_prealloc);
 #endif /* CONFIG_XEN_HAVE_PVMMU */
 
-/* @frames is an array of PFNs */
-int xenmem_reservation_increase(int count, xen_pfn_t *frames)
+/*
+ * @frames is an array of PFNs, one per extent.  Each extent covers
+ * 1 << @order native pages.  For a PV domain Xen reports back only the base
+ * machine frame of each extent; the rest of the extent follows it
+ * contiguously.
+ */
+int xenmem_reservation_increase_order(int count, xen_pfn_t *frames,
+				      unsigned int order)
 {
 	struct xen_memory_reservation reservation = {
 		.address_bits = 0,
-		.extent_order = EXTENT_ORDER,
+		.extent_order = EXTENT_ORDER + order,
 		.domid        = DOMID_SELF
 	};
 
@@ -95,6 +138,13 @@ int xenmem_reservation_increase(int count, xen_pfn_t *frames)
 	set_xen_guest_handle(reservation.extent_start, frames);
 	reservation.nr_extents = count;
 	return HYPERVISOR_memory_op(XENMEM_populate_physmap, &reservation);
+}
+EXPORT_SYMBOL_GPL(xenmem_reservation_increase_order);
+
+/* @frames is an array of PFNs */
+int xenmem_reservation_increase(int count, xen_pfn_t *frames)
+{
+	return xenmem_reservation_increase_order(count, frames, 0);
 }
 EXPORT_SYMBOL_GPL(xenmem_reservation_increase);
 

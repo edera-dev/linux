@@ -108,6 +108,25 @@ static const struct ctl_table balloon_table[] = {
 #define EXTENT_ORDER (fls(XEN_PFN_PER_PAGE) - 1)
 
 /*
+ * A balloon block is 2 MiB of Xen pages, the largest extent Xen lets a domU
+ * request for itself: CONFIG_DOMU_MAX_ORDER is PAGETABLE_ORDER on x86.
+ */
+#define BALLOON_BLOCK_XEN_ORDER	9
+#define BALLOON_BLOCK_ORDER	(BALLOON_BLOCK_XEN_ORDER - EXTENT_ORDER)
+#define BALLOON_BLOCK_NR_PAGES	(1UL << BALLOON_BLOCK_ORDER)
+
+/*
+ * Most blocks populated by one deflate. On PV each block also costs a page
+ * table update per page, batched but done under balloon_mutex. Capping the
+ * batch keeps a large target change from holding the mutex against a later
+ * target update, or against the OOM notifier, which can only trylock it.
+ */
+#define BALLOON_BLOCK_BATCH	32
+
+static bool __read_mostly balloon_superpages = true;
+module_param(balloon_superpages, bool, 0444);
+
+/*
  * balloon_thread() state:
  *
  * BP_DONE: done or nothing to do,
@@ -139,10 +158,20 @@ static xen_pfn_t frame_list[PAGE_SIZE / sizeof(xen_pfn_t)];
 static LIST_HEAD(ballooned_pages);
 static DECLARE_WAIT_QUEUE_HEAD(balloon_wq);
 
+/* List of ballooned blocks, threaded through each block's head page. */
+static LIST_HEAD(ballooned_blocks);
+
 /* When ballooning out (allocating memory to return to Xen) we don't really
    want the kernel to try too hard since that can trigger the oom killer. */
 #define GFP_BALLOON \
 	(GFP_HIGHUSER | __GFP_NOWARN | __GFP_NORETRY | __GFP_NOMEMALLOC)
+
+/*
+ * A block is only taken when the guest has a whole free 2 MiB run to spare:
+ * the balloon never reclaims or compacts to make one, and inflates a page at
+ * a time instead.
+ */
+#define GFP_BALLOON_BLOCK	(GFP_BALLOON & ~__GFP_RECLAIM)
 
 /* balloon_append: add the given page to the balloon. */
 static void balloon_append(struct page *page)
@@ -163,12 +192,87 @@ static void balloon_append(struct page *page)
 	wake_up(&balloon_wq);
 }
 
+/*
+ * A block is accounted as one unit, which the low/high split of the page list
+ * cannot express. That only matters with highmem, which the 64-bit
+ * configurations Xen guests run on do not have.
+ */
+static bool balloon_blocks_usable(void)
+{
+	return balloon_superpages && !IS_ENABLED(CONFIG_HIGHMEM);
+}
+
+/* balloon_append_block: park a whole block on the balloon. */
+static void balloon_append_block(struct page *head)
+{
+	unsigned long i;
+
+	for (i = 0; i < BALLOON_BLOCK_NR_PAGES; i++)
+		__SetPageOffline(head + i);
+
+	list_add(&head->lru, &ballooned_blocks);
+	balloon_stats.balloon_blocks++;
+	mod_node_page_state(page_pgdat(head), NR_BALLOON_PAGES,
+			    BALLOON_BLOCK_NR_PAGES);
+
+	wake_up(&balloon_wq);
+}
+
+/* balloon_retrieve_block: rescue a whole block from the balloon. */
+static struct page *balloon_retrieve_block(void)
+{
+	struct page *head;
+	unsigned long i;
+
+	head = list_first_entry_or_null(&ballooned_blocks, struct page, lru);
+	if (!head)
+		return NULL;
+
+	list_del(&head->lru);
+	balloon_stats.balloon_blocks--;
+	mod_node_page_state(page_pgdat(head), NR_BALLOON_PAGES,
+			    -(long)BALLOON_BLOCK_NR_PAGES);
+
+	for (i = 0; i < BALLOON_BLOCK_NR_PAGES; i++)
+		__ClearPageOffline(head + i);
+
+	return head;
+}
+
+static struct page *balloon_next_block(struct page *head)
+{
+	struct list_head *next = head->lru.next;
+
+	if (next == &ballooned_blocks)
+		return NULL;
+	return list_entry(next, struct page, lru);
+}
+
+/*
+ * Spill one block onto the page list so the order-0 paths can consume it.
+ * This is one way: the pages go back to being ballooned individually, and
+ * only form a block again if a later inflate allocates the same run whole.
+ */
+static bool balloon_break_block(void)
+{
+	struct page *head = balloon_retrieve_block();
+	unsigned long i;
+
+	if (!head)
+		return false;
+
+	for (i = 0; i < BALLOON_BLOCK_NR_PAGES; i++)
+		balloon_append(head + i);
+
+	return true;
+}
+
 /* balloon_retrieve: rescue a page from the balloon, if it is not empty. */
 static struct page *balloon_retrieve(bool require_lowmem)
 {
 	struct page *page;
 
-	if (list_empty(&ballooned_pages))
+	if (list_empty(&ballooned_pages) && !balloon_break_block())
 		return NULL;
 
 	page = list_entry(ballooned_pages.next, struct page, lru);
@@ -385,7 +489,8 @@ static long current_credit(void)
 
 static bool balloon_is_inflated(void)
 {
-	return balloon_stats.balloon_low || balloon_stats.balloon_high;
+	return balloon_stats.balloon_low || balloon_stats.balloon_high ||
+	       balloon_stats.balloon_blocks;
 }
 
 static enum bp_state increase_reservation(unsigned long nr_pages)
@@ -396,6 +501,14 @@ static enum bp_state increase_reservation(unsigned long nr_pages)
 
 	if (nr_pages > ARRAY_SIZE(frame_list))
 		nr_pages = ARRAY_SIZE(frame_list);
+
+	/*
+	 * Memory parked as whole blocks is invisible to the page list walk
+	 * below. Break a block onto the list rather than find nothing to
+	 * populate while the balloon still holds memory.
+	 */
+	if (list_empty(&ballooned_pages))
+		balloon_break_block();
 
 	page = list_first_entry_or_null(&ballooned_pages, struct page, lru);
 	for (i = 0; i < nr_pages; i++) {
@@ -429,6 +542,94 @@ static enum bp_state increase_reservation(unsigned long nr_pages)
 	balloon_stats.current_pages += rc;
 
 	return BP_DONE;
+}
+
+/*
+ * Populate whole parked blocks, one order-9 extent each, so that Xen backs
+ * each block with a single machine-contiguous 2 MiB run. On PVH Xen maps that
+ * run with one 2 MiB EPT entry rather than 512 4 KiB ones.
+ */
+static enum bp_state increase_reservation_blocks(unsigned long nr_blocks)
+{
+	struct page *head;
+	unsigned long i, j;
+	int rc;
+
+	if (nr_blocks > BALLOON_BLOCK_BATCH)
+		nr_blocks = BALLOON_BLOCK_BATCH;
+
+	head = list_first_entry_or_null(&ballooned_blocks, struct page, lru);
+	for (i = 0; i < nr_blocks; i++) {
+		if (!head) {
+			nr_blocks = i;
+			break;
+		}
+
+		/*
+		 * Has to happen before the hypercall: mapping the block in
+		 * below cannot allocate, and once Xen has populated an extent
+		 * there is no way to hand it back. A short batch is fine; what
+		 * is left is deflated on a later pass.
+		 */
+		if (xenmem_reservation_p2m_prealloc(BALLOON_BLOCK_NR_PAGES,
+						    head)) {
+			nr_blocks = i;
+			break;
+		}
+
+		frame_list[i] = page_to_xen_pfn(head);
+		head = balloon_next_block(head);
+	}
+
+	if (!nr_blocks)
+		return BP_EAGAIN;
+
+	rc = xenmem_reservation_increase_order(nr_blocks, frame_list,
+					       BALLOON_BLOCK_ORDER);
+	if (rc <= 0)
+		return BP_EAGAIN;
+
+	for (i = 0; i < rc; i++) {
+		head = balloon_retrieve_block();
+		BUG_ON(head == NULL);
+
+		/*
+		 * A PV domain gets back only the base machine frame of each
+		 * extent, the rest of the block following it; on PVH there is
+		 * nothing to map.
+		 */
+		xenmem_reservation_va_mapping_update_contig(
+				BALLOON_BLOCK_NR_PAGES, head, frame_list[i]);
+
+		for (j = 0; j < BALLOON_BLOCK_NR_PAGES; j++)
+			free_reserved_page(head + j);
+	}
+
+	balloon_stats.current_pages += rc * BALLOON_BLOCK_NR_PAGES;
+
+	return BP_DONE;
+}
+
+/*
+ * Deflate by whole blocks while Xen can supply a 2 MiB extent, a page at a
+ * time otherwise. Xen refuses a block when the host has no free 2 MiB run,
+ * or when the domain is less than 2 MiB below its max_pages ceiling, and
+ * neither must stop the guest growing by what it can still get.
+ */
+static enum bp_state balloon_deflate(unsigned long nr_pages)
+{
+	if (balloon_blocks_usable() && balloon_stats.balloon_blocks &&
+	    nr_pages >= BALLOON_BLOCK_NR_PAGES) {
+		unsigned long before = balloon_stats.current_pages;
+		enum bp_state state;
+
+		state = increase_reservation_blocks(nr_pages >>
+						    BALLOON_BLOCK_ORDER);
+		if (balloon_stats.current_pages != before)
+			return state;
+	}
+
+	return increase_reservation(nr_pages);
 }
 
 static enum bp_state decrease_reservation(unsigned long nr_pages, gfp_t gfp)
@@ -488,6 +689,94 @@ static enum bp_state decrease_reservation(unsigned long nr_pages, gfp_t gfp)
 	return state;
 }
 
+static enum bp_state decrease_reservation_blocks(unsigned long nr_blocks)
+{
+	enum bp_state state = BP_DONE;
+	unsigned long i, j, nr_pages;
+	struct page *head, *tmp;
+	LIST_HEAD(blocks);
+	int ret;
+
+	/*
+	 * One extent per native page even though the frames form whole blocks.
+	 * XENMEM_decrease_reservation releases each frame individually
+	 * whatever the extent order, so an ordered extent would change nothing
+	 * here while asking Xen to trust that the block is machine-contiguous,
+	 * a claim it cannot check for a PV domain, where the frame number it
+	 * is handed is already the machine frame. What lets Xen merge the
+	 * frames back into a 2 MiB buddy is that they are a whole aligned run,
+	 * which they are whenever the block is backed by one machine-contiguous
+	 * allocation.
+	 */
+	if (nr_blocks > ARRAY_SIZE(frame_list) / BALLOON_BLOCK_NR_PAGES)
+		nr_blocks = ARRAY_SIZE(frame_list) / BALLOON_BLOCK_NR_PAGES;
+
+	for (i = 0; i < nr_blocks; i++) {
+		head = alloc_pages(GFP_BALLOON_BLOCK, BALLOON_BLOCK_ORDER);
+		if (head == NULL) {
+			nr_blocks = i;
+			state = BP_EAGAIN;
+			break;
+		}
+
+		split_page(head, BALLOON_BLOCK_ORDER);
+		adjust_managed_page_count(head, -(long)BALLOON_BLOCK_NR_PAGES);
+
+		for (j = 0; j < BALLOON_BLOCK_NR_PAGES; j++)
+			xenmem_reservation_scrub_page(head + j);
+
+		list_add(&head->lru, &blocks);
+	}
+
+	if (!nr_blocks)
+		return state;
+
+	kmap_flush_unused();
+
+	i = 0;
+	list_for_each_entry_safe(head, tmp, &blocks, lru) {
+		for (j = 0; j < BALLOON_BLOCK_NR_PAGES; j++)
+			frame_list[i++] = xen_page_to_gfn(head + j);
+
+		xenmem_reservation_va_mapping_reset_contig(
+				BALLOON_BLOCK_NR_PAGES, head);
+
+		list_del(&head->lru);
+
+		balloon_append_block(head);
+	}
+
+	flush_tlb_all();
+
+	nr_pages = nr_blocks * BALLOON_BLOCK_NR_PAGES;
+	ret = xenmem_reservation_decrease(nr_pages, frame_list);
+	BUG_ON(ret != nr_pages);
+
+	balloon_stats.current_pages -= nr_pages;
+
+	return state;
+}
+
+/*
+ * Inflate by whole blocks while the guest has one to spare, a page at a time
+ * otherwise. A guest with plenty of free memory can still have no whole free
+ * 2 MiB run left, and that must not stop it shrinking.
+ */
+static enum bp_state balloon_inflate(unsigned long nr_pages)
+{
+	if (balloon_blocks_usable() && nr_pages >= BALLOON_BLOCK_NR_PAGES) {
+		unsigned long before = balloon_stats.current_pages;
+		enum bp_state state;
+
+		state = decrease_reservation_blocks(nr_pages >>
+						    BALLOON_BLOCK_ORDER);
+		if (balloon_stats.current_pages != before)
+			return state;
+	}
+
+	return decrease_reservation(nr_pages, GFP_BALLOON);
+}
+
 /*
  * Stop waiting if either state is BP_DONE and ballooning action is
  * needed, or if the credit has changed while state is not BP_DONE.
@@ -540,7 +829,7 @@ static int balloon_thread(void *unused)
 
 		if (credit > 0) {
 			if (balloon_is_inflated())
-				balloon_state = increase_reservation(credit);
+				balloon_state = balloon_deflate(credit);
 			else
 				balloon_state = reserve_additional_memory();
 		}
@@ -549,8 +838,7 @@ static int balloon_thread(void *unused)
 			long n_pages;
 
 			n_pages = min(-credit, si_mem_available());
-			balloon_state = decrease_reservation(n_pages,
-							     GFP_BALLOON);
+			balloon_state = balloon_inflate(n_pages);
 			if (balloon_state == BP_DONE && n_pages != -credit &&
 			    n_pages < totalreserve_pages)
 				balloon_state = BP_EAGAIN;
@@ -696,8 +984,9 @@ static int balloon_oom_notify(struct notifier_block *nb, unsigned long dummy,
 	if (!mutex_trylock(&balloon_mutex))
 		return NOTIFY_OK;
 
-	/* nr: number of pages parked on the balloon list that we can reclaim */
-	nr = balloon_stats.balloon_low + balloon_stats.balloon_high;
+	/* nr: number of pages parked on the balloon that we can reclaim */
+	nr = balloon_stats.balloon_low + balloon_stats.balloon_high +
+	     balloon_stats.balloon_blocks * BALLOON_BLOCK_NR_PAGES;
 
 	/* clamp, so we don't release all of them at once */
 	nr = min_t(unsigned long, nr, BALLOON_OOM_DEFLATE_BATCH);
@@ -709,10 +998,10 @@ static int balloon_oom_notify(struct notifier_block *nb, unsigned long dummy,
 
 	/* runs XENMEM_populate_physmap, updates current_pages */
 	if (nr > 0)
-		increase_reservation(nr);
+		balloon_deflate(nr);
 
 	/*
-	 * increase_reservation() bumped current_pages by however many Xen
+	 * balloon_deflate() bumped current_pages by however many Xen
 	 * actually populated (possibly fewer than asked, or zero if the host is
 	 * out or we are already at max_pages). Report that to the OOM killer so
 	 * it retries instead of killing when we made progress.
@@ -794,6 +1083,14 @@ static int __init balloon_init(void)
 
 	if (!xen_domain())
 		return -ENODEV;
+
+	/* A block must span at least a native page, and be allocatable. */
+	BUILD_BUG_ON(BALLOON_BLOCK_XEN_ORDER < EXTENT_ORDER);
+	BUILD_BUG_ON(BALLOON_BLOCK_ORDER > MAX_PAGE_ORDER);
+	/* Inflating a block takes one frame_list entry per page. */
+	BUILD_BUG_ON(BALLOON_BLOCK_NR_PAGES > ARRAY_SIZE(frame_list));
+	/* Deflating takes one frame_list entry per block. */
+	BUILD_BUG_ON(BALLOON_BLOCK_BATCH > ARRAY_SIZE(frame_list));
 
 	pr_info("Initialising balloon driver\n");
 
