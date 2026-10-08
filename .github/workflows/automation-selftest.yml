@@ -1,0 +1,60 @@
+name: Automation self-test
+
+# Tests the scripts the nightly rebase relies on to decide whether to
+# force-push edera/mainline, so a change that weakens either must not land
+# quietly:
+#
+#   - verify-upstream-rebase.sh: honest replays pass, including one that
+#     flattens a merged series; edited, dropped, added and merged commits and
+#     a stale base are all refused;
+#   - report-needs-decision.sh: any question in Claude's report, or anything
+#     marked UNSURE, stops the automatic push.
+#
+# It runs only when the automation itself changes.
+
+on:
+  pull_request:
+    types: [opened, synchronize, ready_for_review]
+    branches: ['edera/**']
+    paths:
+      - '.github/scripts/**'
+      - '.github/workflows/upstream-rebase.yml'
+      - '.github/workflows/kernel-nightly.yml'
+      - '.github/workflows/rebase-land.yml'
+      - '.github/workflows/automation-selftest.yml'
+      - '.automation/**'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: automation-selftest-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  selftest:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Harden runner
+        uses: step-security/harden-runner@05e31511f85b41b11d1cf0ef85d0992719546e2c # v2.21.0
+        with:
+          egress-policy: audit
+
+      # Only the automation is needed, not the kernel.
+      - name: Checkout
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+          sparse-checkout: |
+            .github
+            .automation
+
+      - name: Rebase checker tests
+        run: bash .github/scripts/tests/verify-upstream-rebase.test.sh
+
+      - name: Decision detector tests
+        run: bash .github/scripts/tests/report-needs-decision.test.sh
+
+      - name: Shellcheck
+        run: shellcheck .github/scripts/*.sh .github/scripts/tests/*.sh
