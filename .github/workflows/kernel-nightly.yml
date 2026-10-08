@@ -1,0 +1,58 @@
+name: Nightly kernel maintenance
+
+# Rebases edera/mainline onto torvalds master every night
+# (upstream-rebase.yml).
+#
+# Claude does the rebase. Independent checks decide whether the result is
+# pushed or proposed as a pull request; see upstream-rebase.yml.
+#
+# GitHub runs scheduled workflows only from the default branch, which is
+# edera/6.18-lts. Until this file is there too, the schedule does not fire.
+#
+# Repository configuration this needs:
+#   vars.REBASE_APP_CLIENT_ID, secrets.REBASE_APP_PRIVATE_KEY
+#       A GitHub App installed on this repository with contents, pull requests
+#       and workflows write, allowed to bypass the protection rules on
+#       edera/mainline. GITHUB_TOKEN cannot do this job: it cannot push
+#       commits that touch .github/workflows/ (every rebase rewrites the ones
+#       that add them), and pull requests it opens do not trigger other
+#       workflows.
+#   vars.ANTHROPIC_FEDERATION_RULE_ID, ANTHROPIC_ORGANIZATION_ID,
+#   ANTHROPIC_SERVICE_ACCOUNT_ID, ANTHROPIC_WORKSPACE_ID
+#       Organization-wide workload identity federation for the Claude API. The
+#       rule must accept this workflow's OIDC subject (a scheduled run on
+#       edera/6.18-lts), which a rule written for pull_request events will
+#       not.
+
+on:
+  schedule:
+    - cron: '23 3 * * *' # 03:23 UTC nightly
+  workflow_dispatch:
+    inputs:
+      force:
+        description: Rebase even if an open rebase pull request already covers this upstream tip
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: kernel-nightly
+  cancel-in-progress: false
+
+jobs:
+  mainline:
+    uses: ./.github/workflows/upstream-rebase.yml
+    permissions:
+      contents: read
+      pull-requests: read
+      issues: write
+      id-token: write
+    with:
+      downstream: edera/mainline
+      key: mainline
+      upstream_url: https://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux.git
+      upstream_branch: master
+      force: ${{ inputs.force == true }}
+    secrets: inherit
