@@ -195,7 +195,7 @@ jobs:
       - name: Normalize identifiers
         id: ids
         env:
-          RULE: ${{ vars.ANTHROPIC_FEDERATION_RULE_ID }}
+          RULE: ${{ vars.REBASE_FEDERATION_RULE_ID }}
           ORG: ${{ vars.ANTHROPIC_ORGANIZATION_ID }}
           SVC: ${{ vars.ANTHROPIC_SERVICE_ACCOUNT_ID }}
           WS: ${{ vars.ANTHROPIC_WORKSPACE_ID }}
@@ -211,10 +211,10 @@ jobs:
           # An unset variable otherwise surfaces as an opaque API failure a
           # second into the model step, with nothing in the log to say why.
           missing=0
-          for n in FEDERATION_RULE_ID:RULE ORGANIZATION_ID:ORG SERVICE_ACCOUNT_ID:SVC WORKSPACE_ID:WS; do
+          for n in REBASE_FEDERATION_RULE_ID:RULE ANTHROPIC_ORGANIZATION_ID:ORG ANTHROPIC_SERVICE_ACCOUNT_ID:SVC ANTHROPIC_WORKSPACE_ID:WS; do
             eval "v=\$${n#*:}"
             if [ -z "$(strip "$v")" ]; then
-              echo "::error::vars.ANTHROPIC_${n%%:*} is empty or not visible to this repository."
+              echo "::error::vars.${n%%:*} is empty or not visible to this repository."
               missing=1
             fi
           done
