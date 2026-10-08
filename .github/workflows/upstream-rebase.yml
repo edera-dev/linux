@@ -1,0 +1,665 @@
+name: Upstream rebase
+
+# Rebases an Edera kernel integration tree onto its upstream. Called nightly
+# by kernel-nightly.yml for edera/mainline, onto torvalds master.
+#
+# Claude does the rebase, following .automation/skills/upstream-rebase/
+# SKILL.md: it replays the series, resolves conflicts, fixes what the replay
+# broke, builds, audits upstream fixes that meet the series, and writes a
+# report.
+#
+# Nothing Claude says about its own result decides what happens to it. The
+# model runs in a job that holds a read-only token and cannot push. Its branch
+# leaves that job as a git bundle, and two things then judge it
+# independently, with scripts taken from the commit this run started from
+# (the default branch), never from the tree under test:
+#
+#   - verify-upstream-rebase.sh proves the series sits on the upstream tip, is
+#     linear, lost or gained no commit, and changed the tree by exactly the
+#     upstream delta;
+#   - kernel-build.sh builds x86_64 and arm64 vmlinux with every downstream
+#     feature built in.
+#
+# If both pass and Claude's report asks for no decision
+# (report-needs-decision.sh), the tree is force-pushed to the result, pinned
+# by lease to the tip the rebase started from, with the old tip kept as a
+# backup branch. Otherwise, or if that push is refused, the result goes up as
+# a rebase/<tree>/... branch with a pull request carrying Claude's report;
+# approving that pull request lands it (rebase-land.yml). A night where
+# Claude could not produce a branch at all opens an issue instead.
+#
+# Nights with nothing new upstream stop in the first job and never start the
+# model.
+#
+# Every job clones with --filter=blob:none: the kernel's full history with
+# blobs is several gigabytes, and the jobs need the commit graph but only the
+# contents of the files the series and the upstream delta touch.
+
+on:
+  workflow_call:
+    inputs:
+      downstream:
+        description: The tree to rebase, e.g. edera/mainline
+        type: string
+        required: true
+      key:
+        description: A short name for the tree, unique per run, for artifact names
+        type: string
+        required: true
+      upstream_url:
+        type: string
+        required: true
+      upstream_branch:
+        type: string
+        required: true
+      force:
+        description: Rebase even if an open rebase pull request already covers this upstream tip
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+env:
+  DOWNSTREAM: ${{ inputs.downstream }}
+  UPSTREAM_URL: ${{ inputs.upstream_url }}
+  UPSTREAM_BRANCH: ${{ inputs.upstream_branch }}
+
+jobs:
+  prepare:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      pull-requests: read
+    outputs:
+      run: ${{ steps.plan.outputs.run }}
+      old: ${{ steps.plan.outputs.old }}
+      up: ${{ steps.plan.outputs.up }}
+      prefix: ${{ steps.plan.outputs.prefix }}
+      candidate: ${{ steps.plan.outputs.candidate }}
+    steps:
+      - name: Harden runner
+        uses: step-security/harden-runner@05e31511f85b41b11d1cf0ef85d0992719546e2c # v2.21.0
+        with:
+          egress-policy: audit
+
+      - name: Checkout
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ env.DOWNSTREAM }}
+          fetch-depth: 0
+          filter: blob:none
+          persist-credentials: false
+
+      - name: Decide whether tonight has work
+        id: plan
+        env:
+          GH_TOKEN: ${{ github.token }}
+          FORCE: ${{ inputs.force }}
+        run: |
+          set -euo pipefail
+          git fetch --no-tags "$UPSTREAM_URL" "$UPSTREAM_BRANCH"
+          old=$(git rev-parse HEAD)
+          up=$(git rev-parse FETCH_HEAD)
+          prefix="rebase/${DOWNSTREAM//\//-}/"
+          candidate="${prefix}$(date -u +%Y%m%d)-${old:0:12}-${up:0:12}"
+          {
+            echo "old=$old"
+            echo "up=$up"
+            echo "prefix=$prefix"
+            echo "candidate=$candidate"
+          } >> "$GITHUB_OUTPUT"
+
+          skip() {
+            echo "run=false" >> "$GITHUB_OUTPUT"
+            echo "### Upstream rebase of \`$DOWNSTREAM\`" >> "$GITHUB_STEP_SUMMARY"
+            echo "$1" >> "$GITHUB_STEP_SUMMARY"
+          }
+
+          if git merge-base --is-ancestor "$up" "$old"; then
+            skip "Nothing to do: \`$DOWNSTREAM\` (\`${old:0:12}\`) already contains \`$UPSTREAM_BRANCH\` (\`${up:0:12}\`)."
+            exit 0
+          fi
+
+          # The candidate name records both tips, so an open pull request for
+          # the same pair means last night's result is still awaiting review.
+          if [ "$FORCE" != "true" ]; then
+            pending=$(gh pr list --repo "$GITHUB_REPOSITORY" --state open --base "$DOWNSTREAM" \
+              --json headRefName,url \
+              -q ".[] | select(.headRefName | startswith(\"$prefix\") and endswith(\"-${old:0:12}-${up:0:12}\")) | .url")
+            if [ -n "$pending" ]; then
+              skip "A rebase of these exact tips is already awaiting review: $pending"
+              exit 0
+            fi
+          fi
+          echo "run=true" >> "$GITHUB_OUTPUT"
+
+  rebase:
+    needs: prepare
+    if: needs.prepare.outputs.run == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 330
+    # Read-only on purpose: the model runs here. It reaches the Claude API
+    # through OIDC federation, and that is the only thing id-token is for.
+    permissions:
+      contents: read
+      id-token: write
+    outputs:
+      produced: ${{ steps.collect.outputs.produced }}
+      result: ${{ steps.collect.outputs.result }}
+    steps:
+      - name: Harden runner
+        uses: step-security/harden-runner@05e31511f85b41b11d1cf0ef85d0992719546e2c # v2.21.0
+        with:
+          egress-policy: audit
+
+      - name: Checkout
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ needs.prepare.outputs.old }}
+          fetch-depth: 0
+          filter: blob:none
+          persist-credentials: false
+
+      # The skill and scripts come from the commit this run started from,
+      # never from the tree under test. The kernel's .gitignore ignores
+      # dot-directories, so .rebase-tools/ cannot end up in a commit.
+      - name: Trusted tools
+        run: |
+          set -euo pipefail
+          git fetch --no-tags --filter=blob:none origin "$GITHUB_SHA"
+          mkdir .rebase-tools
+          git archive "$GITHUB_SHA" .github/scripts .automation | tar -x -C .rebase-tools --strip-components=1
+
+      - name: Fetch upstream
+        env:
+          UP: ${{ needs.prepare.outputs.up }}
+        run: |
+          set -euo pipefail
+          git fetch --no-tags "$UPSTREAM_URL" "$UPSTREAM_BRANCH"
+          git merge-base --is-ancestor "$UP" FETCH_HEAD
+          git branch upstream-target "$UP"
+          # The rebase commits; this identity is what the committer field shows.
+          git config --global user.name "edera-upstream-rebase"
+          git config --global user.email "noreply@edera.dev"
+
+      - name: Install toolchains
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential bc bison flex libelf-dev libssl-dev python3 \
+            gcc-aarch64-linux-gnu
+
+      - name: Normalize identifiers
+        id: ids
+        env:
+          RULE: ${{ vars.ANTHROPIC_FEDERATION_RULE_ID }}
+          ORG: ${{ vars.ANTHROPIC_ORGANIZATION_ID }}
+          SVC: ${{ vars.ANTHROPIC_SERVICE_ACCOUNT_ID }}
+          WS: ${{ vars.ANTHROPIC_WORKSPACE_ID }}
+        run: |
+          set -euo pipefail
+          strip() { printf '%s' "$1" | tr -d '[:space:]'; }
+          {
+            echo "rule=$(strip "$RULE")"
+            echo "org=$(strip "$ORG")"
+            echo "svc=$(strip "$SVC")"
+            echo "ws=$(strip "$WS")"
+          } >> "$GITHUB_OUTPUT"
+          # An unset variable otherwise surfaces as an opaque API failure a
+          # second into the model step, with nothing in the log to say why.
+          missing=0
+          for n in FEDERATION_RULE_ID:RULE ORGANIZATION_ID:ORG SERVICE_ACCOUNT_ID:SVC WORKSPACE_ID:WS; do
+            eval "v=\$${n#*:}"
+            if [ -z "$(strip "$v")" ]; then
+              echo "::error::vars.ANTHROPIC_${n%%:*} is empty or not visible to this repository."
+              missing=1
+            fi
+          done
+          exit "$missing"
+
+      - name: Rebase
+        id: claude
+        continue-on-error: true
+        uses: anthropics/claude-code-action@6fed3ca145920b639991cb756090506e1bcaf515 # v1.0.245
+        with:
+          # The job token, which is read-only here. Without it the action
+          # would exchange OIDC for its own app token, which can write.
+          github_token: ${{ github.token }}
+          anthropic_federation_rule_id: '${{ steps.ids.outputs.rule }}'
+          anthropic_organization_id:    '${{ steps.ids.outputs.org }}'
+          anthropic_service_account_id: '${{ steps.ids.outputs.svc }}'
+          anthropic_workspace_id:       '${{ steps.ids.outputs.ws }}'
+          prompt: |
+            Rebase the downstream kernel series onto upstream by following
+            .rebase-tools/skills/upstream-rebase/SKILL.md exactly. Read it in
+            full before you start.
+
+            DOWNSTREAM=${{ env.DOWNSTREAM }}
+            OLD_TIP=${{ needs.prepare.outputs.old }}   (${{ env.DOWNSTREAM }}, checked out)
+            UPSTREAM=${{ needs.prepare.outputs.up }}   (${{ env.UPSTREAM_BRANCH }}, local branch upstream-target)
+            RESULT=rebase-result
+            REPORT=${{ runner.temp }}/rebase-report.md
+
+            You cannot push and must not try. The workflow verifies and
+            builds your branch independently afterwards and decides what
+            happens to it.
+          claude_args: |
+            --model claude-opus-5-5
+            --max-turns 400
+            --allowedTools "Read,Grep,Glob,Edit,Write,Bash(git:*),Bash(make:*),Bash(bash .rebase-tools/scripts/verify-upstream-rebase.sh:*),Bash(bash .rebase-tools/scripts/kernel-build.sh:*),Bash(scripts/config:*),Bash(mkdir -p .rebase-scratch:*),Bash(diff:*),Bash(comm:*),Bash(sort:*),Bash(grep:*),Bash(sed:*),Bash(awk:*),Bash(cat:*),Bash(head:*),Bash(tail:*),Bash(wc:*),Bash(ls:*),Bash(cut:*),Bash(tee:*)"
+
+      # Take only what Claude left in git and the report file. A branch that
+      # does not exist or does not sit on the upstream tip is a failed night.
+      - name: Collect the result
+        id: collect
+        if: always()
+        env:
+          REPORT: ${{ runner.temp }}/rebase-report.md
+          UP: ${{ needs.prepare.outputs.up }}
+          OUTCOME: ${{ steps.claude.outcome }}
+          EXECUTION_FILE: ${{ steps.claude.outputs.execution_file }}
+        run: |
+          set -euo pipefail
+          out=$RUNNER_TEMP/out
+          mkdir -p "$out"
+          if [ -s "$REPORT" ]; then
+            cp "$REPORT" "$out/report.md"
+          else
+            # The action hides the session to keep tool output out of a
+            # public log, which also hides why a run ended early. Take only
+            # the API error messages and the final result text from it:
+            # neither carries tool output.
+            why=
+            f=${EXECUTION_FILE:-$RUNNER_TEMP/claude-execution-output.json}
+            if [ -s "$f" ]; then
+              why=$(jq -r '
+                (if type == "array" then .[] else . end)
+                | if .type == "assistant" and (.error != null) then
+                    "API error (\(.error)): " + ([.message.content[]? | .text? // empty] | join(" "))
+                  elif .type == "result" then
+                    ([.result // empty] + (.errors // [] | map(tostring))) | join("\n")
+                  else empty end' "$f" 2>/dev/null | head -c 2000 || true)
+            fi
+            {
+              printf 'Claude left no report (rebase step: %s).\n' "$OUTCOME"
+              if [ -n "$why" ]; then
+                # shellcheck disable=SC2016 # a literal Markdown fence
+                printf '\n```\n%s\n```\n' "$why"
+              else
+                printf 'The run log has the cause.\n'
+              fi
+            } >"$out/report.md"
+            [ -z "$why" ] || echo "::error::Claude ended without a result: ${why//$'\n'/ }"
+          fi
+          if git rev-parse --verify -q refs/heads/rebase-result >/dev/null \
+             && git merge-base --is-ancestor "$UP" rebase-result \
+             && [ "$(git rev-parse rebase-result)" != "$UP" ]; then
+            git bundle create "$out/rebase.bundle" refs/heads/rebase-result "^$UP"
+            echo "produced=true" >> "$GITHUB_OUTPUT"
+            echo "result=$(git rev-parse rebase-result)" >> "$GITHUB_OUTPUT"
+          else
+            echo "produced=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Upload
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: rebase-${{ inputs.key }}
+          path: ${{ runner.temp }}/out/
+          if-no-files-found: error
+          retention-days: 30
+
+  verify:
+    needs: [prepare, rebase]
+    if: needs.rebase.outputs.produced == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    outputs:
+      status: ${{ steps.check.outputs.status }}
+    steps:
+      - name: Harden runner
+        uses: step-security/harden-runner@05e31511f85b41b11d1cf0ef85d0992719546e2c # v2.21.0
+        with:
+          egress-policy: audit
+
+      - name: Checkout
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ needs.prepare.outputs.old }}
+          fetch-depth: 0
+          filter: blob:none
+          persist-credentials: false
+
+      # The checker comes from the commit this run started from, never from
+      # the branch under test.
+      - name: Trusted tools
+        run: |
+          set -euo pipefail
+          git fetch --no-tags --filter=blob:none origin "$GITHUB_SHA"
+          mkdir "$RUNNER_TEMP/tools"
+          git archive "$GITHUB_SHA" .github/scripts | tar -x -C "$RUNNER_TEMP/tools" --strip-components=1
+
+      - name: Download
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: rebase-${{ inputs.key }}
+          path: ${{ runner.temp }}/in
+
+      - name: Check
+        id: check
+        env:
+          OLD: ${{ needs.prepare.outputs.old }}
+          UP: ${{ needs.prepare.outputs.up }}
+          RESULT: ${{ needs.rebase.outputs.result }}
+        run: |
+          set -euo pipefail
+          git fetch --no-tags "$UPSTREAM_URL" "$UPSTREAM_BRANCH"
+          git merge-base --is-ancestor "$UP" FETCH_HEAD
+          git fetch "$RUNNER_TEMP/in/rebase.bundle" rebase-result:rebase-result
+          [ "$(git rev-parse rebase-result)" = "$RESULT" ] || { echo "bundle does not hold $RESULT"; exit 1; }
+          # Actions runs this step under bash -e, so a bare call would end the
+          # step on the checker's first non-zero exit, before its verdict is
+          # recorded: drift would then reach the pull request as "the checker
+          # did not run". Capture the status instead.
+          rc=0
+          bash "$RUNNER_TEMP/tools/scripts/verify-upstream-rebase.sh" "$OLD" "$RESULT" "$UP" >"$RUNNER_TEMP/verify.md" || rc=$?
+          case $rc in
+            0) status=clean ;;
+            1) status=drift ;;
+            *) status=broken ;;
+          esac
+          echo "status=$status" >> "$GITHUB_OUTPUT"
+          cat "$RUNNER_TEMP/verify.md" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: verify-${{ inputs.key }}
+          path: ${{ runner.temp }}/verify.md
+          retention-days: 30
+
+  build:
+    needs: [prepare, rebase]
+    if: needs.rebase.outputs.produced == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        arch: [x86_64, arm64]
+    name: build (${{ matrix.arch }})
+    steps:
+      - name: Harden runner
+        uses: step-security/harden-runner@05e31511f85b41b11d1cf0ef85d0992719546e2c # v2.21.0
+        with:
+          egress-policy: audit
+
+      - name: Checkout
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ needs.prepare.outputs.old }}
+          fetch-depth: 0
+          filter: blob:none
+          persist-credentials: false
+
+      - name: Trusted tools
+        run: |
+          set -euo pipefail
+          git fetch --no-tags --filter=blob:none origin "$GITHUB_SHA"
+          mkdir "$RUNNER_TEMP/tools"
+          git archive "$GITHUB_SHA" .github/scripts | tar -x -C "$RUNNER_TEMP/tools" --strip-components=1
+
+      - name: Download
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: rebase-${{ inputs.key }}
+          path: ${{ runner.temp }}/in
+
+      - name: Check out the result
+        env:
+          UP: ${{ needs.prepare.outputs.up }}
+          RESULT: ${{ needs.rebase.outputs.result }}
+        run: |
+          set -euo pipefail
+          git fetch --no-tags "$UPSTREAM_URL" "$UPSTREAM_BRANCH"
+          git merge-base --is-ancestor "$UP" FETCH_HEAD
+          git fetch "$RUNNER_TEMP/in/rebase.bundle" rebase-result:rebase-result
+          git checkout --detach "$RESULT"
+
+      - name: Install toolchains
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential bc bison flex libelf-dev libssl-dev python3 \
+            gcc-aarch64-linux-gnu
+
+      - name: Build
+        env:
+          ARCH: ${{ matrix.arch }}
+        run: bash "$RUNNER_TEMP/tools/scripts/kernel-build.sh" "$ARCH" "$RUNNER_TEMP/obj"
+
+  publish:
+    needs: [prepare, rebase, verify, build]
+    if: always() && needs.prepare.outputs.run == 'true' && needs.rebase.result != 'cancelled'
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    concurrency:
+      group: push-${{ inputs.downstream }}
+      cancel-in-progress: false
+    permissions:
+      contents: read
+      issues: write
+    steps:
+      - name: Harden runner
+        uses: step-security/harden-runner@05e31511f85b41b11d1cf0ef85d0992719546e2c # v2.21.0
+        with:
+          egress-policy: audit
+
+      - name: Checkout
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ needs.prepare.outputs.old }}
+          fetch-depth: 0
+          filter: blob:none
+          persist-credentials: false
+
+      - name: Trusted tools
+        run: |
+          set -euo pipefail
+          git fetch --no-tags --filter=blob:none origin "$GITHUB_SHA"
+          mkdir "$RUNNER_TEMP/tools"
+          git archive "$GITHUB_SHA" .github/scripts | tar -x -C "$RUNNER_TEMP/tools" --strip-components=1
+
+      - name: Download the rebase
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: rebase-${{ inputs.key }}
+          path: ${{ runner.temp }}/in/rebase
+
+      # Absent when Claude produced no branch and the checker never ran.
+      - name: Download the checker report
+        if: needs.verify.result == 'success'
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: verify-${{ inputs.key }}
+          path: ${{ runner.temp }}/in/verify
+
+      - name: App token
+        id: app
+        if: needs.rebase.outputs.produced == 'true'
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          client-id: ${{ vars.REBASE_APP_CLIENT_ID }}
+          private-key: ${{ secrets.REBASE_APP_PRIVATE_KEY }}
+          permission-contents: write
+          permission-pull-requests: write
+          permission-workflows: write
+
+      - name: Push or propose
+        env:
+          APP_TOKEN: ${{ steps.app.outputs.token }}
+          JOB_TOKEN: ${{ github.token }}
+          PRODUCED: ${{ needs.rebase.outputs.produced }}
+          VERIFY: ${{ needs.verify.outputs.status }}
+          BUILD: ${{ needs.build.result }}
+          OLD: ${{ needs.prepare.outputs.old }}
+          UP: ${{ needs.prepare.outputs.up }}
+          RESULT: ${{ needs.rebase.outputs.result }}
+          PREFIX: ${{ needs.prepare.outputs.prefix }}
+          CANDIDATE: ${{ needs.prepare.outputs.candidate }}
+          KEY: ${{ inputs.key }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          in=$RUNNER_TEMP/in
+          report=$in/rebase/report.md
+          verify=$in/verify/verify.md
+          summary() { cat >> "$GITHUB_STEP_SUMMARY"; }
+          title="Nightly upstream rebase of $DOWNSTREAM failed"
+
+          # One issue per tree that stays open until someone deals with it,
+          # rather than one per night.
+          report_issue() {
+            existing=$(GH_TOKEN=$JOB_TOKEN gh issue list --repo "$GITHUB_REPOSITORY" --state open \
+              --search "in:title \"$title\"" --json number -q '.[0].number // empty')
+            if [ -n "$existing" ]; then
+              GH_TOKEN=$JOB_TOKEN gh issue comment "$existing" --repo "$GITHUB_REPOSITORY" --body-file "$1"
+            else
+              GH_TOKEN=$JOB_TOKEN gh issue create --repo "$GITHUB_REPOSITORY" --title "$title" --body-file "$1"
+            fi
+          }
+
+          if [ "$PRODUCED" != "true" ]; then
+            body=$RUNNER_TEMP/issue.md
+            {
+              echo "Claude could not produce a rebase of \`$DOWNSTREAM\` (\`${OLD:0:12}\`) onto \`$UPSTREAM_BRANCH\` (\`${UP:0:12}\`). [Run log]($RUN_URL)."
+              echo
+              cat "$report"
+            } | head -c 60000 >"$body"
+            report_issue "$body"
+            echo "No branch produced; reported in an issue." | summary
+            exit 1
+          fi
+
+          git fetch --no-tags "$UPSTREAM_URL" "$UPSTREAM_BRANCH"
+          git merge-base --is-ancestor "$UP" FETCH_HEAD
+          git fetch "$in/rebase/rebase.bundle" rebase-result:rebase-result
+          [ "$(git rev-parse rebase-result)" = "$RESULT" ]
+
+          # Workflows triggered by a pull request, including the land workflow,
+          # run that branch's own copy of .github/ with this repository's
+          # secrets. So the automation paths must change by exactly what
+          # upstream changed there, or the branch never leaves this job: not
+          # as the tree and not as a pull request.
+          mb=$(git merge-base "$OLD" "$UP")
+          guarded=(.github .automation)
+          lines() { git diff "$@" -- "${guarded[@]}" | grep -E '^([+-]|diff )' || true; }
+          if [ "$(lines "$OLD" "$RESULT")" != "$(lines "$mb" "$UP")" ]; then
+            body=$RUNNER_TEMP/issue.md
+            {
+              echo "**Refused to publish** the rebase of \`$DOWNSTREAM\` (\`${OLD:0:12}\`) onto \`$UPSTREAM_BRANCH\` (\`${UP:0:12}\`): it changes \`${guarded[*]}\` beyond what upstream changed there. Those paths run with repository secrets, so the branch was not pushed anywhere. It is in the run's \`rebase-${KEY}\` artifact. [Run log]($RUN_URL)."
+              echo
+              echo '```diff'
+              git diff --stat "$OLD" "$RESULT" -- "${guarded[@]}"
+              echo '```'
+            } >"$body"
+            report_issue "$body"
+            echo "::error::Rebase changes automation paths beyond the upstream delta; not published."
+            exit 1
+          fi
+
+          origin="https://x-access-token:${APP_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
+          export GH_TOKEN=$APP_TOKEN
+
+          close_superseded() {
+            gh pr list --repo "$GITHUB_REPOSITORY" --state open --base "$DOWNSTREAM" \
+              --json number,headRefName \
+              -q ".[] | select(.headRefName | startswith(\"$PREFIX\")) | select(.headRefName != \"$CANDIDATE\") | .number" |
+            while read -r n; do
+              gh pr close "$n" --repo "$GITHUB_REPOSITORY" --delete-branch \
+                --comment "Superseded by $1."
+            done
+          }
+
+          # Reasons a human has to look before the tree moves. The checker
+          # and the builds judge the branch; the report can still raise a
+          # question they cannot see, such as an upstream change that meets a
+          # downstream feature without touching the same lines.
+          why=()
+          [ "$VERIFY" = "clean" ] || why+=("the checker found ${VERIFY:-no result (it did not run)}")
+          [ "$BUILD" = "success" ] || why+=("a build ${BUILD}")
+          drc=0
+          bash "$RUNNER_TEMP/tools/scripts/report-needs-decision.sh" "$report" >/dev/null || drc=$?
+          case $drc in
+            0) why+=("Claude's report asks for a decision") ;;
+            1) ;;
+            *) why+=("Claude's report could not be read") ;;
+          esac
+
+          if [ "${#why[@]}" -eq 0 ]; then
+            backup="backup/${DOWNSTREAM//\//-}-pre-rebase-$(date -u +%Y%m%d)-${OLD:0:12}"
+            git push "$origin" "$OLD:refs/heads/$backup"
+            # The lease pins the tip this rebase started from: if anything
+            # landed on the tree since, the push fails and nothing is lost.
+            if git push --force-with-lease="refs/heads/$DOWNSTREAM:$OLD" "$origin" \
+                 "$RESULT:refs/heads/$DOWNSTREAM" 2>"$RUNNER_TEMP/push.err"; then
+              cat "$RUNNER_TEMP/push.err" >&2
+              now=$(git ls-remote "$origin" "refs/heads/$DOWNSTREAM" | cut -f1)
+              [ "$now" = "$RESULT" ] || { echo "::error::$DOWNSTREAM is $now after the push, expected $RESULT"; exit 1; }
+              close_superseded "the clean rebase pushed to \`$DOWNSTREAM\` as \`${RESULT:0:12}\`"
+              {
+                echo "### Pushed \`$DOWNSTREAM\` → \`${RESULT:0:12}\`"
+                echo "Was \`${OLD:0:12}\`, kept as \`$backup\`."
+                echo
+                cat "$verify"
+                echo
+                cat "$report"
+              } | summary
+              exit 0
+            fi
+            # Refused: a branch rule, or the tree moved under the lease. A
+            # clean result is still worth a reviewer's approval, so propose
+            # it rather than drop it; the land workflow re-checks the tip.
+            cat "$RUNNER_TEMP/push.err" >&2
+            reason=$(grep -m1 -E 'GH0[0-9]+|\[(remote )?rejected\]|error:' "$RUNNER_TEMP/push.err" |
+              sed -E 's/^remote: *//; s/^[[:space:]]+//; s/[[:space:]]+$//' || true)
+            why+=("the push to \`$DOWNSTREAM\` was refused${reason:+ (\`$reason\`)}")
+            git push "$origin" --delete "$backup" || true
+          fi
+
+          # Not pushed: propose it.
+          git push "$origin" "$RESULT:refs/heads/$CANDIDATE"
+          because=$(IFS=';'; echo "${why[*]}")
+          because=${because//;/ and }
+          body=$RUNNER_TEMP/pr.md
+          {
+            echo "Nightly rebase of \`$DOWNSTREAM\` (\`${OLD:0:12}\`) onto \`$UPSTREAM_BRANCH\` (\`${UP:0:12}\`), driven by Claude. **Not pushed automatically because ${because}.** [Run log]($RUN_URL)."
+            echo
+            echo "> [!IMPORTANT]"
+            echo "> Do not use the merge button: this branch replaces \`$DOWNSTREAM\` rather than merging into it. **Approve** the pull request to land it; the land workflow force-pushes \`$DOWNSTREAM\` to the approved head, pinned to \`${OLD:0:12}\`, and keeps a backup."
+            echo
+            echo "## Independent checks"
+            echo
+            echo "Builds: **${BUILD}** (x86_64 and arm64 vmlinux with the Edera features built in; per-build results in the run)."
+            echo
+            if [ -s "$verify" ]; then cat "$verify"; else echo "The checker did not run."; fi
+            echo
+            echo "# Claude's report"
+            echo
+            cat "$report"
+          } >"$body"
+          if [ "$(wc -c <"$body")" -gt 60000 ]; then
+            head -c 59000 "$body" >"$body.cut"
+            printf '\n\n_Truncated; the full report is in the run artifacts._\n' >>"$body.cut"
+            mv "$body.cut" "$body"
+          fi
+          url=$(gh pr create --repo "$GITHUB_REPOSITORY" --base "$DOWNSTREAM" --head "$CANDIDATE" \
+            --title "Rebase $DOWNSTREAM onto $UPSTREAM_BRANCH @ ${UP:0:12}" --body-file "$body")
+          close_superseded "$url"
+          echo "### Proposed: $url" | summary
