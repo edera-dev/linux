@@ -17,12 +17,12 @@ name: Nightly kernel maintenance
 #       commits that touch .github/workflows/ (every rebase rewrites the ones
 #       that add them), and pull requests it opens do not trigger other
 #       workflows.
-#   vars.ANTHROPIC_FEDERATION_RULE_ID, ANTHROPIC_ORGANIZATION_ID,
-#   ANTHROPIC_SERVICE_ACCOUNT_ID, ANTHROPIC_WORKSPACE_ID
-#       Organization-wide workload identity federation for the Claude API. The
-#       rule must accept this workflow's OIDC subject (a scheduled run on
-#       edera/6.18-lts), which a rule written for pull_request events will
-#       not.
+#   vars.REBASE_FEDERATION_RULE_ID
+#       The workload identity federation rule for the rebase. It must accept
+#       this workflow's OIDC subject (a scheduled or dispatched run).
+#   vars.ANTHROPIC_ORGANIZATION_ID, ANTHROPIC_SERVICE_ACCOUNT_ID,
+#   ANTHROPIC_WORKSPACE_ID
+#       The rest of the Claude API federation identity.
 
 on:
   schedule:
