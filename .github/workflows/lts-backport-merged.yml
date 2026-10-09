@@ -1,0 +1,45 @@
+name: Retry waiting backports
+
+# When a backport pull request merges into edera/6.18-lts, a mainline pull
+# request waiting for it (labelled backport-waiting) may now be able to go
+# ahead, so every waiting one is dispatched again (retry-backports.sh). The
+# nightly retries them too; this just saves the wait.
+#
+# pull_request_target runs this file as it is on edera/6.18-lts, never the
+# pull request's copy, and nothing here checks out the pull request.
+
+on:
+  pull_request_target:
+    types: [closed]
+    branches: [edera/6.18-lts]
+
+permissions: {}
+
+jobs:
+  retry:
+    if: >-
+      github.event.pull_request.merged
+      && startsWith(github.event.pull_request.head.ref, 'backport/edera-6.18-lts/')
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      actions: write
+      pull-requests: read
+    steps:
+      - name: Harden runner
+        uses: step-security/harden-runner@05e31511f85b41b11d1cf0ef85d0992719546e2c # v2.21.0
+        with:
+          egress-policy: audit
+
+      - name: Checkout
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ github.event.pull_request.base.ref }}
+          persist-credentials: false
+          sparse-checkout: .github
+
+      - name: Retry waiting backports
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: bash .github/scripts/retry-backports.sh
