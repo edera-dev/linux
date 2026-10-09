@@ -1,0 +1,134 @@
+name: Land upstream rebase
+
+# Lands a nightly rebase that needed review (see upstream-rebase.yml) once a
+# maintainer approves its pull request.
+#
+# A rebase replaces the tree rather than merging into it, so the merge button
+# is the wrong tool: it would graft a second copy of the whole series onto the
+# old one. Approving instead force-pushes the tree to the exact commit that
+# was approved, and GitHub then marks the pull request merged.
+#
+# A review runs this workflow from the pull request's merge ref, not from the
+# default branch, so it only runs for a tree that carries this file.
+#
+# What has to hold before anything is pushed:
+#   - the pull request is a rebase/<tree>/... branch from this repository,
+#     targeting that tree: rebase/edera-mainline/... into edera/mainline, or
+#     rebase/edera-6.18-lts/... into edera/6.18-lts;
+#   - the review approved the current head, not an earlier one;
+#   - the approver has write access;
+#   - the tree is still the tip the branch was made from. The branch name
+#     records that tip, and branch names cannot be edited on an open pull
+#     request, so this is not something the pull request body can change. If
+#     the tree moved, nothing is pushed; the next nightly run starts from the
+#     new tip.
+
+on:
+  pull_request_review:
+    types: [submitted]
+
+permissions:
+  contents: read
+
+concurrency:
+  # Shared with the nightly's publish jobs, so nothing else moves the tree
+  # while this runs.
+  group: push-${{ github.event.pull_request.base.ref }}
+  cancel-in-progress: false
+
+jobs:
+  land:
+    if: >-
+      github.event.review.state == 'approved'
+      && github.event.pull_request.head.repo.full_name == github.repository
+      && (
+        (github.event.pull_request.base.ref == 'edera/mainline'
+          && startsWith(github.event.pull_request.head.ref, 'rebase/edera-mainline/'))
+        || (github.event.pull_request.base.ref == 'edera/6.18-lts'
+          && startsWith(github.event.pull_request.head.ref, 'rebase/edera-6.18-lts/'))
+      )
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      pull-requests: write
+    steps:
+      - name: Harden runner
+        uses: step-security/harden-runner@05e31511f85b41b11d1cf0ef85d0992719546e2c # v2.21.0
+        with:
+          egress-policy: audit
+
+      - name: App token
+        id: app
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          client-id: ${{ vars.REBASE_APP_CLIENT_ID }}
+          private-key: ${{ secrets.REBASE_APP_PRIVATE_KEY }}
+          permission-contents: write
+          permission-pull-requests: write
+          permission-workflows: write
+
+      - name: Land
+        env:
+          APP_TOKEN: ${{ steps.app.outputs.token }}
+          JOB_TOKEN: ${{ github.token }}
+          PR: ${{ github.event.pull_request.number }}
+          BASE: ${{ github.event.pull_request.base.ref }}
+          HEAD_REF: ${{ github.event.pull_request.head.ref }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          REVIEWED_SHA: ${{ github.event.review.commit_id }}
+          APPROVER: ${{ github.event.review.user.login }}
+        run: |
+          set -euo pipefail
+          say() {
+            GH_TOKEN=$JOB_TOKEN gh pr comment "$PR" --repo "$GITHUB_REPOSITORY" --body "$1"
+          }
+
+          if [ "$REVIEWED_SHA" != "$HEAD_SHA" ]; then
+            say "Not landed: the approval was for \`${REVIEWED_SHA:0:12}\`, but the head is now \`${HEAD_SHA:0:12}\`. Approve the current head to land it."
+            exit 1
+          fi
+
+          perm=$(GH_TOKEN=$JOB_TOKEN gh api "repos/$GITHUB_REPOSITORY/collaborators/$APPROVER/permission" -q .permission)
+          case $perm in
+            admin|maintain|write) ;;
+            *)
+              say "Not landed: @$APPROVER does not have write access, so their approval cannot land a rebase."
+              exit 1 ;;
+          esac
+
+          # Name: rebase/<tree>/<date>-<old tree tip 12>-<upstream tip 12>.
+          rest=${HEAD_REF#"rebase/${BASE//\//-}/"}
+          IFS=- read -r _date old12 up12 extra <<<"$rest"
+          if [ -n "${extra:-}" ] || ! [[ $old12 =~ ^[0-9a-f]{12}$ && $up12 =~ ^[0-9a-f]{12}$ ]]; then
+            say "Not landed: \`$HEAD_REF\` is not a branch the nightly automation made."
+            exit 1
+          fi
+
+          origin="https://x-access-token:${APP_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
+          cur=$(git ls-remote "$origin" "refs/heads/$BASE" | cut -f1)
+          if [ "${cur:0:12}" != "$old12" ]; then
+            say "Not landed: \`$BASE\` has moved to \`${cur:0:12}\` since this branch was made from \`$old12\`. Tonight's run starts from the new tip; this pull request will be closed as superseded."
+            exit 1
+          fi
+
+          # Both commits are already on GitHub, so this needs neither the
+          # kernel's history nor its files, only the two commit objects to
+          # name in the push.
+          git init -q work && cd work
+          git fetch -q --no-tags --depth=1 --filter=tree:0 "$origin" "$HEAD_SHA" "$cur"
+
+          # Created through the API, and before the tree moves: a push from
+          # this shallow clone is refused once the old tip is unreferenced.
+          backup="backup/${BASE//\//-}-pre-rebase-$(date -u +%Y%m%d)-$old12"
+          GH_TOKEN=$APP_TOKEN gh api -X POST "repos/$GITHUB_REPOSITORY/git/refs" \
+            -f ref="refs/heads/$backup" -f sha="$cur" >/dev/null
+
+          git push --force-with-lease="refs/heads/$BASE:$cur" "$origin" "$HEAD_SHA:refs/heads/$BASE"
+          now=$(git ls-remote "$origin" "refs/heads/$BASE" | cut -f1)
+          if [ "$now" != "$HEAD_SHA" ]; then
+            say "Push reported success but \`$BASE\` is \`${now:0:12}\`, not \`${HEAD_SHA:0:12}\`. Check the run log."
+            exit 1
+          fi
+          say "Landed by @$APPROVER's approval: \`$BASE\` is now \`${HEAD_SHA:0:12}\` (was \`${cur:0:12}\`, kept as \`$backup\`)."
+          git push "$origin" --delete "$HEAD_REF" || true
