@@ -1,0 +1,35 @@
+name: Trigger edera/6.18-lts rebase
+
+# Starts edera/6.18-lts's own nightly rebase, and does nothing else.
+#
+# edera/6.18-lts drives its own rebase with its own copy of
+# kernel-nightly.yml, but GitHub runs scheduled workflows only from the
+# default branch, edera/mainline. So this schedule lives here and dispatches
+# that copy: a workflow is identified by its path, and --ref picks the
+# branch whose file runs.
+#
+# GITHUB_TOKEN can do this: workflow_dispatch is one of the events it is
+# allowed to trigger runs with.
+
+on:
+  schedule:
+    - cron: '23 3 * * *' # 03:23 UTC nightly
+
+permissions: {}
+
+jobs:
+  dispatch:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      actions: write
+    steps:
+      - name: Harden runner
+        uses: step-security/harden-runner@05e31511f85b41b11d1cf0ef85d0992719546e2c # v2.21.0
+        with:
+          egress-policy: audit
+
+      - name: Dispatch
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh workflow run kernel-nightly.yml --repo "$GITHUB_REPOSITORY" --ref edera/6.18-lts
