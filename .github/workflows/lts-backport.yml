@@ -1,0 +1,722 @@
+name: LTS backport
+
+# Proposes the backport of one merged edera/mainline pull request to
+# edera/6.18-lts, as a pull request. Called by kernel-nightly.yml when it is
+# dispatched with backport_pr: by lts-backport-trigger.yml on edera/mainline
+# when a pull request merges there, and by retry-backports.sh to retry or
+# refresh one.
+#
+# Edera kernel work lands on edera/mainline first and every merged pull
+# request flows down, unless it is labelled no-backport. The order is kept:
+# backport-blockers.sh holds a pull request back while an earlier Edera commit
+# that touches its files is still missing from edera/6.18-lts, and Claude
+# holds it back for a dependency a file match cannot see. Either way the
+# mainline pull request is labelled backport-waiting and retried later.
+#
+# Claude cherry-picks the commits, following
+# .automation/skills/mainline-backport/SKILL.md. Nothing it says about its own
+# result decides what happens to it. The model runs read-only; its branch
+# leaves as a git bundle and is judged by scripts from the commit this run
+# started from:
+#
+#   - verify-backport.sh proves the branch fast-forwards the LTS tip and holds
+#     exactly the requested commits, in order, each with its source's subject
+#     and its source's +/- lines;
+#   - kernel-build.sh builds x86_64 and arm64 vmlinux.
+#
+# The result always goes up as a backport/edera-6.18-lts/pr-<N> pull request
+# with both results and Claude's report; nothing here pushes edera/6.18-lts.
+# The mainline pull request gets one status comment, kept up to date, and is
+# labelled backport-needs-attention when there is nothing to propose and a
+# human has to decide.
+
+on:
+  workflow_call:
+    inputs:
+      pr:
+        description: Number of the merged edera/mainline pull request
+        type: string
+        required: true
+
+permissions:
+  contents: read
+
+env:
+  SOURCE: edera/mainline
+  SOURCE_UPSTREAM_URL: https://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux.git
+  SOURCE_UPSTREAM_BRANCH: master
+  TARGET: edera/6.18-lts
+  TARGET_UPSTREAM_URL: https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git
+  TARGET_UPSTREAM_BRANCH: linux-6.18.y
+  PR: ${{ inputs.pr }}
+  BRANCH: backport/edera-6.18-lts/pr-${{ inputs.pr }}
+
+jobs:
+  prepare:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      pull-requests: read
+    outputs:
+      state: ${{ steps.plan.outputs.state }}
+      old: ${{ steps.plan.outputs.old }}
+      head: ${{ steps.plan.outputs.head }}
+      source: ${{ steps.plan.outputs.source }}
+      title: ${{ steps.plan.outputs.title }}
+    steps:
+      - name: Harden runner
+        uses: step-security/harden-runner@05e31511f85b41b11d1cf0ef85d0992719546e2c # v2.21.0
+        with:
+          egress-policy: audit
+
+      - name: Checkout
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ env.TARGET }}
+          fetch-depth: 0
+          filter: blob:none
+          persist-credentials: false
+
+      - name: Trusted tools
+        run: |
+          set -euo pipefail
+          git fetch --no-tags --filter=blob:none origin "$GITHUB_SHA"
+          mkdir "$RUNNER_TEMP/tools"
+          git archive "$GITHUB_SHA" .github/scripts .automation | tar -x -C "$RUNNER_TEMP/tools" --strip-components=1
+
+      - name: Plan
+        id: plan
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          out=$RUNNER_TEMP/out
+          mkdir -p "$out"
+          tools=$RUNNER_TEMP/tools
+          finish() { # finish <state> <message>
+            echo "state=$1" >> "$GITHUB_OUTPUT"
+            printf '%s\n' "$2" >"$out/message.md"
+            printf '### Backport of #%s\n\n%s\n' "$PR" "$2" >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          }
+          if ! [[ $PR =~ ^[0-9]+$ ]]; then
+            echo "::error::backport_pr must be a pull request number, not '$PR'."
+            exit 1
+          fi
+          old=$(git rev-parse HEAD)
+          echo "old=$old" >> "$GITHUB_OUTPUT"
+
+          pr=$(gh api "repos/$GITHUB_REPOSITORY/pulls/$PR")
+          title=$(jq -r .title <<<"$pr" | tr -d '\r\n')
+          echo "title=$title" >> "$GITHUB_OUTPUT"
+          if [ "$(jq -r .merged <<<"$pr")" != true ] || [ "$(jq -r .base.ref <<<"$pr")" != "$SOURCE" ]; then
+            finish ignored "#$PR is not a merged pull request into \`$SOURCE\`."
+          fi
+          case $(jq -r .head.ref <<<"$pr") in
+            rebase/*) finish ignored "#$PR is a nightly rebase, not Edera work." ;;
+          esac
+          if jq -e '.labels | map(.name) | index("no-backport")' <<<"$pr" >/dev/null; then
+            finish skipped "#$PR is labelled \`no-backport\`, so it is not backported to \`$TARGET\`."
+          fi
+
+          # The pull request's own commits, as they were reviewed. Their hashes
+          # stay valid when the nightly rebase rewrites edera/mainline.
+          git fetch --no-tags --filter=blob:none origin "refs/pull/$PR/head"
+          head=$(git rev-parse FETCH_HEAD)
+          echo "head=$head" >> "$GITHUB_OUTPUT"
+          gh api --paginate "repos/$GITHUB_REPOSITORY/pulls/$PR/commits" -q '.[].sha' >"$out/pr-commits"
+          while read -r c; do
+            git merge-base --is-ancestor "$c" "$head"
+            printf '%s\t%s\n' "$c" "$(git log -1 --format=%s "$c")"
+          done <"$out/pr-commits" >"$out/request"
+
+          git fetch --no-tags --filter=blob:none origin "$SOURCE"
+          src=$(git rev-parse FETCH_HEAD)
+          echo "source=$src" >> "$GITHUB_OUTPUT"
+          git fetch --no-tags --filter=blob:none "$SOURCE_UPSTREAM_URL" "$SOURCE_UPSTREAM_BRANCH"
+          src_up=$(git rev-parse FETCH_HEAD)
+          git fetch --no-tags --filter=blob:none "$TARGET_UPSTREAM_URL" "$TARGET_UPSTREAM_BRANCH"
+          tgt_up=$(git rev-parse FETCH_HEAD)
+
+          # Never backported: the skip file, and the commits of every mainline
+          # pull request labelled no-backport.
+          cp "$tools/backport-skip" "$out/skip"
+          gh pr list --repo "$GITHUB_REPOSITORY" --base "$SOURCE" --state merged \
+            --label no-backport --limit 500 --json number -q '.[].number' |
+          while read -r n; do
+            gh api --paginate "repos/$GITHUB_REPOSITORY/pulls/$n/commits" -q '.[].commit.message | split("\n")[0]'
+          done >>"$out/skip"
+
+          bash "$tools/scripts/pending-backports.sh" "$src" "$src_up" "$old" "$tgt_up" "$out/skip" >"$out/pending"
+          bash "$tools/scripts/backport-blockers.sh" "$out/pending" "$out/request" "$old" "$tgt_up" "$out/todo" >"$out/blockers"
+
+          if [ ! -s "$out/todo" ]; then
+            finish skipped "Nothing to backport: every commit of #$PR is already on \`$TARGET\` (\`${old:0:12}\`), changes only automation, or is no longer an Edera commit on \`$SOURCE\`."
+          fi
+          if [ -s "$out/blockers" ]; then
+            {
+              echo "Waiting: earlier Edera commits on \`$SOURCE\` that touch the same files are not on \`$TARGET\` yet, and have to be backported first:"
+              echo
+              while IFS=$'\t' read -r sha subject; do echo "- \`${sha:0:12}\` $subject"; done <"$out/blockers"
+              echo
+              echo "This is retried when a backport lands on \`$TARGET\`, and nightly. If one of them should never be backported, label its pull request \`no-backport\`, or list its subject in \`.automation/backport-skip\` on \`$TARGET\`."
+            } >"$out/blocked.md"
+            finish waiting "$(cat "$out/blocked.md")"
+          fi
+          {
+            echo "### Backport of #$PR to \`$TARGET\` (\`${old:0:12}\`)"
+            echo
+            while IFS=$'\t' read -r sha subject; do echo "- \`${sha:0:12}\` $subject"; done <"$out/todo"
+          } >> "$GITHUB_STEP_SUMMARY"
+          echo "state=run" >> "$GITHUB_OUTPUT"
+
+      - name: Upload
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: backport-plan
+          path: ${{ runner.temp }}/out/
+          if-no-files-found: error
+          retention-days: 30
+
+  backport:
+    needs: prepare
+    if: needs.prepare.outputs.state == 'run'
+    runs-on: ubuntu-latest
+    timeout-minutes: 240
+    # Read-only on purpose: the model runs here. It reaches the Claude API
+    # through OIDC federation, and that is the only thing id-token is for.
+    permissions:
+      contents: read
+      id-token: write
+    outputs:
+      produced: ${{ steps.collect.outputs.produced }}
+      result: ${{ steps.collect.outputs.result }}
+    steps:
+      - name: Harden runner
+        uses: step-security/harden-runner@05e31511f85b41b11d1cf0ef85d0992719546e2c # v2.21.0
+        with:
+          egress-policy: audit
+
+      - name: Checkout
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ needs.prepare.outputs.old }}
+          fetch-depth: 0
+          filter: blob:none
+          persist-credentials: false
+
+      # The skill and scripts come from the commit this run started from.
+      # The kernel's .gitignore ignores dot-directories, so .rebase-tools/
+      # cannot end up in a commit.
+      - name: Trusted tools
+        env:
+          HEAD_SHA: ${{ needs.prepare.outputs.head }}
+          SRC: ${{ needs.prepare.outputs.source }}
+        run: |
+          set -euo pipefail
+          git fetch --no-tags --filter=blob:none origin "$GITHUB_SHA" "$SRC" "refs/pull/$PR/head"
+          git cat-file -e "$HEAD_SHA^{commit}"
+          mkdir .rebase-tools
+          git archive "$GITHUB_SHA" .github/scripts .automation | tar -x -C .rebase-tools --strip-components=1
+          git config --global user.name "edera-lts-backport"
+          git config --global user.email "noreply@edera.dev"
+
+      - name: Download the plan
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: backport-plan
+          path: ${{ runner.temp }}/in
+
+      - name: Install toolchains
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential bc bison flex libelf-dev libssl-dev python3 \
+            gcc-aarch64-linux-gnu
+
+      - name: Normalize identifiers
+        id: ids
+        env:
+          RULE: ${{ vars.REBASE_FEDERATION_RULE_ID }}
+          ORG: ${{ vars.ANTHROPIC_ORGANIZATION_ID }}
+          SVC: ${{ vars.ANTHROPIC_SERVICE_ACCOUNT_ID }}
+          WS: ${{ vars.ANTHROPIC_WORKSPACE_ID }}
+        run: |
+          set -euo pipefail
+          strip() { printf '%s' "$1" | tr -d '[:space:]'; }
+          {
+            echo "rule=$(strip "$RULE")"
+            echo "org=$(strip "$ORG")"
+            echo "svc=$(strip "$SVC")"
+            echo "ws=$(strip "$WS")"
+          } >> "$GITHUB_OUTPUT"
+          # An unset variable otherwise surfaces as an opaque API failure a
+          # second into the model step, with nothing in the log to say why.
+          missing=0
+          for n in REBASE_FEDERATION_RULE_ID:RULE ANTHROPIC_ORGANIZATION_ID:ORG ANTHROPIC_SERVICE_ACCOUNT_ID:SVC ANTHROPIC_WORKSPACE_ID:WS; do
+            eval "v=\$${n#*:}"
+            if [ -z "$(strip "$v")" ]; then
+              echo "::error::vars.${n%%:*} is empty or not visible to this repository."
+              missing=1
+            fi
+          done
+          exit "$missing"
+
+      - name: Backport
+        id: claude
+        continue-on-error: true
+        uses: anthropics/claude-code-action@6fed3ca145920b639991cb756090506e1bcaf515 # v1.0.245
+        with:
+          # The job token, which is read-only here. Without it the action
+          # would exchange OIDC for its own app token, which can write.
+          github_token: ${{ github.token }}
+          anthropic_federation_rule_id: '${{ steps.ids.outputs.rule }}'
+          anthropic_organization_id:    '${{ steps.ids.outputs.org }}'
+          anthropic_service_account_id: '${{ steps.ids.outputs.svc }}'
+          anthropic_workspace_id:       '${{ steps.ids.outputs.ws }}'
+          prompt: |
+            Backport a merged edera/mainline pull request to edera/6.18-lts by
+            following .rebase-tools/skills/mainline-backport/SKILL.md exactly.
+            Read it in full before you start.
+
+            MAINLINE_PR=#${{ inputs.pr }}: ${{ needs.prepare.outputs.title }}
+            OLD_TIP=${{ needs.prepare.outputs.old }}   (${{ env.TARGET }}, checked out)
+            REQUEST=${{ runner.temp }}/in/todo
+            PENDING=${{ runner.temp }}/in/pending
+            RESULT=backport-result
+            REPORT=${{ runner.temp }}/backport-report.md
+
+            You cannot push and must not try. The workflow verifies and
+            builds your branch independently afterwards and proposes it as a
+            pull request.
+          claude_args: |
+            --model claude-opus-5-5
+            --max-turns 300
+            --allowedTools "Read,Grep,Glob,Edit,Write,Bash(git:*),Bash(make:*),Bash(bash .rebase-tools/scripts/verify-backport.sh:*),Bash(bash .rebase-tools/scripts/kernel-build.sh:*),Bash(scripts/config:*),Bash(mkdir -p .rebase-scratch:*),Bash(diff:*),Bash(comm:*),Bash(sort:*),Bash(grep:*),Bash(sed:*),Bash(awk:*),Bash(cat:*),Bash(head:*),Bash(tail:*),Bash(wc:*),Bash(ls:*),Bash(cut:*),Bash(tee:*)"
+
+      - name: Collect the result
+        id: collect
+        if: always()
+        env:
+          REPORT: ${{ runner.temp }}/backport-report.md
+          OLD: ${{ needs.prepare.outputs.old }}
+          OUTCOME: ${{ steps.claude.outcome }}
+          EXECUTION_FILE: ${{ steps.claude.outputs.execution_file }}
+        run: |
+          set -euo pipefail
+          out=$RUNNER_TEMP/out
+          mkdir -p "$out"
+          if [ -s "$REPORT" ]; then
+            cp "$REPORT" "$out/report.md"
+          else
+            # Only the API error messages and the final result text: neither
+            # carries tool output into a public log.
+            why=
+            f=${EXECUTION_FILE:-$RUNNER_TEMP/claude-execution-output.json}
+            if [ -s "$f" ]; then
+              why=$(jq -r '
+                (if type == "array" then .[] else . end)
+                | if .type == "assistant" and (.error != null) then
+                    "API error (\(.error)): " + ([.message.content[]? | .text? // empty] | join(" "))
+                  elif .type == "result" then
+                    ([.result // empty] + (.errors // [] | map(tostring))) | join("\n")
+                  else empty end' "$f" 2>/dev/null | head -c 2000 || true)
+            fi
+            {
+              printf 'Status: failed\n\nClaude left no report (backport step: %s).\n' "$OUTCOME"
+              if [ -n "$why" ]; then
+                # shellcheck disable=SC2016 # a literal Markdown fence
+                printf '\n```\n%s\n```\n' "$why"
+              else
+                printf 'The run log has the cause.\n'
+              fi
+            } >"$out/report.md"
+            [ -z "$why" ] || echo "::error::Claude ended without a result: ${why//$'\n'/ }"
+          fi
+          if git rev-parse --verify -q refs/heads/backport-result >/dev/null \
+             && git merge-base --is-ancestor "$OLD" backport-result \
+             && [ "$(git rev-parse backport-result)" != "$OLD" ]; then
+            git bundle create "$out/backport.bundle" refs/heads/backport-result "^$OLD"
+            echo "produced=true" >> "$GITHUB_OUTPUT"
+            echo "result=$(git rev-parse backport-result)" >> "$GITHUB_OUTPUT"
+          else
+            echo "produced=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Upload
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: backport
+          path: ${{ runner.temp }}/out/
+          if-no-files-found: error
+          retention-days: 30
+
+  verify:
+    needs: [prepare, backport]
+    if: needs.backport.outputs.produced == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    outputs:
+      status: ${{ steps.check.outputs.status }}
+    steps:
+      - name: Harden runner
+        uses: step-security/harden-runner@05e31511f85b41b11d1cf0ef85d0992719546e2c # v2.21.0
+        with:
+          egress-policy: audit
+
+      - name: Checkout
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ needs.prepare.outputs.old }}
+          fetch-depth: 0
+          filter: blob:none
+          persist-credentials: false
+
+      - name: Trusted tools
+        run: |
+          set -euo pipefail
+          git fetch --no-tags --filter=blob:none origin "$GITHUB_SHA" "refs/pull/$PR/head"
+          mkdir "$RUNNER_TEMP/tools"
+          git archive "$GITHUB_SHA" .github/scripts | tar -x -C "$RUNNER_TEMP/tools" --strip-components=1
+
+      - name: Download the plan
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: backport-plan
+          path: ${{ runner.temp }}/in/plan
+
+      - name: Download the backport
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: backport
+          path: ${{ runner.temp }}/in/backport
+
+      - name: Check
+        id: check
+        env:
+          OLD: ${{ needs.prepare.outputs.old }}
+          RESULT: ${{ needs.backport.outputs.result }}
+        run: |
+          set -euo pipefail
+          git fetch "$RUNNER_TEMP/in/backport/backport.bundle" backport-result:backport-result
+          [ "$(git rev-parse backport-result)" = "$RESULT" ] || { echo "bundle does not hold $RESULT"; exit 1; }
+          # Capture the status: under bash -e a bare call would end the step
+          # before the verdict is recorded.
+          rc=0
+          bash "$RUNNER_TEMP/tools/scripts/verify-backport.sh" "$OLD" "$RESULT" "$RUNNER_TEMP/in/plan/todo" >"$RUNNER_TEMP/verify.md" || rc=$?
+          case $rc in
+            0) status=clean ;;
+            1) status=differences ;;
+            *) status=broken ;;
+          esac
+          echo "status=$status" >> "$GITHUB_OUTPUT"
+          cat "$RUNNER_TEMP/verify.md" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: backport-verify
+          path: ${{ runner.temp }}/verify.md
+          retention-days: 30
+
+  build:
+    needs: [prepare, backport]
+    if: needs.backport.outputs.produced == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        arch: [x86_64, arm64]
+    name: build (${{ matrix.arch }})
+    steps:
+      - name: Harden runner
+        uses: step-security/harden-runner@05e31511f85b41b11d1cf0ef85d0992719546e2c # v2.21.0
+        with:
+          egress-policy: audit
+
+      - name: Checkout
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ needs.prepare.outputs.old }}
+          fetch-depth: 0
+          filter: blob:none
+          persist-credentials: false
+
+      - name: Trusted tools
+        run: |
+          set -euo pipefail
+          git fetch --no-tags --filter=blob:none origin "$GITHUB_SHA"
+          mkdir "$RUNNER_TEMP/tools"
+          git archive "$GITHUB_SHA" .github/scripts | tar -x -C "$RUNNER_TEMP/tools" --strip-components=1
+
+      - name: Download
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: backport
+          path: ${{ runner.temp }}/in
+
+      - name: Check out the result
+        env:
+          RESULT: ${{ needs.backport.outputs.result }}
+        run: |
+          set -euo pipefail
+          git fetch "$RUNNER_TEMP/in/backport.bundle" backport-result:backport-result
+          git checkout --detach "$RESULT"
+
+      - name: Install toolchains
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential bc bison flex libelf-dev libssl-dev python3 \
+            gcc-aarch64-linux-gnu
+
+      - name: Build
+        env:
+          ARCH: ${{ matrix.arch }}
+        run: bash "$RUNNER_TEMP/tools/scripts/kernel-build.sh" "$ARCH" "$RUNNER_TEMP/obj"
+
+  publish:
+    needs: [prepare, backport, verify, build]
+    if: >-
+      always()
+      && needs.prepare.result == 'success'
+      && needs.prepare.outputs.state != 'ignored'
+      && needs.backport.result != 'cancelled'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      actions: write
+      issues: write
+      pull-requests: write
+    steps:
+      - name: Harden runner
+        uses: step-security/harden-runner@05e31511f85b41b11d1cf0ef85d0992719546e2c # v2.21.0
+        with:
+          egress-policy: audit
+
+      - name: Checkout
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ needs.prepare.outputs.old }}
+          fetch-depth: 0
+          filter: blob:none
+          persist-credentials: false
+
+      - name: Trusted tools
+        run: |
+          set -euo pipefail
+          git fetch --no-tags --filter=blob:none origin "$GITHUB_SHA"
+          mkdir "$RUNNER_TEMP/tools"
+          git archive "$GITHUB_SHA" .github/scripts | tar -x -C "$RUNNER_TEMP/tools" --strip-components=1
+
+      - name: Download the plan
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: backport-plan
+          path: ${{ runner.temp }}/in/plan
+
+      - name: Download the backport
+        if: needs.prepare.outputs.state == 'run'
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: backport
+          path: ${{ runner.temp }}/in/backport
+
+      - name: Download the checker report
+        if: needs.verify.result == 'success'
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: backport-verify
+          path: ${{ runner.temp }}/in/verify
+
+      # Pushes and closes backport branches. Pull requests it opens trigger
+      # the usual checks, which ones opened with GITHUB_TOKEN would not.
+      - name: App token
+        id: app
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          client-id: ${{ vars.REBASE_APP_CLIENT_ID }}
+          private-key: ${{ secrets.REBASE_APP_PRIVATE_KEY }}
+          permission-contents: write
+          permission-pull-requests: write
+
+      - name: Propose
+        env:
+          APP_TOKEN: ${{ steps.app.outputs.token }}
+          GH_TOKEN: ${{ github.token }}
+          STATE: ${{ needs.prepare.outputs.state }}
+          TITLE: ${{ needs.prepare.outputs.title }}
+          PRODUCED: ${{ needs.backport.outputs.produced }}
+          VERIFY: ${{ needs.verify.outputs.status }}
+          BUILD: ${{ needs.build.result }}
+          OLD: ${{ needs.prepare.outputs.old }}
+          RESULT: ${{ needs.backport.outputs.result }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          R=$GITHUB_REPOSITORY
+          in=$RUNNER_TEMP/in
+          summary() { cat >> "$GITHUB_STEP_SUMMARY"; }
+
+          # One status comment on the mainline pull request, kept up to date.
+          marker='<!-- lts-backport-status -->'
+          status_comment() { # status_comment <markdown-file>
+            local id
+            { echo "$marker"; echo "**Backport to \`$TARGET\`:** $(head -n1 "$1")"; tail -n +2 "$1"; echo; echo "[Run log]($RUN_URL)"; } >"$1.full"
+            id=$(gh api --paginate "repos/$R/issues/$PR/comments" \
+              -q ".[] | select(.body | startswith(\"$marker\")) | .id" | head -n1)
+            if [ -n "$id" ]; then
+              gh api -X PATCH "repos/$R/issues/comments/$id" -F body=@"$1.full" >/dev/null
+            else
+              gh api -X POST "repos/$R/issues/$PR/comments" -F body=@"$1.full" >/dev/null
+            fi
+          }
+          # At most one of backport-waiting and backport-needs-attention.
+          set_label() { # set_label <label or none>
+            local l
+            for l in backport-waiting backport-needs-attention; do
+              if [ "$l" = "$1" ]; then
+                gh label create "$l" --repo "$R" --color ededed --force >/dev/null
+                gh api -X POST "repos/$R/issues/$PR/labels" -f "labels[]=$l" >/dev/null
+              else
+                gh api -X DELETE "repos/$R/issues/$PR/labels/$l" >/dev/null 2>&1 || true
+              fi
+            done
+          }
+          open_backport() {
+            gh pr list --repo "$R" --state open --base "$TARGET" --head "$BRANCH" --json number -q '.[0].number // empty'
+          }
+          close_backport() { # close_backport <reason>
+            local n
+            n=$(open_backport)
+            [ -z "$n" ] || GH_TOKEN=$APP_TOKEN gh pr close "$n" --repo "$R" --delete-branch --comment "$1"
+          }
+
+          case $STATE in
+            skipped)
+              set_label none
+              close_backport "Closed: $(cat "$in/plan/message.md")"
+              { echo "not needed"; echo; cat "$in/plan/message.md"; } >"$RUNNER_TEMP/c.md"
+              status_comment "$RUNNER_TEMP/c.md"
+              exit 0 ;;
+            waiting)
+              set_label backport-waiting
+              close_backport "Closed while #$PR waits for earlier backports; it is proposed again once they land."
+              { echo "waiting"; echo; cat "$in/plan/message.md"; } >"$RUNNER_TEMP/c.md"
+              status_comment "$RUNNER_TEMP/c.md"
+              exit 0 ;;
+          esac
+
+          # A rebase moved edera/6.18-lts under this backport: start again
+          # from the new tip rather than propose something built on the old
+          # one. A backport that landed on top is fine; the tree still
+          # contains OLD.
+          git fetch --no-tags --filter=blob:none origin "$TARGET"
+          if ! git merge-base --is-ancestor "$OLD" FETCH_HEAD; then
+            gh workflow run kernel-nightly.yml --repo "$R" --ref "$TARGET" -f backport_pr="$PR"
+            echo "\`$TARGET\` was rebased while this ran; dispatched again from the new tip." | summary
+            exit 0
+          fi
+
+          report=$in/backport/report.md
+          claude_status=$(head -n1 "$report" | sed -nE 's/^Status:[[:space:]]*([a-z-]+).*/\1/p')
+          tail -n +2 "$report" | sed '1{/^$/d}' >"$RUNNER_TEMP/report-body.md"
+
+          if [ "$claude_status" = waiting ]; then
+            set_label backport-waiting
+            close_backport "Closed while #$PR waits for earlier backports; it is proposed again once they land."
+            { echo "waiting (Claude found a dependency)"; echo; cat "$RUNNER_TEMP/report-body.md"; } >"$RUNNER_TEMP/c.md"
+            status_comment "$RUNNER_TEMP/c.md"
+            exit 0
+          fi
+
+          why=
+          if [ "$PRODUCED" != true ]; then
+            why="Claude produced no backport (\`${claude_status:-no status}\`)"
+          elif [ "$VERIFY" = broken ]; then
+            why="the checker refused the backport branch"
+          else
+            git fetch "$in/backport/backport.bundle" backport-result:backport-result
+            [ "$(git rev-parse backport-result)" = "$RESULT" ]
+            # Workflows triggered by a pull request run that branch's own copy
+            # of .github/ with this repository's secrets. A backport never
+            # touches it: automation commits are never requested.
+            if ! git diff --quiet "$OLD" "$RESULT" -- .github .automation; then
+              why="the backport changes \`.github\` or \`.automation\`"
+            fi
+          fi
+          if [ -n "$why" ]; then
+            set_label backport-needs-attention
+            {
+              echo "needs attention: $why"
+              echo
+              [ ! -s "$in/verify/verify.md" ] || { cat "$in/verify/verify.md"; echo; }
+              cat "$RUNNER_TEMP/report-body.md"
+              echo
+              echo "Label this pull request \`no-backport\` if it should not come to \`$TARGET\`; otherwise fix the cause and run **Nightly kernel maintenance** on \`$TARGET\` with \`backport_pr\` = $PR."
+            } | head -c 60000 >"$RUNNER_TEMP/c.md"
+            status_comment "$RUNNER_TEMP/c.md"
+            echo "::error::Backport of #$PR not proposed: $why."
+            exit 1
+          fi
+
+          flags=()
+          [ "$VERIFY" = clean ] || flags+=("the checker found differences from the mainline commits (see below)")
+          [ "$BUILD" = success ] || flags+=("a build ${BUILD}")
+          drc=0
+          bash "$RUNNER_TEMP/tools/scripts/report-needs-decision.sh" "$RUNNER_TEMP/report-body.md" >/dev/null || drc=$?
+          [ "$drc" -ne 0 ] || flags+=("Claude's report asks for a decision")
+
+          body=$RUNNER_TEMP/pr.md
+          {
+            echo "Backport of #$PR from \`$SOURCE\` to \`$TARGET\` (\`${OLD:0:12}\`), prepared by Claude. [Run log]($RUN_URL)."
+            echo
+            if [ "${#flags[@]}" -gt 0 ]; then
+              echo "> [!WARNING]"
+              for f in "${flags[@]}"; do echo "> - $f"; done
+              echo
+            fi
+            echo "Merge with **Rebase and merge**, so \`$TARGET\` stays linear."
+            echo
+            echo "## Independent checks"
+            echo
+            echo "Builds: **${BUILD}** (x86_64 and arm64 vmlinux with the Edera features built in)."
+            echo
+            if [ -s "$in/verify/verify.md" ]; then cat "$in/verify/verify.md"; else echo "The checker did not run."; fi
+            echo
+            echo "# Claude's report"
+            echo
+            cat "$RUNNER_TEMP/report-body.md"
+          } >"$body"
+          if [ "$(wc -c <"$body")" -gt 60000 ]; then
+            head -c 59000 "$body" >"$body.cut"
+            printf '\n\n_Truncated; the full report is in the run artifacts._\n' >>"$body.cut"
+            mv "$body.cut" "$body"
+          fi
+
+          # The branch belongs to this automation; a retry replaces it.
+          git push --force "https://x-access-token:${APP_TOKEN}@github.com/${R}.git" "$RESULT:refs/heads/$BRANCH"
+          n=$(open_backport)
+          if [ -n "$n" ]; then
+            GH_TOKEN=$APP_TOKEN gh pr edit "$n" --repo "$R" --body-file "$body"
+            url=$(gh pr view "$n" --repo "$R" --json url -q .url)
+          else
+            url=$(GH_TOKEN=$APP_TOKEN gh pr create --repo "$R" --base "$TARGET" --head "$BRANCH" \
+              --title "Backport #$PR to 6.18-lts: $TITLE" --body-file "$body")
+          fi
+          set_label none
+          {
+            echo "proposed in $url"
+            echo
+            if [ "${#flags[@]}" -gt 0 ]; then for f in "${flags[@]}"; do echo "- $f"; done; else echo "Checks and builds passed."; fi
+          } >"$RUNNER_TEMP/c.md"
+          status_comment "$RUNNER_TEMP/c.md"
+          echo "### Proposed: $url" | summary
