@@ -1,0 +1,43 @@
+name: Trigger edera/6.18-lts backport
+
+# Starts edera/6.18-lts's backport of a pull request that just merged into
+# edera/mainline, and does nothing else.
+#
+# edera/6.18-lts drives its own backports with its own copy of
+# kernel-nightly.yml (backport_pr=<N> runs lts-backport.yml there). Pull
+# requests labelled no-backport, and the nightly's own rebase pull requests,
+# are not dispatched; edera/6.18-lts decides everything else, including
+# whether there is anything to backport at all.
+#
+# pull_request_target runs this file as it is on edera/mainline, with a token
+# that can dispatch even for a pull request from a fork. Nothing here checks
+# out or runs the pull request's code.
+
+on:
+  pull_request_target:
+    types: [closed]
+    branches: [edera/mainline]
+
+permissions: {}
+
+jobs:
+  dispatch:
+    if: >-
+      github.event.pull_request.merged
+      && !startsWith(github.event.pull_request.head.ref, 'rebase/')
+      && !contains(github.event.pull_request.labels.*.name, 'no-backport')
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      actions: write
+    steps:
+      - name: Harden runner
+        uses: step-security/harden-runner@05e31511f85b41b11d1cf0ef85d0992719546e2c # v2.21.0
+        with:
+          egress-policy: audit
+
+      - name: Dispatch
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR: ${{ github.event.pull_request.number }}
+        run: gh workflow run kernel-nightly.yml --repo "$GITHUB_REPOSITORY" --ref edera/6.18-lts -f backport_pr="$PR"
