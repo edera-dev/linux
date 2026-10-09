@@ -1,14 +1,14 @@
 ---
 name: upstream-rebase
-description: Nightly rebase of edera/mainline onto torvalds master, run unattended in CI by .github/workflows/upstream-rebase.yml. Covers the replay, conflict resolution, build checks, the audit of upstream fixes that meet the series, and the report the workflow publishes.
+description: Nightly rebase of an Edera kernel integration tree (edera/mainline onto torvalds master, edera/6.18-lts onto stable linux-6.18.y), run unattended in CI by .github/workflows/upstream-rebase.yml. Covers the replay, conflict resolution, build checks, the audit of upstream fixes that meet the series, and the report the workflow publishes.
 ---
 
 # Nightly upstream rebase
 
 You are rebasing the Edera downstream kernel series (around 80 commits:
 Hyper-V-nested-on-Xen, the Xen PV-IOMMU, NUMA-aware Xen backends, 2 MiB
-ballooning, OpenPaX, and assorted fixes) on `edera/mainline` onto Linus'
-tree. The goal is a replay that changes **nothing downstream**: every
+ballooning, OpenPaX, and assorted fixes) onto the upstream branch its tree
+tracks. The goal is a replay that changes **nothing downstream**: every
 difference in the final tree must come from the upstream delta alone. Where
 that is impossible, because upstream and downstream touched the same code, you
 resolve the conflict the way a careful kernel maintainer would and you say
@@ -50,7 +50,8 @@ report is a success; one that hides a judgement call is not.
 
 The workflow gives you, in the prompt:
 
-- `DOWNSTREAM`: the branch being rebased, `edera/mainline`.
+- `DOWNSTREAM`: the branch being rebased, `edera/mainline` or
+  `edera/6.18-lts`.
 - `OLD_TIP`: its current commit (already checked out).
 - `UPSTREAM`: the upstream commit to rebase onto, fetched as the local branch
   `upstream-target`.
@@ -83,8 +84,8 @@ git rev-list --count --no-merges MB..OLD_TIP  # downstream commits
 git log --oneline --no-merges MB..UPSTREAM    # what is new upstream
 ```
 
-The upstream range is large (a few days of mainline, far more during a merge
-window), so do not read it all. Find where it meets the
+The upstream range is large (a stable release, or a few days of mainline,
+including merge windows), so do not read it all. Find where it meets the
 series:
 
 ```sh
@@ -116,12 +117,12 @@ When a commit conflicts:
 - Read the upstream change that caused it **and** the downstream commit's
   intent (its message, and the rest of its diff). Resolve so the downstream
   commit does what it did before, on top of what upstream now does.
-- Upstream wins on fixes. If an upstream fix changed the code a downstream
-  commit edits, keep every check, lock, ordering constraint and error path
-  the fix introduced, and fit the downstream change around it.
-- If upstream now contains the downstream change itself (it was upstreamed,
-  perhaps through a subsystem tree), let the downstream commit go empty and
-  let git drop it. Record that, with the upstream commit.
+- Upstream wins on fixes. If a stable backport or a mainline fix changed the
+  code a downstream commit edits, keep every check, lock, ordering constraint
+  and error path the fix introduced, and fit the downstream change around it.
+- If upstream now contains the downstream change itself (it was upstreamed or
+  backported to stable), let the downstream commit go empty and let git drop
+  it. Record that, with the upstream commit.
 - If you cannot tell what the right resolution is, do not guess silently. Make
   the most conservative resolution you can defend, mark it **UNSURE** in the
   report, and explain both readings.
@@ -167,9 +168,9 @@ For every upstream commit flagged in step 1, check that its change **survived
 the replay**. Ancestry is not enough: a downstream commit replayed on top can
 edit the very lines a fix added.
 
-Give fixes the most attention: anything with a `Fixes:` tag, a `CVE-`
-reference, or `Cc: stable`. For each one that touched a file the series also
-touches:
+Give fixes the most attention: stable commits (every one of them is a fix),
+and in mainline anything with a `Fixes:` tag, a `CVE-` reference, or `Cc:
+stable`. For each one that touched a file the series also touches:
 
 ```sh
 git log --oneline UPSTREAM..RESULT -- <files the fix touched>

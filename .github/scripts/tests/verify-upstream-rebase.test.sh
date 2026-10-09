@@ -4,8 +4,9 @@
 # Builds a small throwaway repository with an upstream line and a downstream
 # series on it, rebases the series onto a newer upstream, and then damages
 # copies of that result in each way the checker exists to catch. The nightly
-# rebase force-pushes edera/mainline on this script's say-so, so every
-# damaged copy must be refused, and every honest replay must pass.
+# rebase force-pushes edera/6.18-lts and edera/mainline on this script's
+# say-so, so every damaged copy must be refused, and every honest replay must
+# pass.
 #
 # Run from anywhere: bash .github/scripts/tests/verify-upstream-rebase.test.sh
 set -uo pipefail

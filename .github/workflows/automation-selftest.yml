@@ -1,8 +1,8 @@
 name: Automation self-test
 
 # Tests the scripts the nightly rebase relies on to decide whether to
-# force-push edera/mainline, so a change that weakens either must not land
-# quietly:
+# force-push edera/mainline and edera/6.18-lts, so a change that weakens
+# either must not land quietly:
 #
 #   - verify-upstream-rebase.sh: honest replays pass, including one that
 #     flattens a merged series; edited, dropped, added and merged commits and

@@ -8,12 +8,13 @@ name: Land upstream rebase
 # old one. Approving instead force-pushes the tree to the exact commit that
 # was approved, and GitHub then marks the pull request merged.
 #
-# A review runs this workflow from the pull request's merge ref, which is why
-# it lives on edera/mainline.
+# A review runs this workflow from the pull request's merge ref, not from the
+# default branch, so it only runs for a tree that carries this file.
 #
 # What has to hold before anything is pushed:
-#   - the pull request is a rebase/edera-mainline/... branch from this
-#     repository, targeting edera/mainline;
+#   - the pull request is a rebase/<tree>/... branch from this repository,
+#     targeting that tree: rebase/edera-mainline/... into edera/mainline, or
+#     rebase/edera-6.18-lts/... into edera/6.18-lts;
 #   - the review approved the current head, not an earlier one;
 #   - the approver has write access;
 #   - the tree is still the tip the branch was made from. The branch name
@@ -40,8 +41,12 @@ jobs:
     if: >-
       github.event.review.state == 'approved'
       && github.event.pull_request.head.repo.full_name == github.repository
-      && github.event.pull_request.base.ref == 'edera/mainline'
-      && startsWith(github.event.pull_request.head.ref, 'rebase/edera-mainline/')
+      && (
+        (github.event.pull_request.base.ref == 'edera/mainline'
+          && startsWith(github.event.pull_request.head.ref, 'rebase/edera-mainline/'))
+        || (github.event.pull_request.base.ref == 'edera/6.18-lts'
+          && startsWith(github.event.pull_request.head.ref, 'rebase/edera-6.18-lts/'))
+      )
     runs-on: ubuntu-latest
     timeout-minutes: 15
     permissions:

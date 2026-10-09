@@ -1,7 +1,8 @@
 name: Upstream rebase
 
-# Rebases an Edera kernel integration tree onto its upstream. Called nightly
-# by kernel-nightly.yml for edera/mainline, onto torvalds master.
+# Rebases one Edera kernel integration tree onto its upstream. Called nightly
+# by kernel-nightly.yml, once for edera/mainline (onto torvalds master) and
+# once for edera/6.18-lts (onto stable linux-6.18.y).
 #
 # Claude does the rebase, following .automation/skills/upstream-rebase/
 # SKILL.md: it replays the series, resolves conflicts, fixes what the replay
