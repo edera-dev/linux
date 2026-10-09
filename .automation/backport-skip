@@ -1,0 +1,11 @@
+# Edera commits on edera/mainline that must never be backported to
+# edera/6.18-lts, one subject per line, exactly as the commit has it.
+#
+# Each pull request merged into edera/mainline is backported on its own
+# (.github/workflows/lts-backport.yml); label it no-backport to opt out. This
+# file is for commits that did not arrive through such a pull request, or
+# were ported to 6.18 in a form the subject match cannot see. A commit that
+# is listed here, or belongs to a no-backport pull request, does not hold up
+# later backports that touch the same files.
+#
+# Blank lines and lines starting with # are ignored.

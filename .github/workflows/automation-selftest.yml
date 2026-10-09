@@ -1,14 +1,17 @@
 name: Automation self-test
 
 # Tests the scripts the nightly rebase relies on to decide whether to
-# force-push edera/6.18-lts, so a change that weakens either must not land
-# quietly:
+# force-push edera/6.18-lts, and the ones the backports rely on to decide what
+# to propose, so a change that weakens any of them must not land quietly:
 #
 #   - verify-upstream-rebase.sh: honest replays pass, including one that
 #     flattens a merged series; edited, dropped, added and merged commits and
 #     a stale base are all refused;
 #   - report-needs-decision.sh: any question in Claude's report, or anything
-#     marked UNSURE, stops the automatic push.
+#     marked UNSURE, stops the automatic push;
+#   - pending-backports.sh, backport-blockers.sh and verify-backport.sh: only
+#     what the LTS tree lacks is offered, in mainline order, and a damaged
+#     backport is flagged or refused.
 #
 # It runs only when the automation itself changes.
 
@@ -21,6 +24,8 @@ on:
       - '.github/workflows/upstream-rebase.yml'
       - '.github/workflows/kernel-nightly.yml'
       - '.github/workflows/rebase-land.yml'
+      - '.github/workflows/lts-backport.yml'
+      - '.github/workflows/lts-backport-merged.yml'
       - '.github/workflows/automation-selftest.yml'
       - '.automation/**'
 
@@ -55,6 +60,9 @@ jobs:
 
       - name: Decision detector tests
         run: bash .github/scripts/tests/report-needs-decision.test.sh
+
+      - name: Backport tests
+        run: bash .github/scripts/tests/backport.test.sh
 
       - name: Shellcheck
         run: shellcheck .github/scripts/*.sh .github/scripts/tests/*.sh
