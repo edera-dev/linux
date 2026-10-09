@@ -1,10 +1,17 @@
 name: Nightly kernel maintenance
 
-# Rebases edera/6.18-lts onto stable linux-6.18.y every night
-# (upstream-rebase.yml).
+# Keeps edera/6.18-lts current:
 #
-# Claude does the rebase. Independent checks decide whether the result is
-# pushed or proposed as a pull request; see upstream-rebase.yml.
+#   - nightly, rebases it onto stable linux-6.18.y (upstream-rebase.yml), then
+#     retries waiting backports and refreshes the backport pull requests the
+#     rebase left behind (retry-backports.sh);
+#   - with backport_pr set, proposes the backport of that merged
+#     edera/mainline pull request instead (lts-backport.yml).
+#     lts-backport-trigger.yml on edera/mainline dispatches this for every
+#     pull request that merges there.
+#
+# Claude does the rebase and the backports. Independent checks decide what
+# happens to each result; see those workflows.
 #
 # GitHub runs scheduled workflows only from the default branch, edera/mainline,
 # so this copy has no schedule of its own. lts-rebase-trigger.yml on
@@ -33,18 +40,25 @@ on:
         description: Rebase even if an open rebase pull request already covers this upstream tip
         type: boolean
         default: false
+      backport_pr:
+        description: Instead of the rebase, backport this merged edera/mainline pull request (its number)
+        type: string
+        default: ''
 
 permissions:
   contents: read
 
 concurrency:
   # Per tree: groups are repository-wide, and edera/mainline's copy of this
-  # workflow uses plain kernel-nightly.
-  group: kernel-nightly-edera/6.18-lts
+  # workflow uses plain kernel-nightly. Each backport has its own group, so
+  # they run alongside the rebase and each other; a newer dispatch for the
+  # same pull request replaces one still queued.
+  group: kernel-nightly-edera/6.18-lts${{ inputs.backport_pr != '' && format('-backport-{0}', inputs.backport_pr) || '' }}
   cancel-in-progress: false
 
 jobs:
   lts:
+    if: inputs.backport_pr == ''
     uses: ./.github/workflows/upstream-rebase.yml
     permissions:
       contents: read
@@ -57,4 +71,44 @@ jobs:
       upstream_url: https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git
       upstream_branch: linux-6.18.y
       force: ${{ inputs.force == true }}
+    secrets: inherit
+
+  # After the rebase, whatever it did.
+  retry:
+    needs: lts
+    if: always() && inputs.backport_pr == ''
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      actions: write
+      pull-requests: read
+    steps:
+      - name: Harden runner
+        uses: step-security/harden-runner@05e31511f85b41b11d1cf0ef85d0992719546e2c # v2.21.0
+        with:
+          egress-policy: audit
+
+      - name: Checkout
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+          sparse-checkout: .github
+
+      - name: Retry and refresh backports
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: bash .github/scripts/retry-backports.sh --stale
+
+  backport:
+    if: inputs.backport_pr != ''
+    uses: ./.github/workflows/lts-backport.yml
+    permissions:
+      contents: read
+      actions: write
+      issues: write
+      pull-requests: write
+      id-token: write
+    with:
+      pr: ${{ inputs.backport_pr }}
     secrets: inherit
