@@ -567,4 +567,5 @@ static int __init xen_iommu_init(void)
 	return 0;
 }
 
-module_init(xen_iommu_init);
+/* Must precede xen-pciback's fs_initcall bind, or the IOMMU core sees a bound device. */
+subsys_initcall_sync(xen_iommu_init);
