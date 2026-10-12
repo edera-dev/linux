@@ -277,6 +277,7 @@ jobs:
           anthropic_organization_id:    '${{ steps.ids.outputs.org }}'
           anthropic_service_account_id: '${{ steps.ids.outputs.svc }}'
           anthropic_workspace_id:       '${{ steps.ids.outputs.ws }}'
+          allowed_bots:                 'github-actions'
           prompt: |
             Backport a merged edera/mainline pull request to edera/6.18-lts by
             following .rebase-tools/skills/mainline-backport/SKILL.md exactly.
