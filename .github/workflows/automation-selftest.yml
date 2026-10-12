@@ -64,5 +64,8 @@ jobs:
       - name: Backport tests
         run: bash .github/scripts/tests/backport.test.sh
 
+      - name: Backport retry tests
+        run: bash .github/scripts/tests/retry-backports.test.sh
+
       - name: Shellcheck
         run: shellcheck .github/scripts/*.sh .github/scripts/tests/*.sh
