@@ -232,6 +232,7 @@ jobs:
           anthropic_organization_id:    '${{ steps.ids.outputs.org }}'
           anthropic_service_account_id: '${{ steps.ids.outputs.svc }}'
           anthropic_workspace_id:       '${{ steps.ids.outputs.ws }}'
+          allowed_bots:                 'github-actions'
           prompt: |
             Rebase the downstream kernel series onto upstream by following
             .rebase-tools/skills/upstream-rebase/SKILL.md exactly. Read it in
