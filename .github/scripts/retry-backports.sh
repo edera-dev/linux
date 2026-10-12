@@ -12,6 +12,8 @@
 # read, and GITHUB_REPOSITORY.
 #
 # Usage: retry-backports.sh [--stale]
+#
+# Nothing to retry is the usual case and exits 0.
 
 set -euo pipefail
 
@@ -29,7 +31,7 @@ R=$GITHUB_REPOSITORY
 			-q ".[] | select(.headRefName | startswith(\"$PREFIX\")) | select(.mergeable == \"CONFLICTING\") | .headRefName" |
 			sed "s|^$PREFIX||"
 	fi
-} | grep -xE '[0-9]+' | sort -un | while read -r n; do
+} | { grep -xE '[0-9]+' || true; } | sort -un | while read -r n; do
 	echo "Dispatching the backport of #$n"
 	gh workflow run kernel-nightly.yml --repo "$R" --ref "$TARGET" -f backport_pr="$n"
 done
