@@ -1142,7 +1142,8 @@ static int __init balloon_init(void)
 	/* Init the xen-balloon driver. */
 	xen_balloon_init();
 
-	register_oom_notifier(&balloon_oom_nb);
+	if (!xen_initial_domain())
+		register_oom_notifier(&balloon_oom_nb);
 
 	return 0;
 
