@@ -1024,10 +1024,26 @@ static struct notifier_block balloon_oom_nb = {
 	.notifier_call = balloon_oom_notify,
 };
 
+static void __init balloon_append_range(unsigned long pfn,
+					unsigned long end_pfn)
+{
+	while (pfn < end_pfn) {
+		if (balloon_blocks_usable() &&
+		    IS_ALIGNED(pfn, BALLOON_BLOCK_NR_PAGES) &&
+		    end_pfn - pfn >= BALLOON_BLOCK_NR_PAGES) {
+			balloon_append_block(pfn_to_page(pfn));
+			pfn += BALLOON_BLOCK_NR_PAGES;
+		} else {
+			balloon_append(pfn_to_page(pfn));
+			pfn++;
+		}
+	}
+}
+
 static int __init balloon_add_regions(bool append)
 {
 	unsigned long start_pfn, pages;
-	unsigned long pfn, extra_pfn_end;
+	unsigned long extra_pfn_end;
 	unsigned int i;
 
 	for (i = 0; i < XEN_EXTRA_MEM_MAX_REGIONS; i++) {
@@ -1044,8 +1060,7 @@ static int __init balloon_add_regions(bool append)
 		 */
 		extra_pfn_end = min(max_pfn, start_pfn + pages);
 
-		for (pfn = start_pfn; pfn < extra_pfn_end; pfn++)
-			balloon_append(pfn_to_page(pfn));
+		balloon_append_range(start_pfn, extra_pfn_end);
 
 		/*
 		 * There are two different use-cases depending on how the
