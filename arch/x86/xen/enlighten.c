@@ -10,6 +10,7 @@
 
 #include <xen/xen.h>
 #include <xen/features.h>
+#include <xen/interface/memory.h>
 #include <xen/interface/sched.h>
 #include <xen/interface/version.h>
 #include <xen/page.h>
@@ -441,8 +442,34 @@ void __init xen_add_extra_mem(unsigned long start_pfn, unsigned long n_pfns)
 }
 
 #ifdef CONFIG_XEN_UNPOPULATED_ALLOC
+/*
+ * How much of the extra memory dom0 keeps on the balloon, to grow into up
+ * to the ceiling Xen set for it (dom0_mem=...,max:). Without a max: Xen
+ * reports UINT_MAX and dom0 keeps nothing, so growing stays opt-in. The
+ * last memory section always stays with the mapping pool, so that the
+ * grant table and other early users never fall back to holes in the
+ * physical map before PCI devices have claimed their MMIO windows.
+ */
+static unsigned long __init xen_dom0_growth_pages(unsigned long extra_pages)
+{
+	domid_t domid = DOMID_SELF;
+	long max_pages, cur_pages;
+
+	if (!xen_initial_domain() || extra_pages <= PAGES_PER_SECTION)
+		return 0;
+
+	max_pages = HYPERVISOR_memory_op(XENMEM_maximum_reservation, &domid);
+	cur_pages = HYPERVISOR_memory_op(XENMEM_current_reservation, &domid);
+	if (cur_pages <= 0 || max_pages <= cur_pages || max_pages >= UINT_MAX)
+		return 0;
+
+	return min_t(unsigned long, max_pages - cur_pages,
+		     extra_pages - PAGES_PER_SECTION);
+}
+
 int __init arch_xen_unpopulated_init(struct resource **res)
 {
+	unsigned long extra_pages = 0, growth_pages;
 	unsigned int i;
 
 	if (!xen_domain())
@@ -451,16 +478,27 @@ int __init arch_xen_unpopulated_init(struct resource **res)
 	/* Must be set strictly before calling xen_free_unpopulated_pages(). */
 	*res = &iomem_resource;
 
+	for (i = 0; i < XEN_EXTRA_MEM_MAX_REGIONS; i++)
+		extra_pages += xen_extra_mem[i].n_pfns;
+	growth_pages = xen_dom0_growth_pages(extra_pages);
+
 	/*
 	 * Initialize with pages from the extra memory regions (see
-	 * arch/x86/xen/setup.c).
+	 * arch/x86/xen/setup.c), less what dom0 keeps to grow into. Every
+	 * region gives up the same fraction: on PVH that spreads dom0's
+	 * growth over the NUMA nodes the regions belong to, and leaves each
+	 * node's pool its share of the rest.
 	 */
 	for (i = 0; i < XEN_EXTRA_MEM_MAX_REGIONS; i++) {
-		unsigned int j;
+		struct xen_memory_region *region = &xen_extra_mem[i];
+		unsigned long keep = 0, j;
 
-		for (j = 0; j < xen_extra_mem[i].n_pfns; j++) {
-			struct page *pg =
-				pfn_to_page(xen_extra_mem[i].start_pfn + j);
+		if (growth_pages)
+			keep = mult_frac(region->n_pfns, growth_pages,
+					 extra_pages);
+
+		for (j = keep; j < region->n_pfns; j++) {
+			struct page *pg = pfn_to_page(region->start_pfn + j);
 
 			xen_free_unpopulated_pages(1, &pg);
 		}
@@ -471,9 +509,9 @@ int __init arch_xen_unpopulated_init(struct resource **res)
 		 * driver to know how much of the physmap is unpopulated and
 		 * set an accurate initial memory target.
 		 */
-		xen_unpopulated_pages += xen_extra_mem[i].n_pfns;
-		/* Zero so region is not also added to the balloon driver. */
-		xen_extra_mem[i].n_pfns = 0;
+		xen_unpopulated_pages += region->n_pfns - keep;
+		/* Only the part dom0 keeps is added to the balloon driver. */
+		region->n_pfns = keep;
 	}
 
 	return 0;
