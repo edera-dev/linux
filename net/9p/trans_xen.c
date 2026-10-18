@@ -280,7 +280,7 @@ static irqreturn_t xen_9pfs_front_event_handler(int irq, void *r)
 		return IRQ_HANDLED;
 	}
 
-	wake_up_interruptible(&ring->wq);
+	wake_up(&ring->wq);
 	schedule_work(&ring->work);
 
 	return IRQ_HANDLED;
