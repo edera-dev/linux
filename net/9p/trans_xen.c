@@ -756,6 +756,13 @@ static int xen_9pfs_front_publish(struct xenbus_device *dev,
 			    XEN_9PFS_NUM_RINGS);
 	if (ret)
 		goto error_xenbus;
+	/* Lets the toolstack tell, before it exports a domain, whether its
+	 * open files can follow it into a new backend.
+	 */
+	ret = xenbus_printf(xbt, dev->nodename, "feature-session-transfer",
+			    "%u", 1);
+	if (ret)
+		goto error_xenbus;
 
 	for (i = 0; i < XEN_9PFS_NUM_RINGS; i++) {
 		char str[16];
