@@ -15,6 +15,8 @@
 
 #include <linux/module.h>
 #include <linux/spinlock.h>
+#include <linux/delay.h>
+#include <linux/unaligned.h>
 #include <net/9p/9p.h>
 #include <net/9p/client.h>
 #include <net/9p/transport.h>
@@ -22,6 +24,28 @@
 #define XEN_9PFS_NUM_RINGS 2
 #define XEN_9PFS_RING_ORDER 9
 #define XEN_9PFS_RING_SIZE(ring)  XEN_FLEX_RING_SIZE(ring->intf->ring_order)
+
+/* Edera backend extension that hands the fid table to the guest at suspend
+ * and takes it back after a restore, advertised as feature-session-transfer.
+ * The ids sit outside the 9P2000.L range. Tsession_save offset[4] answers
+ * Rsession_save total[4] next[4] count[4] entry[count]; Tsession_restore
+ * msize[4] flags[4] count[4] entry[count] answers Rsession_restore
+ * restored[4]. The frontend stores the count[4] entry[count] tails without
+ * looking inside them.
+ */
+#define P9_XEN_TSESSION_SAVE		200
+#define P9_XEN_RSESSION_SAVE		201
+#define P9_XEN_TSESSION_RESTORE		202
+#define P9_XEN_RSESSION_RESTORE		203
+#define P9_XEN_SESSION_RESET		1
+#define XEN_9PFS_CTL_TIMEOUT		(5 * HZ)
+#define XEN_9PFS_DRAIN_TIMEOUT		(2 * HZ)
+
+struct xen_9pfs_session_chunk {
+	struct list_head list;
+	u32 len;
+	u8 data[];
+};
 
 struct xen_9pfs_header {
 	uint32_t size;
@@ -61,6 +85,17 @@ struct xen_9pfs_front_priv {
 	 */
 	struct rw_semaphore rings_sem;
 	bool connected;
+
+	/* Session chunks saved at the last suspend, in guest memory so that
+	 * they survive into a restored or forked domain.
+	 */
+	struct list_head session;
+	/* A control request on ring 0, answered with tag P9_NOTAG. */
+	bool ctl_pending;
+	struct completion ctl_done;
+	u8 *ctl_reply;
+	u32 ctl_reply_cap;
+	u32 ctl_reply_len;
 };
 
 static LIST_HEAD(xen_9pfs_devs);
@@ -272,6 +307,29 @@ static void p9_xen_response(struct work_struct *work)
 				     masked_prod, &masked_cons,
 				     XEN_9PFS_RING_SIZE(ring));
 
+		/* A client's own P9_NOTAG request, Tversion, never maps to
+		 * ring 0; see xen_9pfs_front_ctl().
+		 */
+		if (ring == priv->rings && h.tag == P9_NOTAG &&
+		    READ_ONCE(priv->ctl_pending)) {
+			if (h.size <= priv->ctl_reply_cap) {
+				u32 size = XEN_9PFS_RING_SIZE(ring);
+
+				masked_cons = xen_9pfs_mask(cons, size);
+				xen_9pfs_read_packet(priv->ctl_reply,
+						     ring->data.in, h.size,
+						     masked_prod, &masked_cons,
+						     size);
+				priv->ctl_reply_len = h.size;
+			}
+			virt_mb();		/* read ring before freeing it */
+			cons += h.size;
+			ring->intf->in_cons = cons;
+			WRITE_ONCE(priv->ctl_pending, false);
+			complete(&priv->ctl_done);
+			continue;
+		}
+
 		req = p9_tag_lookup(priv->client, h.tag);
 		if (!req || req->status != REQ_STATUS_SENT) {
 			dev_warn(&priv->dev->dev, "Wrong req tag=%x\n", h.tag);
@@ -377,12 +435,23 @@ static void xen_9pfs_front_free_rings(struct xen_9pfs_front_priv *priv)
 	}
 }
 
+static void xen_9pfs_front_session_free(struct xen_9pfs_front_priv *priv)
+{
+	struct xen_9pfs_session_chunk *chunk, *next;
+
+	list_for_each_entry_safe(chunk, next, &priv->session, list) {
+		list_del(&chunk->list);
+		kvfree(chunk);
+	}
+}
+
 static void xen_9pfs_front_free(struct xen_9pfs_front_priv *priv)
 {
 	if (priv->rings) {
 		xen_9pfs_front_free_rings(priv);
 		kfree(priv->rings);
 	}
+	xen_9pfs_front_session_free(priv);
 	kfree(priv->tag);
 	kfree(priv);
 }
@@ -457,6 +526,159 @@ static void xen_9pfs_front_disconnect(struct xen_9pfs_front_priv *priv)
 
 	if (priv->client)
 		xen_9pfs_front_fail_sent(priv->client);
+}
+
+/* Send control request @req on ring 0 and wait for the backend's answer in
+ * @reply, which must carry @id and at least @body bytes after the header.
+ * Returns the reply length or a negative errno. Callers hold rings_sem.
+ */
+static int xen_9pfs_front_ctl(struct xen_9pfs_front_priv *priv,
+			      const u8 *req, u32 len, u8 *reply, u32 cap,
+			      u8 id, u32 body)
+{
+	struct xen_9pfs_dataring *ring = &priv->rings[0];
+	RING_IDX cons, prod, masked_cons, masked_prod;
+	unsigned long flags;
+	u32 reply_len;
+
+	BUILD_BUG_ON(P9_NOTAG % XEN_9PFS_NUM_RINGS == 0);
+	if (len > XEN_9PFS_RING_SIZE(ring))
+		return -E2BIG;
+	if (!wait_event_timeout(ring->wq, p9_xen_write_todo(ring, len),
+				XEN_9PFS_CTL_TIMEOUT))
+		return -ETIMEDOUT;
+
+	reinit_completion(&priv->ctl_done);
+	priv->ctl_reply = reply;
+	priv->ctl_reply_cap = cap;
+	priv->ctl_reply_len = 0;
+	WRITE_ONCE(priv->ctl_pending, true);
+
+	spin_lock_irqsave(&ring->lock, flags);
+	cons = ring->intf->out_cons;
+	prod = ring->intf->out_prod;
+	virt_mb();			/* read indexes before the ring */
+	if (XEN_9PFS_RING_SIZE(ring) -
+	    xen_9pfs_queued(prod, cons, XEN_9PFS_RING_SIZE(ring)) < len) {
+		spin_unlock_irqrestore(&ring->lock, flags);
+		WRITE_ONCE(priv->ctl_pending, false);
+		return -EBUSY;
+	}
+	masked_prod = xen_9pfs_mask(prod, XEN_9PFS_RING_SIZE(ring));
+	masked_cons = xen_9pfs_mask(cons, XEN_9PFS_RING_SIZE(ring));
+	xen_9pfs_write_packet(ring->data.out, req, len, &masked_prod,
+			      masked_cons, XEN_9PFS_RING_SIZE(ring));
+	virt_wmb();			/* write ring before updating pointer */
+	prod += len;
+	ring->intf->out_prod = prod;
+	spin_unlock_irqrestore(&ring->lock, flags);
+	notify_remote_via_irq(ring->irq);
+
+	if (!wait_for_completion_timeout(&priv->ctl_done,
+					 XEN_9PFS_CTL_TIMEOUT)) {
+		WRITE_ONCE(priv->ctl_pending, false);
+		/* A response worker may already be copying into @reply. */
+		flush_work(&ring->work);
+		return -ETIMEDOUT;
+	}
+
+	reply_len = priv->ctl_reply_len;
+	if (reply_len < P9_HDRSZ || get_unaligned_le32(reply) != reply_len)
+		return -EPROTO;
+	if (reply[4] == P9_RLERROR && reply_len >= P9_HDRSZ + 4)
+		return -(int)get_unaligned_le32(reply + P9_HDRSZ);
+	if (reply[4] != id || reply_len < P9_HDRSZ + body)
+		return -EPROTO;
+	return reply_len;
+}
+
+static int xen_9pfs_front_suspend(struct xenbus_device *dev)
+{
+	struct xen_9pfs_front_priv *priv = dev_get_drvdata(&dev->dev);
+	struct xen_9pfs_session_chunk *chunk;
+	u32 offset = 0, total, next, len;
+	struct p9_client *client;
+	u8 req[P9_HDRSZ + 4];
+	unsigned long deadline;
+	struct p9_req_t *p9_req;
+	unsigned long flags;
+	bool idle;
+	u8 *reply;
+	int ret, id;
+
+	if (!priv)
+		return 0;
+	xen_9pfs_front_session_free(priv);
+	if (!xenbus_read_unsigned(dev->otherend, "feature-session-transfer", 0))
+		return 0;
+
+	down_read(&priv->rings_sem);
+	client = priv->client;
+	if (!READ_ONCE(priv->connected) || !client)
+		goto out;
+
+	/* Let what is in flight finish first, so that the saved fids match
+	 * what the guest has seen answered.
+	 */
+	deadline = jiffies + XEN_9PFS_DRAIN_TIMEOUT;
+	do {
+		idle = true;
+		spin_lock_irqsave(&client->lock, flags);
+		idr_for_each_entry(&client->reqs, p9_req, id) {
+			if (READ_ONCE(p9_req->status) == REQ_STATUS_SENT) {
+				idle = false;
+				break;
+			}
+		}
+		spin_unlock_irqrestore(&client->lock, flags);
+		if (idle)
+			break;
+		usleep_range(1000, 2000);
+	} while (time_before(jiffies, deadline));
+
+	reply = kvmalloc(XEN_9PFS_RING_SIZE(priv->rings), GFP_KERNEL);
+	if (!reply) {
+		ret = -ENOMEM;
+		goto failed;
+	}
+	do {
+		put_unaligned_le32(sizeof(req), req);
+		req[4] = P9_XEN_TSESSION_SAVE;
+		put_unaligned_le16(P9_NOTAG, req + 5);
+		put_unaligned_le32(offset, req + P9_HDRSZ);
+		ret = xen_9pfs_front_ctl(priv, req, sizeof(req), reply,
+					 XEN_9PFS_RING_SIZE(priv->rings),
+					 P9_XEN_RSESSION_SAVE, 12);
+		if (ret < 0)
+			break;
+		total = get_unaligned_le32(reply + P9_HDRSZ);
+		next = get_unaligned_le32(reply + P9_HDRSZ + 4);
+		len = ret - (P9_HDRSZ + 8);
+		ret = 0;
+		if (next <= offset && next < total) {
+			ret = -EPROTO;
+			break;
+		}
+		chunk = kvmalloc(struct_size(chunk, data, len), GFP_KERNEL);
+		if (!chunk) {
+			ret = -ENOMEM;
+			break;
+		}
+		chunk->len = len;
+		memcpy(chunk->data, reply + P9_HDRSZ + 8, len);
+		list_add_tail(&chunk->list, &priv->session);
+		offset = next;
+	} while (offset < total);
+	kvfree(reply);
+
+ failed:
+	if (ret) {
+		dev_warn(&dev->dev, "saving the 9P session failed: %d\n", ret);
+		xen_9pfs_front_session_free(priv);
+	}
+ out:
+	up_read(&priv->rings_sem);
+	return 0;
 }
 
 static int xen_9pfs_front_alloc_dataring(struct xenbus_device *dev,
@@ -614,6 +836,8 @@ static int xen_9pfs_front_init(struct xenbus_device *dev)
 	priv->dev = dev;
 	priv->ring_order = max_ring_order;
 	init_rwsem(&priv->rings_sem);
+	INIT_LIST_HEAD(&priv->session);
+	init_completion(&priv->ctl_done);
 	priv->rings = kcalloc(XEN_9PFS_NUM_RINGS, sizeof(*priv->rings),
 			      GFP_KERNEL);
 	if (!priv->rings) {
@@ -712,7 +936,12 @@ static int xen_9pfs_front_resume(struct xenbus_device *dev)
 static void xen_9pfs_front_changed(struct xenbus_device *dev,
 				   enum xenbus_state backend_state)
 {
+	struct xen_9pfs_session_chunk *chunk;
 	struct xen_9pfs_front_priv *priv;
+	u8 reply[P9_HDRSZ + 4];
+	u32 len, flags;
+	int ret;
+	u8 *req;
 
 	switch (backend_state) {
 	case XenbusStateReconfiguring:
@@ -741,10 +970,53 @@ static void xen_9pfs_front_changed(struct xenbus_device *dev,
 			break;
 
 		priv = dev_get_drvdata(&dev->dev);
-		if (priv) {
-			WRITE_ONCE(priv->connected, true);
-			wake_up_all(&xen_9pfs_connect_wq);
+		if (!priv) {
+			xenbus_switch_state(dev, XenbusStateConnected);
+			break;
 		}
+
+		/* Replay the fids saved at suspend before any request can use
+		 * them.
+		 */
+		down_read(&priv->rings_sem);
+		ret = 0;
+		flags = P9_XEN_SESSION_RESET;
+		if (!list_empty(&priv->session) && priv->client &&
+		    xenbus_read_unsigned(dev->otherend,
+					 "feature-session-transfer", 0)) {
+			list_for_each_entry(chunk, &priv->session, list) {
+				len = P9_HDRSZ + 8 + chunk->len;
+				req = kvmalloc(len, GFP_KERNEL);
+				if (!req) {
+					ret = -ENOMEM;
+					break;
+				}
+				put_unaligned_le32(len, req);
+				req[4] = P9_XEN_TSESSION_RESTORE;
+				put_unaligned_le16(P9_NOTAG, req + 5);
+				put_unaligned_le32(priv->client->msize,
+						   req + P9_HDRSZ);
+				put_unaligned_le32(flags, req + P9_HDRSZ + 4);
+				memcpy(req + P9_HDRSZ + 8, chunk->data,
+				       chunk->len);
+				ret = xen_9pfs_front_ctl(priv, req, len, reply,
+							 sizeof(reply),
+							 P9_XEN_RSESSION_RESTORE,
+							 4);
+				kvfree(req);
+				if (ret < 0)
+					break;
+				flags = 0;
+			}
+		}
+		up_read(&priv->rings_sem);
+		if (ret < 0)
+			dev_warn(&dev->dev, "restoring the 9P session failed: %d\n",
+				 ret);
+		xen_9pfs_front_session_free(priv);
+
+		WRITE_ONCE(priv->connected, true);
+		wake_up_all(&xen_9pfs_connect_wq);
 		xenbus_switch_state(dev, XenbusStateConnected);
 		break;
 
@@ -762,6 +1034,7 @@ static struct xenbus_driver xen_9pfs_front_driver = {
 	.ids = xen_9pfs_front_ids,
 	.probe = xen_9pfs_front_probe,
 	.remove = xen_9pfs_front_remove,
+	.suspend = xen_9pfs_front_suspend,
 	.resume = xen_9pfs_front_resume,
 	.otherend_changed = xen_9pfs_front_changed,
 };
