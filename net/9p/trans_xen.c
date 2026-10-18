@@ -56,10 +56,18 @@ struct xen_9pfs_front_priv {
 	struct p9_client *client;
 
 	struct xen_9pfs_dataring *rings;
+	unsigned int ring_order;
+	/* Requests hold it for read while they use the rings; a restore
+	 * holds it for write to replace them.
+	 */
+	struct rw_semaphore rings_sem;
+	bool connected;
 };
 
 static LIST_HEAD(xen_9pfs_devs);
 static DEFINE_RWLOCK(xen_9pfs_lock);
+/* Requests that find their frontend disconnected wait here for it. */
+static DECLARE_WAIT_QUEUE_HEAD(xen_9pfs_connect_wq);
 
 /* We don't currently allow canceling of requests */
 static int p9_xen_cancel(struct p9_client *client, struct p9_req_t *req)
@@ -120,6 +128,23 @@ static bool p9_xen_write_todo(struct xen_9pfs_dataring *ring, RING_IDX size)
 		xen_9pfs_queued(prod, cons, XEN_9PFS_RING_SIZE(ring)) >= size;
 }
 
+/* True once @client's frontend is connected, or gone. */
+static bool p9_xen_ready(struct p9_client *client)
+{
+	struct xen_9pfs_front_priv *priv;
+	bool ready = true;
+
+	read_lock(&xen_9pfs_lock);
+	list_for_each_entry(priv, &xen_9pfs_devs, list) {
+		if (priv->client == client) {
+			ready = READ_ONCE(priv->connected);
+			break;
+		}
+	}
+	read_unlock(&xen_9pfs_lock);
+	return ready;
+}
+
 static int p9_xen_request(struct p9_client *client, struct p9_req_t *p9_req)
 {
 	struct xen_9pfs_front_priv *priv;
@@ -129,6 +154,7 @@ static int p9_xen_request(struct p9_client *client, struct p9_req_t *p9_req)
 	struct xen_9pfs_dataring *ring;
 	int num;
 
+lookup:
 	read_lock(&xen_9pfs_lock);
 	list_for_each_entry(priv, &xen_9pfs_devs, list) {
 		if (priv->client == client)
@@ -138,13 +164,27 @@ static int p9_xen_request(struct p9_client *client, struct p9_req_t *p9_req)
 	if (list_entry_is_head(priv, &xen_9pfs_devs, list))
 		return -EINVAL;
 
+	down_read(&priv->rings_sem);
+	if (!READ_ONCE(priv->connected)) {
+		up_read(&priv->rings_sem);
+		if (wait_event_killable(xen_9pfs_connect_wq,
+					p9_xen_ready(client)))
+			return -ERESTARTSYS;
+		goto lookup;
+	}
+
 	num = p9_req->tc.tag % XEN_9PFS_NUM_RINGS;
 	ring = &priv->rings[num];
 
 again:
 	while (io_wait_event_killable(ring->wq,
+				      !READ_ONCE(priv->connected) ||
 				      p9_xen_write_todo(ring, size)) != 0)
 		;
+	if (!READ_ONCE(priv->connected)) {
+		up_read(&priv->rings_sem);
+		goto lookup;
+	}
 
 	spin_lock_irqsave(&ring->lock, flags);
 	cons = ring->intf->out_cons;
@@ -170,6 +210,7 @@ again:
 	ring->intf->out_prod = prod;
 	spin_unlock_irqrestore(&ring->lock, flags);
 	notify_remote_via_irq(ring->irq);
+	up_read(&priv->rings_sem);
 	p9_req_put(client, p9_req);
 
 	return 0;
@@ -280,44 +321,48 @@ static const struct xenbus_device_id xen_9pfs_front_ids[] = {
 	{ "" }
 };
 
-static void xen_9pfs_front_free(struct xen_9pfs_front_priv *priv)
+static void xen_9pfs_front_free_rings(struct xen_9pfs_front_priv *priv)
 {
 	int i, j;
 
-	if (priv->rings) {
-		for (i = 0; i < XEN_9PFS_NUM_RINGS; i++) {
-			struct xen_9pfs_dataring *ring = &priv->rings[i];
+	for (i = 0; i < XEN_9PFS_NUM_RINGS; i++) {
+		struct xen_9pfs_dataring *ring = &priv->rings[i];
 
-			cancel_work_sync(&ring->work);
+		cancel_work_sync(&ring->work);
 
-			if (!ring->intf)
-				break;
-			if (ring->irq >= 0) {
-				unbind_from_irqhandler(ring->irq, ring);
-				ring->irq = -1;
-			}
-			if (ring->data.in) {
-				for (j = 0; j < (1 << ring->intf->ring_order);
-				     j++) {
-					grant_ref_t ref;
-
-					ref = ring->intf->ref[j];
-					gnttab_end_foreign_access(ref, NULL);
-					ring->intf->ref[j] = INVALID_GRANT_REF;
-				}
-				free_pages_exact(ring->data.in,
-						 1UL << (ring->intf->ring_order +
-							 XEN_PAGE_SHIFT));
-				ring->data.in = NULL;
-				ring->data.out = NULL;
-			}
-			if (ring->ref != INVALID_GRANT_REF) {
-				gnttab_end_foreign_access(ring->ref, NULL);
-				ring->ref = INVALID_GRANT_REF;
-			}
-			free_page((unsigned long)ring->intf);
-			ring->intf = NULL;
+		if (!ring->intf)
+			break;
+		if (ring->irq >= 0) {
+			unbind_from_irqhandler(ring->irq, ring);
+			ring->irq = -1;
 		}
+		if (ring->data.in) {
+			for (j = 0; j < (1 << ring->intf->ring_order); j++) {
+				grant_ref_t ref;
+
+				ref = ring->intf->ref[j];
+				gnttab_end_foreign_access(ref, NULL);
+				ring->intf->ref[j] = INVALID_GRANT_REF;
+			}
+			free_pages_exact(ring->data.in,
+					 1UL << (ring->intf->ring_order +
+						 XEN_PAGE_SHIFT));
+			ring->data.in = NULL;
+			ring->data.out = NULL;
+		}
+		if (ring->ref != INVALID_GRANT_REF) {
+			gnttab_end_foreign_access(ring->ref, NULL);
+			ring->ref = INVALID_GRANT_REF;
+		}
+		free_page((unsigned long)ring->intf);
+		ring->intf = NULL;
+	}
+}
+
+static void xen_9pfs_front_free(struct xen_9pfs_front_priv *priv)
+{
+	if (priv->rings) {
+		xen_9pfs_front_free_rings(priv);
 		kfree(priv->rings);
 	}
 	kfree(priv->tag);
@@ -337,8 +382,63 @@ static void xen_9pfs_front_remove(struct xenbus_device *dev)
 	dev_set_drvdata(&dev->dev, NULL);
 	list_del(&priv->list);
 	write_unlock(&xen_9pfs_lock);
+	wake_up_all(&xen_9pfs_connect_wq);
 
 	xen_9pfs_front_free(priv);
+}
+
+/* Fail the requests the backend held when the rings went away; nothing
+ * will answer them now, and whether they took effect is unknown.
+ */
+static void xen_9pfs_front_fail_sent(struct p9_client *client)
+{
+	struct p9_req_t *req, *next;
+	unsigned long flags;
+	LIST_HEAD(sent);
+	int id;
+
+	spin_lock_irqsave(&client->lock, flags);
+	idr_for_each_entry(&client->reqs, req, id) {
+		if (READ_ONCE(req->status) == REQ_STATUS_SENT &&
+		    p9_req_try_get(req))
+			list_add_tail(&req->req_list, &sent);
+	}
+	spin_unlock_irqrestore(&client->lock, flags);
+
+	list_for_each_entry_safe(req, next, &sent, req_list) {
+		list_del(&req->req_list);
+		req->t_err = -EIO;
+		p9_client_cb(client, req, REQ_STATUS_ERROR);
+	}
+}
+
+static void xen_9pfs_front_disconnect(struct xen_9pfs_front_priv *priv)
+{
+	int i;
+
+	WRITE_ONCE(priv->connected, false);
+	for (i = 0; i < XEN_9PFS_NUM_RINGS; i++) {
+		if (priv->rings[i].intf)
+			wake_up(&priv->rings[i].wq);
+	}
+
+	down_write(&priv->rings_sem);
+	if (priv->client) {
+		/* Collect the replies the backend wrote before it went away. */
+		for (i = 0; i < XEN_9PFS_NUM_RINGS; i++) {
+			struct xen_9pfs_dataring *ring = &priv->rings[i];
+
+			if (!ring->intf)
+				break;
+			schedule_work(&ring->work);
+			flush_work(&ring->work);
+		}
+	}
+	xen_9pfs_front_free_rings(priv);
+	up_write(&priv->rings_sem);
+
+	if (priv->client)
+		xen_9pfs_front_fail_sent(priv->client);
 }
 
 static int xen_9pfs_front_alloc_dataring(struct xenbus_device *dev,
@@ -415,10 +515,68 @@ out:
 	return ret;
 }
 
-static int xen_9pfs_front_init(struct xenbus_device *dev)
+static int xen_9pfs_front_publish(struct xenbus_device *dev,
+				  struct xen_9pfs_front_priv *priv)
 {
 	int ret, i;
 	struct xenbus_transaction xbt;
+
+ again:
+	ret = xenbus_transaction_start(&xbt);
+	if (ret) {
+		xenbus_dev_fatal(dev, ret, "starting transaction");
+		return ret;
+	}
+	ret = xenbus_printf(xbt, dev->nodename, "version", "%u", 1);
+	if (ret)
+		goto error_xenbus;
+	ret = xenbus_printf(xbt, dev->nodename, "num-rings", "%u",
+			    XEN_9PFS_NUM_RINGS);
+	if (ret)
+		goto error_xenbus;
+
+	for (i = 0; i < XEN_9PFS_NUM_RINGS; i++) {
+		char str[16];
+
+		BUILD_BUG_ON(XEN_9PFS_NUM_RINGS > 9);
+		sprintf(str, "ring-ref%d", i);
+		ret = xenbus_printf(xbt, dev->nodename, str, "%d",
+				    priv->rings[i].ref);
+		if (ret)
+			goto error_xenbus;
+
+		sprintf(str, "event-channel-%d", i);
+		ret = xenbus_printf(xbt, dev->nodename, str, "%u",
+				    priv->rings[i].evtchn);
+		if (ret)
+			goto error_xenbus;
+	}
+	if (!priv->tag) {
+		priv->tag = xenbus_read(xbt, dev->nodename, "tag", NULL);
+		if (IS_ERR(priv->tag)) {
+			ret = PTR_ERR(priv->tag);
+			priv->tag = NULL;
+			goto error_xenbus;
+		}
+	}
+	ret = xenbus_transaction_end(xbt, 0);
+	if (ret) {
+		if (ret == -EAGAIN)
+			goto again;
+		xenbus_dev_fatal(dev, ret, "completing transaction");
+		return ret;
+	}
+	return 0;
+
+ error_xenbus:
+	xenbus_transaction_end(xbt, 1);
+	xenbus_dev_fatal(dev, ret, "writing xenstore");
+	return ret;
+}
+
+static int xen_9pfs_front_init(struct xenbus_device *dev)
+{
+	int ret, i;
 	struct xen_9pfs_front_priv *priv;
 	char *versions, *v, *token;
 	bool version_1 = false;
@@ -457,6 +615,8 @@ static int xen_9pfs_front_init(struct xenbus_device *dev)
 	if (!priv)
 		return -ENOMEM;
 	priv->dev = dev;
+	priv->ring_order = max_ring_order;
+	init_rwsem(&priv->rings_sem);
 	priv->rings = kzalloc_objs(*priv->rings, XEN_9PFS_NUM_RINGS);
 	if (!priv->rings) {
 		kfree(priv);
@@ -471,48 +631,9 @@ static int xen_9pfs_front_init(struct xenbus_device *dev)
 			goto error;
 	}
 
- again:
-	ret = xenbus_transaction_start(&xbt);
-	if (ret) {
-		xenbus_dev_fatal(dev, ret, "starting transaction");
-		goto error;
-	}
-	ret = xenbus_printf(xbt, dev->nodename, "version", "%u", 1);
+	ret = xen_9pfs_front_publish(dev, priv);
 	if (ret)
-		goto error_xenbus;
-	ret = xenbus_printf(xbt, dev->nodename, "num-rings", "%u",
-			    XEN_9PFS_NUM_RINGS);
-	if (ret)
-		goto error_xenbus;
-
-	for (i = 0; i < XEN_9PFS_NUM_RINGS; i++) {
-		char str[16];
-
-		BUILD_BUG_ON(XEN_9PFS_NUM_RINGS > 9);
-		sprintf(str, "ring-ref%d", i);
-		ret = xenbus_printf(xbt, dev->nodename, str, "%d",
-				    priv->rings[i].ref);
-		if (ret)
-			goto error_xenbus;
-
-		sprintf(str, "event-channel-%d", i);
-		ret = xenbus_printf(xbt, dev->nodename, str, "%u",
-				    priv->rings[i].evtchn);
-		if (ret)
-			goto error_xenbus;
-	}
-	priv->tag = xenbus_read(xbt, dev->nodename, "tag", NULL);
-	if (IS_ERR(priv->tag)) {
-		ret = PTR_ERR(priv->tag);
-		goto error_xenbus;
-	}
-	ret = xenbus_transaction_end(xbt, 0);
-	if (ret) {
-		if (ret == -EAGAIN)
-			goto again;
-		xenbus_dev_fatal(dev, ret, "completing transaction");
 		goto error;
-	}
 
 	write_lock(&xen_9pfs_lock);
 	dev_set_drvdata(&dev->dev, priv);
@@ -522,11 +643,44 @@ static int xen_9pfs_front_init(struct xenbus_device *dev)
 	xenbus_switch_state(dev, XenbusStateInitialised);
 	return 0;
 
- error_xenbus:
-	xenbus_transaction_end(xbt, 1);
-	xenbus_dev_fatal(dev, ret, "writing xenstore");
  error:
 	xen_9pfs_front_free(priv);
+	return ret;
+}
+
+/* Give a restored frontend new rings, keeping its clients and their fids. */
+static int xen_9pfs_front_reconnect(struct xenbus_device *dev,
+				    struct xen_9pfs_front_priv *priv)
+{
+	int ret, i;
+
+	if (xenbus_read_unsigned(dev->otherend, "max-rings", 0) <
+	    XEN_9PFS_NUM_RINGS ||
+	    xenbus_read_unsigned(dev->otherend, "max-ring-page-order", 0) <
+	    priv->ring_order) {
+		xenbus_dev_fatal(dev, -EINVAL,
+				 "backend cannot serve the rings in use");
+		return -EINVAL;
+	}
+
+	down_write(&priv->rings_sem);
+	for (i = 0; i < XEN_9PFS_NUM_RINGS; i++) {
+		ret = xen_9pfs_front_alloc_dataring(dev, &priv->rings[i],
+						    priv->ring_order);
+		if (ret < 0)
+			goto error;
+	}
+	ret = xen_9pfs_front_publish(dev, priv);
+	if (ret)
+		goto error;
+	up_write(&priv->rings_sem);
+
+	xenbus_switch_state(dev, XenbusStateInitialised);
+	return 0;
+
+ error:
+	xen_9pfs_front_free_rings(priv);
+	up_write(&priv->rings_sem);
 	return ret;
 }
 
@@ -538,13 +692,30 @@ static int xen_9pfs_front_probe(struct xenbus_device *dev,
 
 static int xen_9pfs_front_resume(struct xenbus_device *dev)
 {
-	dev_warn(&dev->dev, "suspend/resume unsupported\n");
+	struct xen_9pfs_front_priv *priv = dev_get_drvdata(&dev->dev);
+	int ret;
+
+	if (!priv)
+		return 0;
+
+	xen_9pfs_front_disconnect(priv);
+	/* xenbus set dev->state back to Initialising without publishing it,
+	 * and a backend that still serves the old rings only goes back to
+	 * InitWait once it sees that.
+	 */
+	ret = xenbus_printf(XBT_NIL, dev->nodename, "state", "%d",
+			    XenbusStateInitialising);
+	if (ret)
+		dev_warn(&dev->dev, "publishing Initialising failed: %d\n",
+			 ret);
 	return 0;
 }
 
 static void xen_9pfs_front_changed(struct xenbus_device *dev,
 				   enum xenbus_state backend_state)
 {
+	struct xen_9pfs_front_priv *priv;
+
 	switch (backend_state) {
 	case XenbusStateReconfiguring:
 	case XenbusStateReconfigured:
@@ -557,10 +728,25 @@ static void xen_9pfs_front_changed(struct xenbus_device *dev,
 		if (dev->state != XenbusStateInitialising)
 			break;
 
-		xen_9pfs_front_init(dev);
+		priv = dev_get_drvdata(&dev->dev);
+		if (priv)
+			xen_9pfs_front_reconnect(dev, priv);
+		else
+			xen_9pfs_front_init(dev);
 		break;
 
 	case XenbusStateConnected:
+		/* Until we publish rings, a Connected backend is one still
+		 * serving the rings a resume dropped.
+		 */
+		if (dev->state != XenbusStateInitialised)
+			break;
+
+		priv = dev_get_drvdata(&dev->dev);
+		if (priv) {
+			WRITE_ONCE(priv->connected, true);
+			wake_up_all(&xen_9pfs_connect_wq);
+		}
 		xenbus_switch_state(dev, XenbusStateConnected);
 		break;
 
