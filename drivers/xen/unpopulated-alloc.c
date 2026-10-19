@@ -180,51 +180,19 @@ err_resource:
 	return ret;
 }
 
-/**
- * xen_alloc_unpopulated_pages_node - alloc unpopulated pages on a node
- * @nr_pages: Number of pages
- * @pages: pages returned
- * @node: Preferred Linux node id, or NUMA_NO_NODE for current CPU's node
- *
- * The returned pages are drawn from a per-node pool registered with
- * memremap_pages() against @node, so page_to_nid() reports @node for
- * every returned page.  Callers that know the host node of a foreign
- * frame should pass it here to keep page_to_nid in agreement with the
- * actual host placement after a subsequent grant-map.  When the pool of
- * @node is short, pages come from the other nodes' pools instead.
- *
- * Returns 0 on success, error otherwise.
+/*
+ * Take @nr_pages from the pool of @node, or from any node's pool when @any is
+ * set.  Called with list_lock held.  Never carves a new region.
  */
-int xen_alloc_unpopulated_pages_node(unsigned int nr_pages, struct page **pages,
-				     int node)
+static int pop_pages(unsigned int nr_pages, struct page **pages, int node,
+		     bool any)
 {
 	unsigned int i, total = 0;
-	int ret = 0;
 
-	/*
-	 * Fallback to default behavior if we do not have any suitable resource
-	 * to allocate required region from and as the result we won't be able to
-	 * construct pages.
-	 */
-	if (!target_resource)
-		return xen_alloc_ballooned_pages(nr_pages, pages);
-
-	node = xen_unpopulated_clamp_node(node);
-
-	mutex_lock(&list_lock);
-
-	/*
-	 * A new region comes from free address space, which can overlap MMIO
-	 * the hypervisor has mapped into the guest. Only carve one when every
-	 * node's pool is short, and borrow from other nodes before that.
-	 */
 	for (i = 0; i < MAX_NUMNODES; i++)
 		total += list_count[i];
-	if (total < nr_pages) {
-		ret = fill_list(nr_pages - total, node);
-		if (ret)
-			goto out;
-	}
+	if ((any ? total : list_count[node]) < nr_pages)
+		return -ENOMEM;
 
 	for (i = 0; i < nr_pages; i++) {
 		int src = node;
@@ -240,7 +208,8 @@ int xen_alloc_unpopulated_pages_node(unsigned int nr_pages, struct page **pages,
 
 #ifdef CONFIG_XEN_HAVE_PVMMU
 		if (xen_pv_domain()) {
-			ret = xen_alloc_p2m_entry(page_to_pfn(pg));
+			int ret = xen_alloc_p2m_entry(page_to_pfn(pg));
+
 			if (ret < 0) {
 				unsigned int j;
 
@@ -252,14 +221,53 @@ int xen_alloc_unpopulated_pages_node(unsigned int nr_pages, struct page **pages,
 					page_list[dst] = pages[j];
 					list_count[dst]++;
 				}
-				goto out;
+				return ret;
 			}
 		}
 #endif
 	}
 
-out:
+	return 0;
+}
+
+/**
+ * xen_alloc_unpopulated_pages_node - alloc unpopulated pages on a node
+ * @nr_pages: Number of pages
+ * @pages: pages returned
+ * @node: Linux node id, or NUMA_NO_NODE for current CPU's node
+ *
+ * The returned pages are drawn from the per-node pool registered with
+ * memremap_pages() against @node, so page_to_nid() reports @node for
+ * every returned page.  Callers that know the host node of a foreign
+ * frame should pass it here to keep page_to_nid in agreement with the
+ * actual host placement after a subsequent grant-map.
+ *
+ * Fails with -ENOMEM when the pool of @node is short rather than returning
+ * pages of another node.  A new region is not carved here: it comes from free
+ * address space, which can overlap MMIO the hypervisor has mapped into the
+ * guest, so only xen_alloc_unpopulated_pages() does it.
+ *
+ * Returns 0 on success, error otherwise.
+ */
+int xen_alloc_unpopulated_pages_node(unsigned int nr_pages, struct page **pages,
+				     int node)
+{
+	int ret;
+
+	/*
+	 * Fallback to default behavior if we do not have any suitable resource
+	 * to allocate required region from and as the result we won't be able to
+	 * construct pages.
+	 */
+	if (!target_resource)
+		return xen_alloc_ballooned_pages(nr_pages, pages);
+
+	node = xen_unpopulated_clamp_node(node);
+
+	mutex_lock(&list_lock);
+	ret = pop_pages(nr_pages, pages, node, false);
 	mutex_unlock(&list_lock);
+
 	return ret;
 }
 EXPORT_SYMBOL(xen_alloc_unpopulated_pages_node);
@@ -270,12 +278,29 @@ EXPORT_SYMBOL(xen_alloc_unpopulated_pages_node);
  * @pages: pages returned
  * @return 0 on success, error otherwise
  *
- * Equivalent to xen_alloc_unpopulated_pages_node() with the current
- * CPU's node as the preference.
+ * Prefers the pool of the current CPU's node, then takes from the other
+ * nodes' pools.  A new region is carved only when every pool is short.
  */
 int xen_alloc_unpopulated_pages(unsigned int nr_pages, struct page **pages)
 {
-	return xen_alloc_unpopulated_pages_node(nr_pages, pages, numa_node_id());
+	unsigned int i, total = 0;
+	int node = numa_node_id();
+	int ret;
+
+	if (!target_resource)
+		return xen_alloc_ballooned_pages(nr_pages, pages);
+
+	mutex_lock(&list_lock);
+	for (i = 0; i < MAX_NUMNODES; i++)
+		total += list_count[i];
+	ret = 0;
+	if (total < nr_pages)
+		ret = fill_list(nr_pages - total, node);
+	if (!ret)
+		ret = pop_pages(nr_pages, pages, node, true);
+	mutex_unlock(&list_lock);
+
+	return ret;
 }
 EXPORT_SYMBOL(xen_alloc_unpopulated_pages);
 
