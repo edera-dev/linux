@@ -985,7 +985,10 @@ int gnttab_alloc_pages_node(int nr_pages, struct page **pages, int node)
 {
 	int ret;
 
-	ret = xen_alloc_unpopulated_pages_node(nr_pages, pages, node);
+	if (node == NUMA_NO_NODE)
+		ret = xen_alloc_unpopulated_pages(nr_pages, pages);
+	else
+		ret = xen_alloc_unpopulated_pages_node(nr_pages, pages, node);
 	if (ret < 0)
 		return ret;
 
