@@ -312,4 +312,51 @@ struct ioctl_gntdev_dmabuf_imp_release {
 	__u32 reserved;
 };
 
+/*
+ * io_uring commands, issued as IORING_OP_URING_CMD on a gntdev file descriptor
+ * from a ring created with IORING_SETUP_SQE128. They move data between a file
+ * and pages of a grant mapping directly, without a user mapping of those pages
+ * being pinned for the transfer.
+ *
+ * The mapping must already be live: IOCTL_GNTDEV_MAP_GRANT_REF followed by an
+ * mmap() of the returned index. The command is not supported on PV domains.
+ *
+ * The result is the number of bytes transferred, or a negative errno.
+ */
+
+/* Read from the target file into the granted pages (needs a writable map). */
+#define GNTDEV_URING_CMD_READ	0
+/* Write the granted pages to the target file. */
+#define GNTDEV_URING_CMD_WRITE	1
+
+/* Upper bound on the number of segments of one command. */
+#define GNTDEV_URING_MAX_SEGS	256
+
+struct gntdev_uring_seg {
+	/* Page within the mapping, counted from its first grant. */
+	__u32 page;
+	/* Byte range within that page: offset + len must not exceed 4096. */
+	__u16 offset;
+	__u16 len;
+};
+
+/* Payload of the command, in the SQE's cmd area. */
+struct gntdev_uring_io {
+	/* The index returned by IOCTL_GNTDEV_MAP_GRANT_REF. */
+	__u64 index;
+	/* User pointer to @nr_segs struct gntdev_uring_seg. */
+	__u64 segs;
+	/* Byte offset in the target file. */
+	__u64 pos;
+	/*
+	 * File to transfer to or from. Whether the transfer is direct is
+	 * decided by whether this descriptor was opened O_DIRECT.
+	 */
+	__s32 target_fd;
+	__u32 nr_segs;
+	/* Reserved - must be zero. */
+	__u32 flags;
+	__u32 reserved;
+};
+
 #endif /* __LINUX_PUBLIC_GNTDEV_H__ */
