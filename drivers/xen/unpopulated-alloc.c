@@ -190,14 +190,15 @@ err_resource:
  * memremap_pages() against @node, so page_to_nid() reports @node for
  * every returned page.  Callers that know the host node of a foreign
  * frame should pass it here to keep page_to_nid in agreement with the
- * actual host placement after a subsequent grant-map.
+ * actual host placement after a subsequent grant-map.  When the pool of
+ * @node is short, pages come from the other nodes' pools instead.
  *
  * Returns 0 on success, error otherwise.
  */
 int xen_alloc_unpopulated_pages_node(unsigned int nr_pages, struct page **pages,
 				     int node)
 {
-	unsigned int i;
+	unsigned int i, total = 0;
 	int ret = 0;
 
 	/*
@@ -211,18 +212,30 @@ int xen_alloc_unpopulated_pages_node(unsigned int nr_pages, struct page **pages,
 	node = xen_unpopulated_clamp_node(node);
 
 	mutex_lock(&list_lock);
-	if (list_count[node] < nr_pages) {
-		ret = fill_list(nr_pages - list_count[node], node);
+
+	/*
+	 * A new region comes from free address space, which can overlap MMIO
+	 * the hypervisor has mapped into the guest. Only carve one when every
+	 * node's pool is short, and borrow from other nodes before that.
+	 */
+	for (i = 0; i < MAX_NUMNODES; i++)
+		total += list_count[i];
+	if (total < nr_pages) {
+		ret = fill_list(nr_pages - total, node);
 		if (ret)
 			goto out;
 	}
 
 	for (i = 0; i < nr_pages; i++) {
-		struct page *pg = page_list[node];
+		int src = node;
+		struct page *pg;
 
-		BUG_ON(!pg);
-		page_list[node] = pg->zone_device_data;
-		list_count[node]--;
+		while (!page_list[src])
+			src = (src + 1) % MAX_NUMNODES;
+
+		pg = page_list[src];
+		page_list[src] = pg->zone_device_data;
+		list_count[src]--;
 		pages[i] = pg;
 
 #ifdef CONFIG_XEN_HAVE_PVMMU
@@ -232,9 +245,12 @@ int xen_alloc_unpopulated_pages_node(unsigned int nr_pages, struct page **pages,
 				unsigned int j;
 
 				for (j = 0; j <= i; j++) {
-					pages[j]->zone_device_data = page_list[node];
-					page_list[node] = pages[j];
-					list_count[node]++;
+					int dst = xen_unpopulated_clamp_node(
+							page_to_nid(pages[j]));
+
+					pages[j]->zone_device_data = page_list[dst];
+					page_list[dst] = pages[j];
+					list_count[dst]++;
 				}
 				goto out;
 			}
