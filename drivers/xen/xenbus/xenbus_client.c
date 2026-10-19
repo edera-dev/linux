@@ -834,6 +834,10 @@ static int xenbus_map_ring_hvm(struct xenbus_device *dev,
 		err = xen_alloc_unpopulated_pages_node(nr_pages,
 						       node->hvm.pages,
 						       host_node);
+		/* The node's pool is short; the ring still works from any node. */
+		if (err)
+			err = xen_alloc_unpopulated_pages(nr_pages,
+							  node->hvm.pages);
 		if (err) {
 			/*
 			 * Pages already gone; clear the array so the
