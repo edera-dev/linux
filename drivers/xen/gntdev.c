@@ -36,6 +36,10 @@
 #include <linux/highmem.h>
 #include <linux/refcount.h>
 #include <linux/workqueue.h>
+#include <linux/bvec.h>
+#include <linux/file.h>
+#include <linux/io_uring/cmd.h>
+#include <linux/uio.h>
 
 #include <xen/xen.h>
 #include <xen/grant_table.h>
@@ -586,6 +590,12 @@ static void __unmap_grant_pages(struct gntdev_grant_map *map, int offset,
 	map->unmap_data.data = map;
 	refcount_inc(&map->users); /* to keep map alive during async call below */
 
+	/*
+	 * The pages are marked as being removed before this point. Order that
+	 * before the page reference counts read by the async unmap, as it pairs
+	 * with the page references taken in gntdev_uring_cmd().
+	 */
+	smp_mb();
 	gnttab_unmap_refs_async(&map->unmap_data);
 }
 
@@ -1134,6 +1144,193 @@ static long gntdev_ioctl_grant_copy(struct gntdev_priv *priv, void __user *u)
 	return ret;
 }
 
+#ifdef CONFIG_IO_URING
+
+/*
+ * One in-flight GNTDEV_URING_CMD_READ/WRITE. It holds a reference on the map
+ * and on every page it transfers, so the grants cannot be unmapped and handed
+ * back to the granting domain while the device may still be using them:
+ * gnttab_unmap_refs_async() waits for the page references to drop.
+ */
+struct gntdev_uring_req {
+	struct kiocb iocb;
+	struct io_uring_cmd *ioucmd;
+	struct gntdev_grant_map *map;
+	struct file *target;
+	bool write;
+	long res;
+	unsigned int nr;
+	struct bio_vec bvec[];
+};
+
+struct gntdev_uring_pdu {
+	struct gntdev_uring_req *req;
+};
+
+/* Process context only: dropping the last map reference unmaps its grants. */
+static void gntdev_uring_req_free(struct gntdev_uring_req *req)
+{
+	unsigned int i;
+
+	for (i = 0; i < req->nr; i++)
+		put_page(req->bvec[i].bv_page);
+	if (req->map)
+		gntdev_put_map(NULL, req->map);
+	if (req->target)
+		fput(req->target);
+	kfree(req);
+}
+
+static void gntdev_uring_task_cb(struct io_tw_req tw_req, io_tw_token_t tw)
+{
+	struct io_uring_cmd *ioucmd = io_uring_cmd_from_tw(tw_req);
+	struct gntdev_uring_req *req =
+		io_uring_cmd_to_pdu(ioucmd, struct gntdev_uring_pdu)->req;
+	long res = req->res;
+
+	gntdev_uring_req_free(req);
+	io_uring_cmd_done(ioucmd, res, IO_URING_CMD_TASK_WORK_ISSUE_FLAGS);
+}
+
+static void gntdev_uring_complete(struct kiocb *iocb, long res)
+{
+	struct gntdev_uring_req *req =
+		container_of(iocb, struct gntdev_uring_req, iocb);
+
+	if (req->write)
+		kiocb_end_write(iocb);
+	req->res = res;
+	/* May run in interrupt context, so finish the request from task work. */
+	io_uring_cmd_complete_in_task(req->ioucmd, gntdev_uring_task_cb);
+}
+
+static int gntdev_uring_cmd(struct io_uring_cmd *ioucmd,
+			    unsigned int issue_flags)
+{
+	struct gntdev_priv *priv = ioucmd->file->private_data;
+	const struct gntdev_uring_io *cmd;
+	struct gntdev_uring_seg __user *useg;
+	struct gntdev_uring_req *req;
+	struct gntdev_grant_map *map;
+	struct iov_iter iter;
+	size_t total = 0;
+	unsigned int i;
+	long ret;
+
+	if (ioucmd->cmd_op != GNTDEV_URING_CMD_READ &&
+	    ioucmd->cmd_op != GNTDEV_URING_CMD_WRITE)
+		return -ENOTTY;
+	/*
+	 * A PV dom0 would need the foreign MFNs of each page translated for
+	 * the block layer; this is for auto-translated domains only.
+	 */
+	if (xen_pv_domain())
+		return -EOPNOTSUPP;
+	if (!(issue_flags & IO_URING_F_SQE128) ||
+	    (issue_flags & IO_URING_F_IOPOLL))
+		return -EOPNOTSUPP;
+
+	cmd = io_uring_sqe128_cmd(ioucmd->sqe, struct gntdev_uring_io);
+	if (cmd->flags || cmd->reserved || cmd->pos > LLONG_MAX)
+		return -EINVAL;
+	if (!cmd->nr_segs || cmd->nr_segs > GNTDEV_URING_MAX_SEGS)
+		return -EINVAL;
+
+	req = kzalloc_flex(*req, bvec, cmd->nr_segs);
+	if (!req)
+		return -ENOMEM;
+	req->write = ioucmd->cmd_op == GNTDEV_URING_CMD_WRITE;
+
+	req->target = fget(cmd->target_fd);
+	if (!req->target) {
+		ret = -EBADF;
+		goto err;
+	}
+	init_sync_kiocb(&req->iocb, req->target);
+	req->iocb.ki_pos = cmd->pos;
+	req->iocb.ki_complete = gntdev_uring_complete;
+	/* Let io_uring retry from a blocking context a file that can wait. */
+	if (issue_flags & IO_URING_F_NONBLOCK) {
+		if (!(req->target->f_mode & FMODE_NOWAIT)) {
+			ret = -EAGAIN;
+			goto err;
+		}
+		req->iocb.ki_flags |= IOCB_NOWAIT;
+	}
+
+	if ((cmd->index >> PAGE_SHIFT) > INT_MAX) {
+		ret = -ENOENT;
+		goto err;
+	}
+	mutex_lock(&priv->lock);
+	map = gntdev_find_map_index(priv, cmd->index >> PAGE_SHIFT, 0);
+	/* A map has live grants only once it was mmap()ed. */
+	if (!map || !map->flags || !atomic_read(&map->live_grants)) {
+		mutex_unlock(&priv->lock);
+		ret = -ENOENT;
+		goto err;
+	}
+	/* A read stores into the granted pages. */
+	if (!req->write && (map->flags & GNTMAP_readonly)) {
+		mutex_unlock(&priv->lock);
+		ret = -EPERM;
+		goto err;
+	}
+	refcount_inc(&map->users);
+	mutex_unlock(&priv->lock);
+	req->map = map;
+
+	useg = u64_to_user_ptr(cmd->segs);
+	for (i = 0; i < cmd->nr_segs; i++) {
+		struct gntdev_uring_seg seg;
+
+		if (copy_from_user(&seg, &useg[i], sizeof(seg))) {
+			ret = -EFAULT;
+			goto err;
+		}
+		if (seg.page >= map->count || !seg.len ||
+		    seg.offset >= PAGE_SIZE ||
+		    seg.len > PAGE_SIZE - seg.offset) {
+			ret = -EINVAL;
+			goto err;
+		}
+		get_page(map->pages[seg.page]);
+		bvec_set_page(&req->bvec[i], map->pages[seg.page], seg.len,
+			      seg.offset);
+		req->nr = i + 1;
+		total += seg.len;
+
+		/*
+		 * The page reference must be visible before the check below. It
+		 * pairs with the smp_mb() in __unmap_grant_pages(): either the
+		 * unmap sees our reference and waits, or we see the page marked
+		 * as being removed and give up.
+		 */
+		smp_mb();
+		if (map->being_removed[seg.page]) {
+			ret = -ENOENT;
+			goto err;
+		}
+	}
+
+	iov_iter_bvec(&iter, req->write ? ITER_SOURCE : ITER_DEST, req->bvec,
+		      req->nr, total);
+	req->ioucmd = ioucmd;
+	io_uring_cmd_to_pdu(ioucmd, struct gntdev_uring_pdu)->req = req;
+
+	ret = req->write ?
+		vfs_iocb_iter_write(req->target, &req->iocb, &iter) :
+		vfs_iocb_iter_read(req->target, &req->iocb, &iter);
+	if (ret == -EIOCBQUEUED)
+		return -EIOCBQUEUED;
+err:
+	/* Failed to start, or finished without queueing. */
+	gntdev_uring_req_free(req);
+	return ret;
+}
+
+#endif /* CONFIG_IO_URING */
+
 static long gntdev_ioctl(struct file *flip,
 			 unsigned int cmd, unsigned long arg)
 {
@@ -1284,7 +1481,10 @@ static const struct file_operations gntdev_fops = {
 	.open = gntdev_open,
 	.release = gntdev_release,
 	.mmap = gntdev_mmap,
-	.unlocked_ioctl = gntdev_ioctl
+	.unlocked_ioctl = gntdev_ioctl,
+#ifdef CONFIG_IO_URING
+	.uring_cmd = gntdev_uring_cmd,
+#endif
 };
 
 static struct miscdevice gntdev_miscdev = {
