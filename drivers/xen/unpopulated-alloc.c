@@ -484,6 +484,53 @@ unsigned int xen_alloc_unpopulated_blocks(struct page **heads,
 	return nr;
 }
 
+/* Add the free 2 MiB blocks of @chunk to *@data. */
+static void count_free_blocks(struct gen_pool *pool,
+			      struct gen_pool_chunk *chunk, void *data)
+{
+	unsigned long nr_pages = chunk->end_addr - chunk->start_addr + 1;
+	unsigned long *count = data;
+	unsigned long b, e;
+
+	for_each_clear_bitrange(b, e, chunk->bits, nr_pages) {
+		unsigned long first = ALIGN(chunk->start_addr + b,
+					    XEN_UNPOPULATED_BLOCK_PAGES);
+		unsigned long end = ALIGN_DOWN(chunk->start_addr + e,
+					       XEN_UNPOPULATED_BLOCK_PAGES);
+
+		if (end > first)
+			*count += (end - first) / XEN_UNPOPULATED_BLOCK_PAGES;
+	}
+}
+
+/**
+ * xen_unpopulated_spare_blocks - 2 MiB blocks dom0's balloon could still take
+ *
+ * Each node spares the free 2 MiB blocks of its boot-time address space, up to
+ * what it can give and still keep MAPPING_FLOOR_PAGES free pages.
+ */
+unsigned long xen_unpopulated_spare_blocks(void)
+{
+	unsigned long nr = 0;
+	int node;
+
+	mutex_lock(&list_lock);
+	for (node = 0; node < MAX_NUMNODES; node++) {
+		unsigned long blocks = 0, nr_free = pool_pages(node);
+
+		if (!boot_pool[node] || nr_free <= MAPPING_FLOOR_PAGES)
+			continue;
+
+		gen_pool_for_each_chunk(boot_pool[node], count_free_blocks,
+					&blocks);
+		nr += min(blocks, (nr_free - MAPPING_FLOOR_PAGES) /
+				  XEN_UNPOPULATED_BLOCK_PAGES);
+	}
+	mutex_unlock(&list_lock);
+
+	return nr;
+}
+
 static int __init unpopulated_init(void)
 {
 	int ret;
