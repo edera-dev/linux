@@ -180,6 +180,16 @@ err_resource:
 	return ret;
 }
 
+/* Put @pg on the pool of its own node.  Called with list_lock held. */
+static void push_page(struct page *pg)
+{
+	int node = xen_unpopulated_clamp_node(page_to_nid(pg));
+
+	pg->zone_device_data = page_list[node];
+	page_list[node] = pg;
+	list_count[node]++;
+}
+
 /*
  * Take @nr_pages from the pool of @node, or from any node's pool when @any is
  * set.  Called with list_lock held.  Never carves a new region.
@@ -213,14 +223,8 @@ static int pop_pages(unsigned int nr_pages, struct page **pages, int node,
 			if (ret < 0) {
 				unsigned int j;
 
-				for (j = 0; j <= i; j++) {
-					int dst = xen_unpopulated_clamp_node(
-							page_to_nid(pages[j]));
-
-					pages[j]->zone_device_data = page_list[dst];
-					page_list[dst] = pages[j];
-					list_count[dst]++;
-				}
+				for (j = 0; j <= i; j++)
+					push_page(pages[j]);
 				return ret;
 			}
 		}
@@ -324,13 +328,8 @@ void xen_free_unpopulated_pages(unsigned int nr_pages, struct page **pages)
 	}
 
 	mutex_lock(&list_lock);
-	for (i = 0; i < nr_pages; i++) {
-		int node = xen_unpopulated_clamp_node(page_to_nid(pages[i]));
-
-		pages[i]->zone_device_data = page_list[node];
-		page_list[node] = pages[i];
-		list_count[node]++;
-	}
+	for (i = 0; i < nr_pages; i++)
+		push_page(pages[i]);
 	mutex_unlock(&list_lock);
 }
 EXPORT_SYMBOL(xen_free_unpopulated_pages);
