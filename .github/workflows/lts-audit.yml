@@ -1,0 +1,396 @@
+name: LTS audit
+
+# Checks that edera/6.18-lts has every Edera commit edera/mainline has, and
+# keeps one issue open about the ones it lacks. Called by kernel-nightly.yml
+# when it is dispatched with audit: lts-audit-trigger.yml on edera/mainline
+# does that weekly.
+#
+# Every merged edera/mainline pull request is backported on its own
+# (lts-backport.yml), but commits can still fall through: one pushed without
+# a pull request, a backport that waits or needs attention and is forgotten,
+# a rebase or a hand-landed series that drops one. This is the backstop.
+#
+# What is missing is decided from git alone, by pending-backports.sh, exactly
+# as the backports decide it, with the same skip list. Open backport pull
+# requests that carry a missing commit, and mainline pull requests whose
+# backport is labelled waiting or needs-attention, are matched to it by
+# subject. Claude then reads each commit that is not already in flight and
+# says whether it really is missing, following
+# .automation/skills/lts-audit/SKILL.md. It runs read-only, and its notes
+# only annotate the issue: every commit pending-backports.sh lists stays in
+# it until the LTS tree has it or the commit is skipped
+# (.automation/backport-skip, or a no-backport label on its pull request).
+#
+# The issue is edited in place each week, and gets a comment only when the
+# set of missing commits changes. A week with nothing missing closes it.
+
+on:
+  workflow_call:
+
+permissions:
+  contents: read
+
+env:
+  SOURCE: edera/mainline
+  SOURCE_UPSTREAM_URL: https://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux.git
+  SOURCE_UPSTREAM_BRANCH: master
+  TARGET: edera/6.18-lts
+  TARGET_UPSTREAM_URL: https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git
+  TARGET_UPSTREAM_BRANCH: linux-6.18.y
+  ISSUE_TITLE: edera/6.18-lts is missing commits from edera/mainline
+
+jobs:
+  prepare:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      pull-requests: read
+    outputs:
+      state: ${{ steps.plan.outputs.state }}
+      old: ${{ steps.plan.outputs.old }}
+      source: ${{ steps.plan.outputs.source }}
+    steps:
+      - name: Harden runner
+        uses: step-security/harden-runner@05e31511f85b41b11d1cf0ef85d0992719546e2c # v2.21.0
+        with:
+          egress-policy: audit
+
+      - name: Checkout
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ env.TARGET }}
+          fetch-depth: 0
+          filter: blob:none
+          persist-credentials: false
+
+      - name: Trusted tools
+        run: |
+          set -euo pipefail
+          git fetch --no-tags --filter=blob:none origin "$GITHUB_SHA"
+          mkdir "$RUNNER_TEMP/tools"
+          git archive "$GITHUB_SHA" .github/scripts .automation | tar -x -C "$RUNNER_TEMP/tools" --strip-components=1
+
+      - name: Plan
+        id: plan
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          out=$RUNNER_TEMP/out
+          mkdir -p "$out"
+          tools=$RUNNER_TEMP/tools
+          R=$GITHUB_REPOSITORY
+          norm() { sed -E 's/[[:space:]]*\((v?[0-9]+\.[0-9]+(\.[0-9y]+)?(-lts)?)\)$//'; }
+          subjects() { gh api --paginate "repos/$R/pulls/$1/commits" -q '.[].commit.message | split("\n")[0]' | norm; }
+
+          old=$(git rev-parse HEAD)
+          echo "old=$old" >> "$GITHUB_OUTPUT"
+          git fetch --no-tags --filter=blob:none origin "$SOURCE"
+          src=$(git rev-parse FETCH_HEAD)
+          echo "source=$src" >> "$GITHUB_OUTPUT"
+          git fetch --no-tags --filter=blob:none "$SOURCE_UPSTREAM_URL" "$SOURCE_UPSTREAM_BRANCH"
+          src_up=$(git rev-parse FETCH_HEAD)
+          git fetch --no-tags --filter=blob:none "$TARGET_UPSTREAM_URL" "$TARGET_UPSTREAM_BRANCH"
+          tgt_up=$(git rev-parse FETCH_HEAD)
+          printf '%s\n' "$old" >"$out/lts-tip"
+          printf '%s\n' "$src" >"$out/mainline-tip"
+
+          # The same skip list the backports use (lts-backport.yml).
+          cp "$tools/backport-skip" "$out/skip"
+          gh pr list --repo "$R" --base "$SOURCE" --state merged \
+            --label no-backport --limit 500 --json number -q '.[].number' |
+          while read -r n; do
+            gh api --paginate "repos/$R/pulls/$n/commits" -q '.[].commit.message | split("\n")[0]'
+          done >>"$out/skip"
+
+          bash "$tools/scripts/pending-backports.sh" "$src" "$src_up" "$old" "$tgt_up" "$out/skip" >"$out/pending"
+
+          # Where each missing commit already stands, by subject:
+          # "<where> TAB <subject>", where is "#N" for an open pull request
+          # into the LTS tree, or "#N label" for a merged mainline one whose
+          # backport carries that label.
+          : >"$out/status"
+          if [ -s "$out/pending" ]; then
+            gh pr list --repo "$R" --base "$TARGET" --state open --limit 200 --json number -q '.[].number' |
+            while read -r n; do
+              subjects "$n" | sed "s/^/#$n\t/"
+            done >>"$out/status"
+            for label in backport-waiting backport-needs-attention; do
+              gh pr list --repo "$R" --base "$SOURCE" --state merged --label "$label" --limit 200 --json number -q '.[].number' |
+              while read -r n; do
+                subjects "$n" | sed "s/^/#$n $label\t/"
+              done >>"$out/status"
+            done
+          fi
+
+          {
+            echo "### LTS audit of \`$TARGET\` (\`${old:0:12}\`) against \`$SOURCE\` (\`${src:0:12}\`)"
+            echo
+            if [ -s "$out/pending" ]; then
+              echo "$(wc -l <"$out/pending") Edera commit(s) missing:"
+              echo
+              while IFS=$'\t' read -r sha subject; do echo "- \`${sha:0:12}\` $subject"; done <"$out/pending"
+            else
+              echo "In sync: no Edera commit on \`$SOURCE\` is missing."
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+          if [ -s "$out/pending" ]; then
+            echo "state=missing" >> "$GITHUB_OUTPUT"
+          else
+            echo "state=clean" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Upload
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: audit-plan
+          path: ${{ runner.temp }}/out/
+          if-no-files-found: error
+          retention-days: 30
+
+  triage:
+    needs: prepare
+    if: needs.prepare.outputs.state == 'missing'
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    # Read-only on purpose: the model runs here. It reaches the Claude API
+    # through OIDC federation, and that is the only thing id-token is for.
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - name: Harden runner
+        uses: step-security/harden-runner@05e31511f85b41b11d1cf0ef85d0992719546e2c # v2.21.0
+        with:
+          egress-policy: audit
+
+      - name: Checkout
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ needs.prepare.outputs.old }}
+          fetch-depth: 0
+          filter: blob:none
+          persist-credentials: false
+
+      # The skill comes from the commit this run started from. The kernel's
+      # .gitignore ignores dot-directories, so .rebase-tools/ cannot end up in
+      # a commit.
+      - name: Trusted tools
+        env:
+          SRC: ${{ needs.prepare.outputs.source }}
+        run: |
+          set -euo pipefail
+          git fetch --no-tags --filter=blob:none origin "$GITHUB_SHA" "$SRC"
+          mkdir .rebase-tools
+          git archive "$GITHUB_SHA" .github/scripts .automation | tar -x -C .rebase-tools --strip-components=1
+          git fetch --no-tags --filter=blob:none "$SOURCE_UPSTREAM_URL" "$SOURCE_UPSTREAM_BRANCH"
+          git branch mainline-upstream FETCH_HEAD
+          git fetch --no-tags --filter=blob:none "$TARGET_UPSTREAM_URL" "$TARGET_UPSTREAM_BRANCH"
+          git branch lts-upstream FETCH_HEAD
+
+      - name: Download the plan
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: audit-plan
+          path: ${{ runner.temp }}/in
+
+      - name: Normalize identifiers
+        id: ids
+        env:
+          RULE: ${{ vars.REBASE_FEDERATION_RULE_ID }}
+          ORG: ${{ vars.ANTHROPIC_ORGANIZATION_ID }}
+          SVC: ${{ vars.ANTHROPIC_SERVICE_ACCOUNT_ID }}
+          WS: ${{ vars.ANTHROPIC_WORKSPACE_ID }}
+        run: |
+          set -euo pipefail
+          strip() { printf '%s' "$1" | tr -d '[:space:]'; }
+          {
+            echo "rule=$(strip "$RULE")"
+            echo "org=$(strip "$ORG")"
+            echo "svc=$(strip "$SVC")"
+            echo "ws=$(strip "$WS")"
+          } >> "$GITHUB_OUTPUT"
+          # An unset variable otherwise surfaces as an opaque API failure a
+          # second into the model step, with nothing in the log to say why.
+          missing=0
+          for n in REBASE_FEDERATION_RULE_ID:RULE ANTHROPIC_ORGANIZATION_ID:ORG ANTHROPIC_SERVICE_ACCOUNT_ID:SVC ANTHROPIC_WORKSPACE_ID:WS; do
+            eval "v=\$${n#*:}"
+            if [ -z "$(strip "$v")" ]; then
+              echo "::error::vars.${n%%:*} is empty or not visible to this repository."
+              missing=1
+            fi
+          done
+          exit "$missing"
+
+      - name: Triage
+        id: claude
+        continue-on-error: true
+        uses: anthropics/claude-code-action@6fed3ca145920b639991cb756090506e1bcaf515 # v1.0.245
+        with:
+          # The job token, which is read-only here. Without it the action
+          # would exchange OIDC for its own app token, which can write.
+          github_token: ${{ github.token }}
+          anthropic_federation_rule_id: '${{ steps.ids.outputs.rule }}'
+          anthropic_organization_id:    '${{ steps.ids.outputs.org }}'
+          anthropic_service_account_id: '${{ steps.ids.outputs.svc }}'
+          anthropic_workspace_id:       '${{ steps.ids.outputs.ws }}'
+          allowed_bots:                 'github-actions'
+          prompt: |
+            Audit edera/6.18-lts for Edera commits from edera/mainline that it
+            lacks, by following .rebase-tools/skills/lts-audit/SKILL.md
+            exactly. Read it in full before you start.
+
+            LTS_TIP=${{ needs.prepare.outputs.old }}   (${{ env.TARGET }}, checked out; its upstream is local branch lts-upstream)
+            MAINLINE_TIP=${{ needs.prepare.outputs.source }}   (${{ env.SOURCE }}; its upstream is local branch mainline-upstream)
+            PENDING=${{ runner.temp }}/in/pending
+            STATUS=${{ runner.temp }}/in/status
+            REPORT=${{ runner.temp }}/audit-report.md
+
+            You change nothing: no commits, no branches, no pushes. The
+            workflow files the issue from git's own list; your report
+            annotates it.
+          claude_args: |
+            --model claude-opus-5-5
+            --max-turns 150
+            --allowedTools "Read,Grep,Glob,Write,Bash(git log:*),Bash(git show:*),Bash(git diff:*),Bash(git range-diff:*),Bash(git merge-base:*),Bash(git rev-parse:*),Bash(git patch-id:*),Bash(git grep:*),Bash(git cat-file:*),Bash(diff:*),Bash(comm:*),Bash(sort:*),Bash(grep:*),Bash(sed:*),Bash(awk:*),Bash(cat:*),Bash(head:*),Bash(tail:*),Bash(wc:*),Bash(ls:*),Bash(cut:*)"
+
+      - name: Collect the report
+        if: always()
+        env:
+          REPORT: ${{ runner.temp }}/audit-report.md
+          OUTCOME: ${{ steps.claude.outcome }}
+        run: |
+          set -euo pipefail
+          out=$RUNNER_TEMP/out
+          mkdir -p "$out"
+          if [ -s "$REPORT" ]; then
+            cp "$REPORT" "$out/report.md"
+          else
+            printf 'Claude left no triage notes (triage step: %s); the run log has the cause.\n' "$OUTCOME" >"$out/report.md"
+          fi
+
+      - name: Upload
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: audit-triage
+          path: ${{ runner.temp }}/out/
+          if-no-files-found: error
+          retention-days: 30
+
+  publish:
+    needs: [prepare, triage]
+    # Whatever triage did: the issue rests on prepare's list, not on Claude.
+    if: always() && needs.prepare.result == 'success'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    concurrency:
+      group: lts-audit-issue
+      cancel-in-progress: false
+    permissions:
+      issues: write
+    steps:
+      - name: Harden runner
+        uses: step-security/harden-runner@05e31511f85b41b11d1cf0ef85d0992719546e2c # v2.21.0
+        with:
+          egress-policy: audit
+
+      - name: Download the plan
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: audit-plan
+          path: ${{ runner.temp }}/in/plan
+
+      - name: Download the triage
+        if: needs.triage.result != 'skipped'
+        continue-on-error: true
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: audit-triage
+          path: ${{ runner.temp }}/in/triage
+
+      - name: Open, update or close the issue
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          in=$RUNNER_TEMP/in
+          plan=$in/plan
+          R=$GITHUB_REPOSITORY
+          old=$(cat "$plan/lts-tip")
+          src=$(cat "$plan/mainline-tip")
+          summary() { cat >> "$GITHUB_STEP_SUMMARY"; }
+
+          existing=$(gh issue list --repo "$R" --state open \
+            --search "in:title \"$ISSUE_TITLE\"" --json number,title \
+            -q ".[] | select(.title == \"$ISSUE_TITLE\") | .number" | head -n1)
+
+          if [ ! -s "$plan/pending" ]; then
+            if [ -n "$existing" ]; then
+              gh issue close "$existing" --repo "$R" --comment \
+                "Back in sync: \`$TARGET\` (\`${old:0:12}\`) has every Edera commit on \`$SOURCE\` (\`${src:0:12}\`). [Audit run]($RUN_URL)."
+              echo "In sync; closed #$existing." | summary
+            else
+              echo "In sync; no issue to close." | summary
+            fi
+            exit 0
+          fi
+
+          # Commit hashes change with every nightly rebase, so the set of
+          # missing commits is recorded by subject, in the issue itself, to
+          # tell next week whether it changed.
+          cut -f2 "$plan/pending" | sort >"$RUNNER_TEMP/now"
+          now=$(base64 -w0 <"$RUNNER_TEMP/now")
+          : >"$RUNNER_TEMP/before"
+          if [ -n "$existing" ]; then
+            gh issue view "$existing" --repo "$R" --json body -q .body |
+              sed -n 's/.*<!-- lts-audit-subjects:\([A-Za-z0-9+\/=]*\) -->.*/\1/p' | head -n1 |
+              base64 -d >"$RUNNER_TEMP/before" 2>/dev/null || : >"$RUNNER_TEMP/before"
+          fi
+
+          body=$RUNNER_TEMP/issue.md
+          {
+            echo "<!-- lts-audit-subjects:$now -->"
+            echo "The weekly audit found **$(wc -l <"$plan/pending") Edera commit(s)** on \`$SOURCE\` (\`${src:0:12}\`) that \`$TARGET\` (\`${old:0:12}\`) does not have. [Audit run]($RUN_URL)."
+            echo
+            echo "| Mainline commit | Subject | Backport status |"
+            echo "| --- | --- | --- |"
+            while IFS=$'\t' read -r sha subject; do
+              where=$(awk -F'\t' -v s="$subject" '$2 == s { print $1 }' "$plan/status" | sort -u | paste -sd, - | sed 's/,/, /g')
+              printf '| `%s` | %s | %s |\n' "${sha:0:12}" "${subject//|/\\|}" "${where:-none}"
+            done <"$plan/pending"
+            echo
+            echo "Each one is resolved by landing its backport on \`$TARGET\`, or, if it must never go there, by labelling its mainline pull request \`no-backport\` or listing its subject in \`.automation/backport-skip\` on \`$TARGET\`. A commit that was ported under another subject or in another form also goes in the skip file. This issue is updated weekly and closes itself once nothing is missing."
+            echo
+            echo "## Claude's triage"
+            echo
+            if [ -s "$in/triage/report.md" ]; then cat "$in/triage/report.md"; else echo "Triage did not run; the run log has the cause."; fi
+          } >"$body"
+          if [ "$(wc -c <"$body")" -gt 60000 ]; then
+            head -c 59000 "$body" >"$body.cut"
+            printf '\n\n_Truncated; the full triage is in the run artifacts._\n' >>"$body.cut"
+            mv "$body.cut" "$body"
+          fi
+
+          if [ -z "$existing" ]; then
+            url=$(gh issue create --repo "$R" --title "$ISSUE_TITLE" --body-file "$body")
+            echo "Opened $url." | summary
+            exit 0
+          fi
+          gh issue edit "$existing" --repo "$R" --body-file "$body"
+          if cmp -s "$RUNNER_TEMP/before" "$RUNNER_TEMP/now"; then
+            echo "Unchanged since the last audit; refreshed #$existing." | summary
+            exit 0
+          fi
+          note=$RUNNER_TEMP/comment.md
+          {
+            echo "The set of missing commits changed; the description is updated. [Audit run]($RUN_URL)."
+            echo
+            comm -13 "$RUNNER_TEMP/before" "$RUNNER_TEMP/now" | sed 's/^/- newly missing: /'
+            comm -23 "$RUNNER_TEMP/before" "$RUNNER_TEMP/now" | sed 's/^/- no longer missing: /'
+          } >"$note"
+          gh issue comment "$existing" --repo "$R" --body-file "$note"
+          echo "Updated #$existing." | summary
