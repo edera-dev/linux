@@ -125,7 +125,13 @@ jobs:
           git fetch --no-tags --filter=blob:none origin "refs/pull/$PR/head"
           head=$(git rev-parse FETCH_HEAD)
           echo "head=$head" >> "$GITHUB_OUTPUT"
-          gh api --paginate "repos/$GITHUB_REPOSITORY/pulls/$PR/commits" -q '.[].sha' >"$out/pr-commits"
+          gh api --paginate "repos/$GITHUB_REPOSITORY/pulls/$PR/commits" >"$out/pr-commits.json"
+          jq -r '.[].sha' "$out/pr-commits.json" >"$out/pr-commits"
+          # Reviewers for the backport: the GitHub accounts of the commits'
+          # authors, or the pull request's author when none of them has one.
+          # Bots are left out.
+          jq -r '.[].author | select(.type? == "User") | .login' "$out/pr-commits.json" | sort -u >"$out/reviewers"
+          [ -s "$out/reviewers" ] || jq -r 'select(.user.type == "User") | .user.login' <<<"$pr" >"$out/reviewers"
           while read -r c; do
             git merge-base --is-ancestor "$c" "$head"
             printf '%s\t%s\n' "$c" "$(git log -1 --format=%s "$c")"
@@ -713,6 +719,14 @@ jobs:
             url=$(GH_TOKEN=$APP_TOKEN gh pr create --repo "$R" --base "$TARGET" --head "$BRANCH" \
               --title "Backport #$PR to 6.18-lts: $TITLE" --body-file "$body")
           fi
+          # One at a time: GitHub refuses the whole request if any one of
+          # them cannot review here, such as an author without access to the
+          # repository. A refresh asks them again, since the branch changed.
+          n=${url##*/}
+          while read -r who; do
+            GH_TOKEN=$APP_TOKEN gh api -X POST "repos/$R/pulls/$n/requested_reviewers" -f "reviewers[]=$who" >/dev/null ||
+              echo "::warning::Could not request a review of #$n from @$who."
+          done <"$in/plan/reviewers"
           set_label none
           {
             echo "proposed in $url"
