@@ -10,7 +10,6 @@
 
 #include <xen/xen.h>
 #include <xen/features.h>
-#include <xen/interface/xen.h>
 #include <xen/interface/memory.h>
 #include <xen/interface/sched.h>
 #include <xen/interface/version.h>
