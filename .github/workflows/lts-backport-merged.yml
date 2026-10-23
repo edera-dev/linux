@@ -1,0 +1,91 @@
+name: Landed edera/6.18-lts backport
+
+# Runs when a backport/edera-6.18-lts/pr-<N> pull request merges into
+# edera/6.18-lts:
+#
+#   - deletes its branch, as long as it still points at the commit that
+#     merged. The repository keeps delete_branch_on_merge off so feature
+#     branches survive, and these branches are the automation's own:
+#     lts-backport.yml on edera/6.18-lts makes a new one if a backport is
+#     ever proposed again;
+#   - dispatches every mainline pull request labelled backport-waiting
+#     again, since what it was waiting for may just have landed
+#     (retry-backports.sh, as edera/6.18-lts has it). The nightly retries
+#     them too; this just saves the wait.
+#
+# pull_request_target always runs this file as it is on the default branch,
+# edera/mainline, whichever branch the pull request targets, which is why it
+# lives here. edera/6.18-lts's copy of this path never runs. Nothing here
+# checks out or runs the pull request's code.
+
+on:
+  pull_request_target:
+    types: [closed]
+    branches: [edera/6.18-lts]
+
+permissions: {}
+
+jobs:
+  delete:
+    if: >-
+      github.event.pull_request.merged
+      && github.event.pull_request.head.repo.full_name == github.repository
+      && startsWith(github.event.pull_request.head.ref, 'backport/edera-6.18-lts/')
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: write
+    steps:
+      - name: Harden runner
+        uses: step-security/harden-runner@05e31511f85b41b11d1cf0ef85d0992719546e2c # v2.21.0
+        with:
+          egress-policy: audit
+
+      - name: Delete the branch
+        env:
+          GH_TOKEN: ${{ github.token }}
+          HEAD_REF: ${{ github.event.pull_request.head.ref }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          set -euo pipefail
+          # Only the commit that merged: a branch that has moved since holds
+          # something newer, and is left alone.
+          if ! cur=$(gh api "repos/$GITHUB_REPOSITORY/git/ref/heads/$HEAD_REF" -q .object.sha 2>/dev/null); then
+            echo "\`$HEAD_REF\` is already gone." >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          if [ "$cur" != "$HEAD_SHA" ]; then
+            echo "::warning::Not deleting $HEAD_REF: it is at ${cur:0:12}, not the merged ${HEAD_SHA:0:12}."
+            exit 0
+          fi
+          gh api -X DELETE "repos/$GITHUB_REPOSITORY/git/refs/heads/$HEAD_REF"
+          echo "Deleted \`$HEAD_REF\` (\`${HEAD_SHA:0:12}\`)." >> "$GITHUB_STEP_SUMMARY"
+
+  retry:
+    if: >-
+      github.event.pull_request.merged
+      && github.event.pull_request.head.repo.full_name == github.repository
+      && startsWith(github.event.pull_request.head.ref, 'backport/edera-6.18-lts/')
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      actions: write
+      pull-requests: read
+    steps:
+      - name: Harden runner
+        uses: step-security/harden-runner@05e31511f85b41b11d1cf0ef85d0992719546e2c # v2.21.0
+        with:
+          egress-policy: audit
+
+      - name: Checkout
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: edera/6.18-lts
+          persist-credentials: false
+          sparse-checkout: .github
+
+      - name: Retry waiting backports
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: bash .github/scripts/retry-backports.sh
