@@ -8,10 +8,15 @@ name: Nightly kernel maintenance
 #   - with backport_pr set, proposes the backport of that merged
 #     edera/mainline pull request instead (lts-backport.yml).
 #     lts-backport-trigger.yml on edera/mainline dispatches this for every
-#     pull request that merges there.
+#     pull request that merges there;
+#   - with audit set, checks that it has every Edera commit edera/mainline
+#     has, and keeps an issue open about the ones it lacks, instead
+#     (lts-audit.yml). lts-audit-trigger.yml on edera/mainline dispatches
+#     this weekly.
 #
-# Claude does the rebase and the backports. Independent checks decide what
-# happens to each result; see those workflows.
+# Claude does the rebase and the backports, and triages the audit.
+# Independent checks decide what happens to each result; see those
+# workflows.
 #
 # GitHub runs scheduled workflows only from the default branch, edera/mainline,
 # so this copy has no schedule of its own. lts-rebase-trigger.yml on
@@ -44,6 +49,10 @@ on:
         description: Instead of the rebase, backport this merged edera/mainline pull request (its number)
         type: string
         default: ''
+      audit:
+        description: Instead of the rebase, audit this tree for Edera commits from edera/mainline that it lacks
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -52,13 +61,14 @@ concurrency:
   # Per tree: groups are repository-wide, and edera/mainline's copy of this
   # workflow uses plain kernel-nightly. Each backport has its own group, so
   # they run alongside the rebase and each other; a newer dispatch for the
-  # same pull request replaces one still queued.
-  group: kernel-nightly-edera/6.18-lts${{ inputs.backport_pr != '' && format('-backport-{0}', inputs.backport_pr) || '' }}
+  # same pull request replaces one still queued. The audit only reads, and
+  # has its own group too.
+  group: kernel-nightly-edera/6.18-lts${{ inputs.audit && '-audit' || inputs.backport_pr != '' && format('-backport-{0}', inputs.backport_pr) || '' }}
   cancel-in-progress: false
 
 jobs:
   lts:
-    if: inputs.backport_pr == ''
+    if: inputs.backport_pr == '' && !inputs.audit
     uses: ./.github/workflows/upstream-rebase.yml
     permissions:
       contents: read
@@ -76,7 +86,7 @@ jobs:
   # After the rebase, whatever it did.
   retry:
     needs: lts
-    if: always() && inputs.backport_pr == ''
+    if: always() && inputs.backport_pr == '' && !inputs.audit
     runs-on: ubuntu-latest
     timeout-minutes: 10
     permissions:
@@ -101,7 +111,7 @@ jobs:
         run: bash .github/scripts/retry-backports.sh --stale
 
   backport:
-    if: inputs.backport_pr != ''
+    if: inputs.backport_pr != '' && !inputs.audit
     uses: ./.github/workflows/lts-backport.yml
     permissions:
       contents: read
@@ -111,4 +121,14 @@ jobs:
       id-token: write
     with:
       pr: ${{ inputs.backport_pr }}
+    secrets: inherit
+
+  audit:
+    if: inputs.audit
+    uses: ./.github/workflows/lts-audit.yml
+    permissions:
+      contents: read
+      pull-requests: read
+      issues: write
+      id-token: write
     secrets: inherit
