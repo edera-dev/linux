@@ -9,7 +9,12 @@ name: Land upstream rebase
 # was approved, and GitHub then marks the pull request merged.
 #
 # A review runs this workflow from the pull request's merge ref, which is why
-# it lives on edera/mainline.
+# it lives on edera/mainline. GitHub starts nothing for a pull request it
+# cannot compute a merge ref for, and a rebase often conflicts with the tree
+# it replaces, so an approval can also be landed by running this workflow
+# with the pull request's number. It then lands on the most recent approval
+# of the current head, from a reviewer whose latest review is still an
+# approval.
 #
 # What has to hold before anything is pushed:
 #   - the pull request is a rebase/edera-mainline/... branch from this
@@ -25,6 +30,12 @@ name: Land upstream rebase
 on:
   pull_request_review:
     types: [submitted]
+  workflow_dispatch:
+    inputs:
+      pr:
+        description: Number of the approved rebase pull request to land
+        type: string
+        required: true
 
 permissions:
   contents: read
@@ -32,16 +43,17 @@ permissions:
 concurrency:
   # Shared with the nightly's publish jobs, so nothing else moves the tree
   # while this runs.
-  group: push-${{ github.event.pull_request.base.ref }}
+  group: push-edera/mainline
   cancel-in-progress: false
 
 jobs:
   land:
     if: >-
-      github.event.review.state == 'approved'
-      && github.event.pull_request.head.repo.full_name == github.repository
-      && github.event.pull_request.base.ref == 'edera/mainline'
-      && startsWith(github.event.pull_request.head.ref, 'rebase/edera-mainline/')
+      github.event_name == 'workflow_dispatch'
+      || (github.event.review.state == 'approved'
+          && github.event.pull_request.head.repo.full_name == github.repository
+          && github.event.pull_request.base.ref == 'edera/mainline'
+          && startsWith(github.event.pull_request.head.ref, 'rebase/edera-mainline/'))
     runs-on: ubuntu-latest
     timeout-minutes: 15
     permissions:
@@ -67,7 +79,7 @@ jobs:
         env:
           APP_TOKEN: ${{ steps.app.outputs.token }}
           JOB_TOKEN: ${{ github.token }}
-          PR: ${{ github.event.pull_request.number }}
+          PR: ${{ github.event.pull_request.number || inputs.pr }}
           BASE: ${{ github.event.pull_request.base.ref }}
           HEAD_REF: ${{ github.event.pull_request.head.ref }}
           HEAD_SHA: ${{ github.event.pull_request.head.sha }}
@@ -78,6 +90,37 @@ jobs:
           say() {
             GH_TOKEN=$JOB_TOKEN gh pr comment "$PR" --repo "$GITHUB_REPOSITORY" --body "$1"
           }
+
+          # Run by hand: take from the pull request itself what a review
+          # event would have carried.
+          if [ "$GITHUB_EVENT_NAME" = workflow_dispatch ]; then
+            if ! [[ $PR =~ ^[0-9]+$ ]]; then
+              echo "::error::pr must be a pull request number, not '$PR'."
+              exit 1
+            fi
+            pr=$(GH_TOKEN=$JOB_TOKEN gh api "repos/$GITHUB_REPOSITORY/pulls/$PR")
+            BASE=$(jq -r .base.ref <<<"$pr")
+            HEAD_REF=$(jq -r .head.ref <<<"$pr")
+            HEAD_SHA=$(jq -r .head.sha <<<"$pr")
+            if [ "$(jq -r .state <<<"$pr")" != open ] \
+              || [ "$(jq -r .head.repo.full_name <<<"$pr")" != "$GITHUB_REPOSITORY" ] \
+              || [ "$BASE" != edera/mainline ] \
+              || [[ $HEAD_REF != rebase/edera-mainline/* ]]; then
+              echo "::error::#$PR is not an open rebase/edera-mainline/... pull request from this repository into edera/mainline."
+              exit 1
+            fi
+            APPROVER=$(GH_TOKEN=$JOB_TOKEN gh api --paginate "repos/$GITHUB_REPOSITORY/pulls/$PR/reviews" |
+              jq -rs --arg sha "$HEAD_SHA" '
+                add | map(select(.state != "COMMENTED" and .state != "PENDING"))
+                | group_by(.user.login) | map(last)
+                | map(select(.state == "APPROVED" and .commit_id == $sha))
+                | sort_by(.submitted_at) | last | .user.login // empty')
+            if [ -z "$APPROVER" ]; then
+              say "Not landed: nobody's current review approves the head, \`${HEAD_SHA:0:12}\`. Approve it, then run this again."
+              exit 1
+            fi
+            REVIEWED_SHA=$HEAD_SHA
+          fi
 
           if [ "$REVIEWED_SHA" != "$HEAD_SHA" ]; then
             say "Not landed: the approval was for \`${REVIEWED_SHA:0:12}\`, but the head is now \`${HEAD_SHA:0:12}\`. Approve the current head to land it."
