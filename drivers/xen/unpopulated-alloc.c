@@ -32,6 +32,10 @@
  * pfns with nothing behind them.  It is kept in a gen_pool per node, whose
  * addresses are pfns, so that a page given back joins its neighbours again.
  * Mappings take pages from page_list[] first, then from the gen_pool.
+ *
+ * dom0's balloon takes aligned 2 MiB blocks from the gen_pools, which Xen can
+ * populate as one extent each, and leaves each node at least
+ * MAPPING_FLOOR_PAGES free pages.
  */
 static DEFINE_MUTEX(list_lock);
 static struct page *page_list[MAX_NUMNODES];
@@ -45,6 +49,18 @@ static struct gen_pool *boot_pool[MAX_NUMNODES];
  * chunks used up are skipped whole.
  */
 #define BOOT_CHUNK_PAGES	(SZ_1G >> PAGE_SHIFT)
+
+/*
+ * Free pages of each node that dom0's balloon leaves to mappings, so that
+ * they rarely need fill_list() to carve a region out of address space that
+ * may belong to a device.
+ */
+#define MAPPING_FLOOR_PAGES	PAGES_PER_SECTION
+
+/* Align blocks on the pfn, not on the offset into the gen_pool chunk. */
+static struct genpool_data_align block_align = {
+	.align = XEN_UNPOPULATED_BLOCK_PAGES,
+};
 
 static struct resource *target_resource;
 
@@ -421,6 +437,51 @@ void __init xen_unpopulated_add_range(unsigned long start_pfn,
 				pfn, end - 1);
 	}
 	mutex_unlock(&list_lock);
+}
+
+/*
+ * Take a 2 MiB block off the boot-time address space of @node, if @node keeps
+ * MAPPING_FLOOR_PAGES free pages after it.  Returns NULL otherwise.
+ */
+static struct page *take_block(int node)
+{
+	unsigned long pfn = 0;
+
+	if (boot_pool[node] &&
+	    pool_pages(node) >= MAPPING_FLOOR_PAGES + XEN_UNPOPULATED_BLOCK_PAGES)
+		pfn = gen_pool_alloc_algo(boot_pool[node],
+					  XEN_UNPOPULATED_BLOCK_PAGES,
+					  gen_pool_first_fit_align, &block_align);
+	return pfn ? pfn_to_page(pfn) : NULL;
+}
+
+/**
+ * xen_alloc_unpopulated_blocks - take 2 MiB blocks for dom0's balloon
+ * @heads: first page of each block taken
+ * @nr_blocks: number of blocks wanted
+ *
+ * Blocks come from the boot-time address space of the lowest node that can
+ * spare one and still keep MAPPING_FLOOR_PAGES free pages.  Give back the
+ * pages Xen did not populate with xen_free_unpopulated_pages().
+ *
+ * Returns the number of blocks taken, which may be less than @nr_blocks.
+ */
+unsigned int xen_alloc_unpopulated_blocks(struct page **heads,
+					  unsigned int nr_blocks)
+{
+	unsigned int nr = 0;
+	int node;
+
+	mutex_lock(&list_lock);
+	for (node = 0; node < MAX_NUMNODES && nr < nr_blocks; node++) {
+		struct page *head;
+
+		while (nr < nr_blocks && (head = take_block(node)))
+			heads[nr++] = head;
+	}
+	mutex_unlock(&list_lock);
+
+	return nr;
 }
 
 static int __init unpopulated_init(void)
