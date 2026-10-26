@@ -19,6 +19,7 @@ on:
     paths:
       - '.github/scripts/**'
       - '.github/workflows/upstream-rebase.yml'
+      - '.github/workflows/rebase-build.yml'
       - '.github/workflows/kernel-nightly.yml'
       - '.github/workflows/rebase-land.yml'
       - '.github/workflows/automation-selftest.yml'
