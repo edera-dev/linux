@@ -74,6 +74,7 @@ int xen_alloc_unpopulated_pages_node(unsigned int nr_pages, struct page **pages,
 				     int node);
 int xen_alloc_unpopulated_pages(unsigned int nr_pages, struct page **pages);
 void xen_free_unpopulated_pages(unsigned int nr_pages, struct page **pages);
+void xen_unpopulated_add_range(unsigned long start_pfn, unsigned long nr_pages);
 #include <linux/ioport.h>
 int arch_xen_unpopulated_init(struct resource **res);
 #else

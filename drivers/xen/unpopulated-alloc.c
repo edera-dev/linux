@@ -1,10 +1,12 @@
 // SPDX-License-Identifier: GPL-2.0
 #include <linux/errno.h>
+#include <linux/genalloc.h>
 #include <linux/gfp.h>
 #include <linux/kernel.h>
 #include <linux/mm.h>
 #include <linux/memremap.h>
 #include <linux/numa.h>
+#include <linux/sizes.h>
 #include <linux/slab.h>
 
 #include <asm/page.h>
@@ -24,10 +26,25 @@
  *
  * A single mutex covers all per-node lists.  Alloc/free are
  * connect-time events on the I/O backends and not contention-sensitive.
+ *
+ * The boot-time unbacked address space, which arch_xen_unpopulated_init()
+ * hands over with xen_unpopulated_add_range(), is not ZONE_DEVICE but RAM
+ * pfns with nothing behind them.  It is kept in a gen_pool per node, whose
+ * addresses are pfns, so that a page given back joins its neighbours again.
+ * Mappings take pages from page_list[] first, then from the gen_pool.
  */
 static DEFINE_MUTEX(list_lock);
 static struct page *page_list[MAX_NUMNODES];
 static unsigned int list_count[MAX_NUMNODES];
+static struct gen_pool *boot_pool[MAX_NUMNODES];
+
+/*
+ * Each allocation searches a gen_pool chunk from its first page, and skips a
+ * chunk with too few free pages without searching it.  Boot-time address
+ * space goes into the pools in chunks of at most this many pages, so that
+ * chunks used up are skipped whole.
+ */
+#define BOOT_CHUNK_PAGES	(SZ_1G >> PAGE_SHIFT)
 
 static struct resource *target_resource;
 
@@ -185,9 +202,44 @@ static void push_page(struct page *pg)
 {
 	int node = xen_unpopulated_clamp_node(page_to_nid(pg));
 
+	if (!is_zone_device_page(pg)) {
+		gen_pool_free(boot_pool[node], page_to_pfn(pg), 1);
+		return;
+	}
+
 	pg->zone_device_data = page_list[node];
 	page_list[node] = pg;
 	list_count[node]++;
+}
+
+/*
+ * Take a page off the pool of @node: from page_list[] first, then from the
+ * boot-time address space.  Returns NULL when the pool is empty.
+ */
+static struct page *take_page(int node)
+{
+	struct page *pg = page_list[node];
+	unsigned long pfn = 0;
+
+	if (pg) {
+		page_list[node] = pg->zone_device_data;
+		list_count[node]--;
+		return pg;
+	}
+
+	if (boot_pool[node])
+		pfn = gen_pool_alloc(boot_pool[node], 1);
+	return pfn ? pfn_to_page(pfn) : NULL;
+}
+
+/* Free pages in the pool of @node, boot-time ones included. */
+static unsigned long pool_pages(int node)
+{
+	unsigned long nr = list_count[node];
+
+	if (boot_pool[node])
+		nr += gen_pool_avail(boot_pool[node]);
+	return nr;
 }
 
 /*
@@ -197,23 +249,21 @@ static void push_page(struct page *pg)
 static int pop_pages(unsigned int nr_pages, struct page **pages, int node,
 		     bool any)
 {
-	unsigned int i, total = 0;
+	unsigned long total = 0;
+	unsigned int i;
 
 	for (i = 0; i < MAX_NUMNODES; i++)
-		total += list_count[i];
-	if ((any ? total : list_count[node]) < nr_pages)
+		total += pool_pages(i);
+	if ((any ? total : pool_pages(node)) < nr_pages)
 		return -ENOMEM;
 
 	for (i = 0; i < nr_pages; i++) {
 		int src = node;
 		struct page *pg;
 
-		while (!page_list[src])
+		while (!(pg = take_page(src)))
 			src = (src + 1) % MAX_NUMNODES;
 
-		pg = page_list[src];
-		page_list[src] = pg->zone_device_data;
-		list_count[src]--;
 		pages[i] = pg;
 
 #ifdef CONFIG_XEN_HAVE_PVMMU
@@ -287,8 +337,9 @@ EXPORT_SYMBOL(xen_alloc_unpopulated_pages_node);
  */
 int xen_alloc_unpopulated_pages(unsigned int nr_pages, struct page **pages)
 {
-	unsigned int i, total = 0;
+	unsigned long total = 0;
 	int node = numa_node_id();
+	unsigned int i;
 	int ret;
 
 	if (!target_resource)
@@ -296,7 +347,7 @@ int xen_alloc_unpopulated_pages(unsigned int nr_pages, struct page **pages)
 
 	mutex_lock(&list_lock);
 	for (i = 0; i < MAX_NUMNODES; i++)
-		total += list_count[i];
+		total += pool_pages(i);
 	ret = 0;
 	if (total < nr_pages)
 		ret = fill_list(nr_pages - total, node);
@@ -333,6 +384,44 @@ void xen_free_unpopulated_pages(unsigned int nr_pages, struct page **pages)
 	mutex_unlock(&list_lock);
 }
 EXPORT_SYMBOL(xen_free_unpopulated_pages);
+
+/**
+ * xen_unpopulated_add_range - hand over boot-time unbacked address space
+ * @start_pfn: first pfn of the range
+ * @nr_pages: number of pages in the range
+ *
+ * The pages must have a struct page and nothing behind them, as the extra
+ * memory regions of a Xen guest do.  They go to the gen_pool of their node in
+ * chunks of at most BOOT_CHUNK_PAGES, and a chunk never spans two nodes.
+ */
+void __init xen_unpopulated_add_range(unsigned long start_pfn,
+				      unsigned long nr_pages)
+{
+	unsigned long pfn, end, end_pfn = start_pfn + nr_pages;
+
+	mutex_lock(&list_lock);
+	for (pfn = start_pfn; pfn < end_pfn; pfn = end) {
+		int node = page_to_nid(pfn_to_page(pfn));
+
+		/*
+		 * Freed pages go back to the pool of their own node, so a
+		 * chunk must not hold pages of two nodes.  When the chunk ends
+		 * on another node, move its end back to the last page of this
+		 * node, which assumes no other node's pages come before it.
+		 */
+		end = min(ALIGN(pfn + 1, BOOT_CHUNK_PAGES), end_pfn);
+		while (page_to_nid(pfn_to_page(end - 1)) != node)
+			end--;
+
+		if (!boot_pool[node])
+			boot_pool[node] = gen_pool_create(0, node);
+		if (!boot_pool[node] ||
+		    gen_pool_add(boot_pool[node], pfn, end - pfn, node))
+			pr_warn("Cannot keep pfns %#lx-%#lx for mappings\n",
+				pfn, end - 1);
+	}
+	mutex_unlock(&list_lock);
+}
 
 static int __init unpopulated_init(void)
 {

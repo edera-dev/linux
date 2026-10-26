@@ -448,22 +448,15 @@ int __init arch_xen_unpopulated_init(struct resource **res)
 	if (!xen_domain())
 		return -ENODEV;
 
-	/* Must be set strictly before calling xen_free_unpopulated_pages(). */
 	*res = &iomem_resource;
 
 	/*
-	 * Initialize with pages from the extra memory regions (see
+	 * Initialize with the extra memory regions (see
 	 * arch/x86/xen/setup.c).
 	 */
 	for (i = 0; i < XEN_EXTRA_MEM_MAX_REGIONS; i++) {
-		unsigned int j;
-
-		for (j = 0; j < xen_extra_mem[i].n_pfns; j++) {
-			struct page *pg =
-				pfn_to_page(xen_extra_mem[i].start_pfn + j);
-
-			xen_free_unpopulated_pages(1, &pg);
-		}
+		xen_unpopulated_add_range(xen_extra_mem[i].start_pfn,
+					  xen_extra_mem[i].n_pfns);
 
 		/*
 		 * Account for the region being in the physmap but unpopulated.
