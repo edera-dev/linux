@@ -26,7 +26,8 @@ Your report can only stop it. When you finish, the workflow independently:
    alone that the series sits on the upstream tip, is linear, lost or gained
    no commit, and changed the tree by exactly the upstream delta;
 2. builds x86_64 and arm64 `vmlinux` with `kernel-build.sh`, which turns on
-   every downstream feature as a built-in.
+   every downstream feature as a built-in. x86_64 starts from the latest
+   Edera host config in edera-dev/linux-kernel-oci; arm64 from defconfig.
 
 If all of that passes **and your report's "Needs a decision" section is
 `None.` with nothing marked UNSURE anywhere** (checked by
