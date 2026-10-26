@@ -48,7 +48,8 @@ static struct iommu_device xen_iommu_device;
 static struct pv_iommu_capabilities caps;
 
 static int xen_iommu_attach_dev(struct iommu_domain *domain,
-				struct device *dev);
+				struct device *dev,
+				struct iommu_domain *old);
 
 static const struct iommu_domain_ops xen_iommu_identity_ops = {
 	.attach_dev = xen_iommu_attach_dev,
@@ -332,7 +333,8 @@ static size_t xen_iommu_unmap_pages(struct iommu_domain *domain, unsigned long i
 	return unmap.unmapped * pgsize;
 }
 
-static int xen_iommu_attach_dev(struct iommu_domain *domain, struct device *dev)
+static int xen_iommu_attach_dev(struct iommu_domain *domain, struct device *dev,
+				struct iommu_domain *old)
 {
 	struct pci_dev *pdev;
 	struct xen_iommu_domain *dom = to_xen_iommu_domain(domain);
