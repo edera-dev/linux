@@ -18,7 +18,8 @@ name: Upstream rebase
 #     linear, lost or gained no commit, and changed the tree by exactly the
 #     upstream delta;
 #   - kernel-build.sh builds x86_64 and arm64 vmlinux with every downstream
-#     feature built in.
+#     feature built in, x86_64 on top of the latest Edera host config from
+#     edera-dev/linux-kernel-oci.
 #
 # If both pass and Claude's report asks for no decision
 # (report-needs-decision.sh), the tree is force-pushed to the result, pinned
@@ -647,7 +648,7 @@ jobs:
             echo
             echo "## Independent checks"
             echo
-            echo "Builds: **${BUILD}** (x86_64 and arm64 vmlinux with the Edera features built in; per-build results in the run)."
+            echo "Builds: **${BUILD}** (x86_64 vmlinux on the Edera host config and arm64 vmlinux, both with the Edera features built in; per-build results in the run)."
             echo
             if [ -s "$verify" ]; then cat "$verify"; else echo "The checker did not run."; fi
             echo
