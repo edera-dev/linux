@@ -1,0 +1,117 @@
+name: Rebase build
+
+# The independent build of a rebase result, called by upstream-rebase.yml:
+# once for Claude's rebase and, if that fails and Claude repairs the branch,
+# once more for the repaired branch.
+#
+# It builds x86_64 and arm64 vmlinux with kernel-build.sh, taken from the
+# commit the calling run started from, never from the tree under test. Each
+# build's log is kept as an artifact, so a repair round can read what broke.
+
+on:
+  workflow_call:
+    inputs:
+      old:
+        description: The downstream tip the rebase started from
+        type: string
+        required: true
+      up:
+        description: The upstream commit the result sits on
+        type: string
+        required: true
+      result:
+        description: The commit to build
+        type: string
+        required: true
+      bundle:
+        description: The artifact holding rebase.bundle with the result
+        type: string
+        required: true
+      logs:
+        description: Prefix for the build log artifacts; the arch is appended
+        type: string
+        required: true
+      upstream_url:
+        type: string
+        required: true
+      upstream_branch:
+        type: string
+        required: true
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        arch: [x86_64, arm64]
+    name: build (${{ matrix.arch }})
+    steps:
+      - name: Harden runner
+        uses: step-security/harden-runner@05e31511f85b41b11d1cf0ef85d0992719546e2c # v2.21.0
+        with:
+          egress-policy: audit
+
+      - name: Checkout
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ inputs.old }}
+          fetch-depth: 0
+          filter: blob:none
+          persist-credentials: false
+
+      - name: Trusted tools
+        run: |
+          set -euo pipefail
+          git fetch --no-tags --filter=blob:none origin "$GITHUB_SHA"
+          mkdir "$RUNNER_TEMP/tools"
+          git archive "$GITHUB_SHA" .github/scripts | tar -x -C "$RUNNER_TEMP/tools" --strip-components=1
+
+      - name: Download
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: ${{ inputs.bundle }}
+          path: ${{ runner.temp }}/in
+
+      - name: Check out the result
+        env:
+          UPSTREAM_URL: ${{ inputs.upstream_url }}
+          UPSTREAM_BRANCH: ${{ inputs.upstream_branch }}
+          UP: ${{ inputs.up }}
+          RESULT: ${{ inputs.result }}
+        run: |
+          set -euo pipefail
+          git fetch --no-tags "$UPSTREAM_URL" "$UPSTREAM_BRANCH"
+          git merge-base --is-ancestor "$UP" FETCH_HEAD
+          git fetch "$RUNNER_TEMP/in/rebase.bundle" rebase-result:rebase-result
+          [ "$(git rev-parse rebase-result)" = "$RESULT" ] || { echo "bundle does not hold $RESULT"; exit 1; }
+          git checkout --detach "$RESULT"
+
+      - name: Install toolchains
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential bc bison flex libelf-dev libssl-dev python3 \
+            gcc-aarch64-linux-gnu
+
+      - name: Build
+        env:
+          ARCH: ${{ matrix.arch }}
+        run: |
+          set -euo pipefail
+          bash "$RUNNER_TEMP/tools/scripts/kernel-build.sh" "$ARCH" "$RUNNER_TEMP/obj" 2>&1 |
+            tee "$RUNNER_TEMP/build-$ARCH.log"
+
+      - name: Upload the log
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: ${{ inputs.logs }}-${{ matrix.arch }}
+          path: ${{ runner.temp }}/build-${{ matrix.arch }}.log
+          if-no-files-found: ignore
+          retention-days: 30
