@@ -7,6 +7,12 @@
 # replay that breaks any of them, or links against a symbol upstream removed,
 # fails here. Building only a subdirectory would miss those link errors.
 #
+# x86_64 adds Edera's shipping host config, fetched from the tip of
+# edera-dev/linux-kernel-oci each run, over defconfig, so the branch is
+# judged against the kernel we actually ship. That config builds
+# OpenPaX out and several Edera drivers as modules, so the options below are
+# still forced on as built-ins over it. arm64 starts from defconfig.
+#
 # The rebase skill runs this same script before they finish, so
 # what Claude checks and what the workflow checks cannot drift apart.
 #
@@ -18,7 +24,8 @@
 # aarch64-linux-gnu-) unless LLVM is set, in which case it builds with clang.
 #
 # Exit status: make's on a build failure; 3 if an option it asked for did not
-# survive olddefconfig (a Kconfig dependency the series no longer satisfies).
+# survive olddefconfig (a Kconfig dependency the series no longer satisfies);
+# git's if the host config cannot be fetched.
 
 set -euo pipefail
 
@@ -51,6 +58,8 @@ x86_64)
 		HYPERVISOR_GUEST PARAVIRT XEN_PV XEN_PVHVM_GUEST PCI_XEN
 		XEN_PCIDEV_FRONTEND XEN_PCIDEV_BACKEND XEN_IOMMU
 		HYPERV HYPERV_VMBUS HYPERV_NET PCI_HYPERV PCI_HYPERV_INTERFACE
+		# host.config builds AGP as a module, which caps DRM at m.
+		AGP
 	)
 	;;
 arm64)
@@ -72,6 +81,19 @@ mkdir -p "$objdir"
 mk() { make -s ARCH="$karch" "${cross[@]}" O="$objdir" "$@"; }
 
 mk defconfig
+if [ "$arch" = x86_64 ]; then
+	# host.config is a fragment against x86_64_defconfig: it leaves out
+	# whatever matches defconfig (SMP and NET among them), so it only means
+	# something merged over defconfig, the way linux-kernel-oci applies it.
+	oci=https://github.com/edera-dev/linux-kernel-oci
+	cfgrepo=$(mktemp -d)
+	trap 'rm -rf "$cfgrepo"' EXIT
+	git init -q --bare "$cfgrepo"
+	git -C "$cfgrepo" fetch -q --depth 1 "$oci" main
+	git -C "$cfgrepo" show FETCH_HEAD:configs/x86_64/host.config >"$cfgrepo/host.config"
+	echo "kernel-build: merging host.config from $oci@$(git -C "$cfgrepo" rev-parse FETCH_HEAD)"
+	scripts/kconfig/merge_config.sh -m -O "$objdir" "$objdir/.config" "$cfgrepo/host.config" >/dev/null
+fi
 enable=()
 for o in "${opts[@]}"; do enable+=(--enable "$o"); done
 scripts/config --file "$objdir/.config" "${enable[@]}"
