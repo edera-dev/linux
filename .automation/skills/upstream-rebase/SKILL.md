@@ -29,6 +29,10 @@ Your report can only stop it. When you finish, the workflow independently:
    every downstream feature as a built-in. x86_64 starts from the latest
    Edera host config in edera-dev/linux-kernel-oci; arm64 from defconfig.
 
+If the build fails, you get your branch back with the build logs and one
+chance to repair it (see "Repairing a failed build"), and the repaired branch
+is checked and built again from scratch.
+
 If all of that passes **and your report's "Needs a decision" section is
 `None.` with nothing marked UNSURE anywhere** (checked by
 `report-needs-decision.sh`), the downstream branch is force-pushed to your
@@ -139,6 +143,12 @@ The workflow re-runs these builds itself, but run them here so you can fix
 what your resolutions broke. Each takes a while; run them once the rebase is
 complete, not after every commit.
 
+Run each build in the foreground and wait for it: the shell allows a command
+up to 90 minutes, which is enough for a full build. Never start a build in
+the background, and never end your session while one is running. A run
+that stops to wait for a build ends there, and nobody fixes what it would
+have shown.
+
 ```sh
 bash .rebase-tools/scripts/kernel-build.sh x86_64 .rebase-scratch/obj-x86 4
 bash .rebase-tools/scripts/kernel-build.sh arm64 .rebase-scratch/obj-arm64 4
@@ -150,9 +160,10 @@ the build script names). Find out which, and say so in the report; if the
 build script's list is what is stale, that is a **Needs a decision** item,
 not something to work around.
 
-If a build fails because of the rebase (a resolution, or an upstream change a
-downstream commit has not caught up with), fix it **in the downstream commit
-that is wrong**. Interactive editors do not work here, so drive the todo list
+A failing build is not a finished rebase. If a build fails because of the
+rebase (a resolution, or an upstream change a downstream commit has not
+caught up with), fix it, build again, and keep going until both builds pass.
+Fix it **in the downstream commit that is wrong**. Interactive editors do not work here, so drive the todo list
 with sed: `git -c sequence.editor="sed -i 's/^pick <sha>/edit <sha>/'" rebase
 -i UPSTREAM`, amend, then `git rebase --continue`. Do not add a fix-up commit
 on top unless there is no single commit it belongs to; if you must, its
@@ -237,6 +248,36 @@ x86_64, arm64: pass, fail (with the first error), or pre-existing failure
 
 Then stop. Leave RESULT checked out or not; the workflow reads the branch,
 not the working tree.
+
+## Repairing a failed build
+
+The workflow sends you here, in a fresh session, when the branch you produced
+failed its independent build. The prompt gives you `BUILD_LOGS`, a directory
+holding the log of each arch the workflow built, and your branch is checked
+out as `RESULT`. `REPORT` already holds the report you wrote for the rebase.
+
+1. Read the logs. Find the first error in each failing one; later errors
+   usually follow from it. A log that ends with `kernel-build: ... built`
+   passed.
+2. Reproduce the failure with `kernel-build.sh` exactly as in step 3, then
+   fix it the same way: in the downstream commit that is wrong, with the
+   same rules on fix-up commits. If it fails on pristine `UPSTREAM` too, it
+   is not yours: say so and leave the branch alone.
+3. Build both arches again, not only the one that failed, and keep fixing
+   and rebuilding until both pass. Do not stop at the first fix.
+4. Run `verify-upstream-rebase.sh` as in step 5. Every new drift line must be
+   one of your build fixes.
+5. Update `REPORT` in place. Add each fix to **Build fixes** (what broke, the
+   first error, which commit you changed, why), and rewrite **Builds** with
+   the results you now have. Leave the rest as it is, except to add an
+   **UNSURE** item if a fix needed a judgement call. A reviewer will read
+   this report, not your session.
+
+Exit status 3 is still not something to work around here: a Kconfig symbol
+the build script names no longer surviving `olddefconfig` goes to **Needs a
+decision**, as in step 3. If you cannot make the build pass, leave `RESULT`
+at the best branch you have and say in **Builds** exactly what still fails
+and why.
 
 ## If you cannot finish
 
