@@ -31,6 +31,9 @@
  * of their node, linked through their first page as page_list[] links pages,
  * and the pages around them go on page_list[].
  *
+ * dom0's balloon takes blocks off block_list[], which Xen can populate as one
+ * extent each, and leaves each node at least MAPPING_FLOOR_PAGES free pages.
+ *
  * Mappings take pages from page_list[] only, and give them back to it.  When
  * page_list[] runs empty, a block moves onto it from block_list[].
  */
@@ -39,6 +42,13 @@ static struct page *page_list[MAX_NUMNODES];
 static unsigned int list_count[MAX_NUMNODES];
 static struct page *block_list[MAX_NUMNODES];
 static unsigned long block_count[MAX_NUMNODES];
+
+/*
+ * Free pages of each node that dom0's balloon leaves to mappings, so that
+ * they rarely need fill_list() to carve a region out of address space that
+ * may belong to a device.
+ */
+#define MAPPING_FLOOR_PAGES	PAGES_PER_SECTION
 
 static struct resource *target_resource;
 
@@ -438,6 +448,49 @@ void __init xen_unpopulated_add_range(unsigned long start_pfn,
 		}
 	}
 	mutex_unlock(&list_lock);
+}
+
+/*
+ * Blocks dom0's balloon may take from @node.  Pages on page_list[] count
+ * toward MAPPING_FLOOR_PAGES, and @node keeps enough blocks to make up the
+ * rest.
+ */
+static unsigned long spare_blocks(int node)
+{
+	unsigned long keep = 0;
+
+	if (list_count[node] < MAPPING_FLOOR_PAGES)
+		keep = DIV_ROUND_UP(MAPPING_FLOOR_PAGES - list_count[node],
+				    XEN_UNPOPULATED_BLOCK_PAGES);
+
+	return block_count[node] > keep ? block_count[node] - keep : 0;
+}
+
+/**
+ * xen_alloc_unpopulated_blocks - take 2 MiB blocks for dom0's balloon
+ * @heads: first page of each block taken
+ * @nr_blocks: number of blocks wanted
+ *
+ * Blocks come from the boot-time address space of the lowest node that can
+ * spare one and still keep MAPPING_FLOOR_PAGES free pages.  Give back the
+ * pages Xen did not populate with xen_free_unpopulated_pages(), after which
+ * they serve mappings and do not form a block again.
+ *
+ * Returns the number of blocks taken, which may be less than @nr_blocks.
+ */
+unsigned int xen_alloc_unpopulated_blocks(struct page **heads,
+					  unsigned int nr_blocks)
+{
+	unsigned int nr = 0;
+	int node;
+
+	mutex_lock(&list_lock);
+	for (node = 0; node < MAX_NUMNODES; node++)
+		while (nr < nr_blocks && spare_blocks(node))
+			heads[nr++] = pop_block(node);
+	mutex_unlock(&list_lock);
+
+	return nr;
 }
 
 static int __init unpopulated_init(void)
