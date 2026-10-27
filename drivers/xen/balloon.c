@@ -1012,6 +1012,31 @@ void xen_free_ballooned_pages(unsigned int nr_pages, struct page **pages)
 }
 EXPORT_SYMBOL(xen_free_ballooned_pages);
 
+/*
+ * How many pages dom0 can still grow by: the 2 MiB blocks the unpopulated
+ * allocator has to spare, within Xen's ceiling for dom0 (dom0_mem=...,max:)
+ * when one is set. Without a max: Xen reports UINT_MAX.
+ */
+unsigned long balloon_room_pages(void)
+{
+	domid_t domid = DOMID_SELF;
+	long max_pages, cur_pages;
+	unsigned long room;
+
+	if (!xen_initial_domain())
+		return 0;
+
+	room = xen_unpopulated_spare_blocks() * XEN_UNPOPULATED_BLOCK_PAGES;
+
+	max_pages = HYPERVISOR_memory_op(XENMEM_maximum_reservation, &domid);
+	cur_pages = HYPERVISOR_memory_op(XENMEM_current_reservation, &domid);
+	if (max_pages > 0 && max_pages < UINT_MAX && cur_pages > 0)
+		room = min_t(unsigned long, room,
+			     max(max_pages - cur_pages, 0L));
+
+	return room;
+}
+
 #define BALLOON_OOM_DEFLATE_BATCH 512UL /* pages per OOM event (~2 MiB) */
 
 static int balloon_oom_notify(struct notifier_block *nb, unsigned long dummy,
