@@ -632,6 +632,48 @@ static enum bp_state balloon_deflate(unsigned long nr_pages)
 	return increase_reservation(nr_pages);
 }
 
+/*
+ * Grow dom0 into 2 MiB blocks of the unpopulated allocator's address space,
+ * rather than hotplugging memory at the first free physical address, which
+ * can belong to a PCI device that has not claimed it yet. The blocks are
+ * parked on the balloon only for this call and deflated like any others, and
+ * whatever Xen did not populate goes straight back, so the balloon never
+ * holds address space grant mappings could use.
+ */
+static enum bp_state balloon_grow_dom0(unsigned long nr_pages)
+{
+	unsigned long before = balloon_stats.current_pages;
+	struct page *heads[BALLOON_BLOCK_BATCH], *page;
+	unsigned int nr = 1, i;
+	enum bp_state state;
+
+	BUILD_BUG_ON(XEN_UNPOPULATED_BLOCK_PAGES != BALLOON_BLOCK_NR_PAGES);
+
+	/*
+	 * Take as many blocks as balloon_deflate() populates whole, or one for
+	 * it to populate a page at a time.
+	 */
+	if (balloon_blocks_usable())
+		nr = clamp(nr_pages / BALLOON_BLOCK_NR_PAGES, 1UL,
+			   ARRAY_SIZE(heads));
+	nr = xen_alloc_unpopulated_blocks(heads, nr);
+	if (!nr) {
+		pr_warn_once("no room left for dom0 to grow into\n");
+		return BP_ECANCELED;
+	}
+
+	for (i = 0; i < nr; i++)
+		balloon_append_block(heads[i]);
+
+	state = balloon_deflate(nr_pages);
+	balloon_stats.total_pages += balloon_stats.current_pages - before;
+
+	while ((page = balloon_retrieve(false)))
+		xen_free_unpopulated_pages(1, &page);
+
+	return state;
+}
+
 static enum bp_state decrease_reservation(unsigned long nr_pages, gfp_t gfp)
 {
 	enum bp_state state = BP_DONE;
@@ -830,6 +872,8 @@ static int balloon_thread(void *unused)
 		if (credit > 0) {
 			if (balloon_is_inflated())
 				balloon_state = balloon_deflate(credit);
+			else if (xen_initial_domain())
+				balloon_state = balloon_grow_dom0(credit);
 			else
 				balloon_state = reserve_additional_memory();
 		}
