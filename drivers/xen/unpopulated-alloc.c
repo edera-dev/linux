@@ -493,6 +493,25 @@ unsigned int xen_alloc_unpopulated_blocks(struct page **heads,
 	return nr;
 }
 
+/**
+ * xen_unpopulated_spare_blocks - 2 MiB blocks dom0's balloon could still take
+ *
+ * Each node spares the blocks on its block_list[] beyond those it keeps to make
+ * up MAPPING_FLOOR_PAGES free pages.
+ */
+unsigned long xen_unpopulated_spare_blocks(void)
+{
+	unsigned long nr = 0;
+	int node;
+
+	mutex_lock(&list_lock);
+	for (node = 0; node < MAX_NUMNODES; node++)
+		nr += spare_blocks(node);
+	mutex_unlock(&list_lock);
+
+	return nr;
+}
+
 static int __init unpopulated_init(void)
 {
 	int ret;
