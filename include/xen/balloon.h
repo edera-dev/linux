@@ -27,6 +27,7 @@ struct balloon_stats {
 extern struct balloon_stats balloon_stats;
 
 void balloon_set_new_target(unsigned long target);
+unsigned long balloon_room_pages(void);
 
 int xen_alloc_ballooned_pages(unsigned int nr_pages, struct page **pages);
 void xen_free_ballooned_pages(unsigned int nr_pages, struct page **pages);
