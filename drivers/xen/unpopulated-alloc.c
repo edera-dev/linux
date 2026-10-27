@@ -24,10 +24,21 @@
  *
  * A single mutex covers all per-node lists.  Alloc/free are
  * connect-time events on the I/O backends and not contention-sensitive.
+ *
+ * The boot-time unbacked address space, which arch_xen_unpopulated_init()
+ * hands over with xen_unpopulated_add_range(), is not ZONE_DEVICE but RAM
+ * pfns with nothing behind them.  Its aligned 2 MiB blocks go on block_list[]
+ * of their node, linked through their first page as page_list[] links pages,
+ * and the pages around them go on page_list[].
+ *
+ * Mappings take pages from page_list[] only, and give them back to it.  When
+ * page_list[] runs empty, a block moves onto it from block_list[].
  */
 static DEFINE_MUTEX(list_lock);
 static struct page *page_list[MAX_NUMNODES];
 static unsigned int list_count[MAX_NUMNODES];
+static struct page *block_list[MAX_NUMNODES];
+static unsigned long block_count[MAX_NUMNODES];
 
 static struct resource *target_resource;
 
@@ -180,7 +191,7 @@ err_resource:
 	return ret;
 }
 
-/* Put @pg on the pool of its own node.  Called with list_lock held. */
+/* Put @pg on page_list[] of its own node.  Called with list_lock held. */
 static void push_page(struct page *pg)
 {
 	int node = xen_unpopulated_clamp_node(page_to_nid(pg));
@@ -191,29 +202,85 @@ static void push_page(struct page *pg)
 }
 
 /*
+ * Put the 2 MiB block that starts at @head on block_list[] of its node.
+ * Called with list_lock held.
+ */
+static void push_block(struct page *head)
+{
+	int node = page_to_nid(head);
+
+	head->zone_device_data = block_list[node];
+	block_list[node] = head;
+	block_count[node]++;
+}
+
+/*
+ * Take a 2 MiB block off block_list[@node].  Returns its first page, or NULL
+ * when none is left.  Called with list_lock held.
+ */
+static struct page *pop_block(int node)
+{
+	struct page *head = block_list[node];
+
+	if (head) {
+		block_list[node] = head->zone_device_data;
+		block_count[node]--;
+	}
+	return head;
+}
+
+/*
+ * Take a page off page_list[@node], which a block refills when it is empty.
+ * Returns NULL when the pool is empty.
+ */
+static struct page *take_page(int node)
+{
+	struct page *pg;
+	unsigned long pfn, i;
+
+	if (!page_list[node] && block_list[node]) {
+		pfn = page_to_pfn(pop_block(node));
+		for (i = 0; i < XEN_UNPOPULATED_BLOCK_PAGES; i++)
+			push_page(pfn_to_page(pfn + i));
+	}
+
+	pg = page_list[node];
+	if (pg) {
+		page_list[node] = pg->zone_device_data;
+		list_count[node]--;
+	}
+	return pg;
+}
+
+/* Free pages of @node, those in the blocks on block_list[] included. */
+static unsigned long pool_pages(int node)
+{
+	return list_count[node] +
+	       block_count[node] * XEN_UNPOPULATED_BLOCK_PAGES;
+}
+
+/*
  * Take @nr_pages from the pool of @node, or from any node's pool when @any is
  * set.  Called with list_lock held.  Never carves a new region.
  */
 static int pop_pages(unsigned int nr_pages, struct page **pages, int node,
 		     bool any)
 {
-	unsigned int i, total = 0;
+	unsigned long total = 0;
+	unsigned int i;
 
 	for (i = 0; i < MAX_NUMNODES; i++)
-		total += list_count[i];
-	if ((any ? total : list_count[node]) < nr_pages)
+		total += pool_pages(i);
+	if ((any ? total : pool_pages(node)) < nr_pages)
 		return -ENOMEM;
 
 	for (i = 0; i < nr_pages; i++) {
 		int src = node;
 		struct page *pg;
 
-		while (!page_list[src])
+		while (!(pg = take_page(src)))
 			src = (src + 1) % MAX_NUMNODES;
 
-		pg = page_list[src];
-		page_list[src] = pg->zone_device_data;
-		list_count[src]--;
 		pages[i] = pg;
 
 #ifdef CONFIG_XEN_HAVE_PVMMU
@@ -287,8 +354,9 @@ EXPORT_SYMBOL(xen_alloc_unpopulated_pages_node);
  */
 int xen_alloc_unpopulated_pages(unsigned int nr_pages, struct page **pages)
 {
-	unsigned int i, total = 0;
+	unsigned long total = 0;
 	int node = numa_node_id();
+	unsigned int i;
 	int ret;
 
 	if (!target_resource)
@@ -296,7 +364,7 @@ int xen_alloc_unpopulated_pages(unsigned int nr_pages, struct page **pages)
 
 	mutex_lock(&list_lock);
 	for (i = 0; i < MAX_NUMNODES; i++)
-		total += list_count[i];
+		total += pool_pages(i);
 	ret = 0;
 	if (total < nr_pages)
 		ret = fill_list(nr_pages - total, node);
@@ -333,6 +401,44 @@ void xen_free_unpopulated_pages(unsigned int nr_pages, struct page **pages)
 	mutex_unlock(&list_lock);
 }
 EXPORT_SYMBOL(xen_free_unpopulated_pages);
+
+/**
+ * xen_unpopulated_add_range - hand over boot-time unbacked address space
+ * @start_pfn: first pfn of the range
+ * @nr_pages: number of pages in the range
+ *
+ * The pages must have a struct page and nothing behind them, as the extra
+ * memory regions of a Xen guest do.  Each aligned 2 MiB block goes on
+ * block_list[] of its node, and the other pages on page_list[].
+ */
+void __init xen_unpopulated_add_range(unsigned long start_pfn,
+				      unsigned long nr_pages)
+{
+	unsigned long pfn = start_pfn, end_pfn = start_pfn + nr_pages, last;
+	struct page *pg;
+
+	mutex_lock(&list_lock);
+	while (pfn < end_pfn) {
+		pg = pfn_to_page(pfn);
+		last = pfn + XEN_UNPOPULATED_BLOCK_PAGES - 1;
+
+		/*
+		 * As with __pageblock_pfn_to_page we assume no A B A
+		 * alternations of numa node assignments within a block, thus
+		 * check only the first and last entries.
+		 */
+		if (IS_ALIGNED(pfn, XEN_UNPOPULATED_BLOCK_PAGES) &&
+		    last < end_pfn &&
+		    page_to_nid(pg) == page_to_nid(pfn_to_page(last))) {
+			push_block(pg);
+			pfn += XEN_UNPOPULATED_BLOCK_PAGES;
+		} else {
+			push_page(pg);
+			pfn++;
+		}
+	}
+	mutex_unlock(&list_lock);
+}
 
 static int __init unpopulated_init(void)
 {
