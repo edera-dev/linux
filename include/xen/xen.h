@@ -78,6 +78,8 @@ int xen_alloc_unpopulated_pages_node(unsigned int nr_pages, struct page **pages,
 int xen_alloc_unpopulated_pages(unsigned int nr_pages, struct page **pages);
 void xen_free_unpopulated_pages(unsigned int nr_pages, struct page **pages);
 void xen_unpopulated_add_range(unsigned long start_pfn, unsigned long nr_pages);
+unsigned int xen_alloc_unpopulated_blocks(struct page **heads,
+					  unsigned int nr_blocks);
 #include <linux/ioport.h>
 int arch_xen_unpopulated_init(struct resource **res);
 #else
@@ -97,6 +99,11 @@ static inline void xen_free_unpopulated_pages(unsigned int nr_pages,
 		struct page **pages)
 {
 	xen_free_ballooned_pages(nr_pages, pages);
+}
+static inline unsigned int xen_alloc_unpopulated_blocks(struct page **heads,
+		unsigned int nr_blocks)
+{
+	return 0;
 }
 #endif
 
