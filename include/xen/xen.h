@@ -68,12 +68,16 @@ bool xen_biovec_phys_mergeable(const struct bio_vec *vec1,
 extern u64 xen_saved_max_mem_size;
 #endif
 
+/* Pages in a 2 MiB block of unbacked address space, one order-9 Xen extent. */
+#define XEN_UNPOPULATED_BLOCK_PAGES	(1UL << (21 - PAGE_SHIFT))
+
 #ifdef CONFIG_XEN_UNPOPULATED_ALLOC
 extern unsigned long xen_unpopulated_pages;
 int xen_alloc_unpopulated_pages_node(unsigned int nr_pages, struct page **pages,
 				     int node);
 int xen_alloc_unpopulated_pages(unsigned int nr_pages, struct page **pages);
 void xen_free_unpopulated_pages(unsigned int nr_pages, struct page **pages);
+void xen_unpopulated_add_range(unsigned long start_pfn, unsigned long nr_pages);
 #include <linux/ioport.h>
 int arch_xen_unpopulated_init(struct resource **res);
 #else
