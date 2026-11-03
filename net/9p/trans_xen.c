@@ -708,8 +708,8 @@ static int xen_9pfs_front_alloc_dataring(struct xenbus_device *dev,
 		goto out;
 	}
 	for (; i < (1 << order); i++) {
-		ret = gnttab_grant_foreign_access(
-				dev->otherend_id, virt_to_gfn(bytes) + i, 0);
+		ret = gnttab_grant_foreign_access(dev->otherend_id,
+				virt_to_gfn(bytes + i * XEN_PAGE_SIZE), 0);
 		if (ret < 0)
 			goto out;
 		ring->intf->ref[i] = ret;
