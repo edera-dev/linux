@@ -1,0 +1,36 @@
+name: Linear autotrack
+
+# Files a Linear issue in Core Eng (COR) for a pull request opened without one, and
+# moves it to Done when the pull request merges. Putting any Linear issue key
+# in the branch name, title or description skips it.
+#
+# Needs the LINEAR_API_KEY secret. Without it the job warns and does nothing.
+
+on:
+  pull_request:
+    types: [opened, reopened, ready_for_review, closed]
+
+permissions: {}
+
+concurrency:
+  group: linear-autotrack-${{ github.event.pull_request.number }}
+  cancel-in-progress: false
+
+jobs:
+  autotrack:
+    # A fork's pull request gets no secrets. Bot pull requests (rebases,
+    # backports, dependency bumps) are not tracked.
+    if: >-
+      github.event.pull_request.head.repo.full_name == github.repository
+      && github.event.pull_request.user.type != 'Bot'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      pull-requests: write
+      issues: read
+    steps:
+      - uses: edera-dev/actions/linear-autotrack@4284f52d8169e8ece1e3709f8bd488549b8a2d6c
+        with:
+          team: COR
+          linear-api-key: ${{ secrets.LINEAR_API_KEY }}
