@@ -1104,6 +1104,7 @@ static long gntdev_ioctl_grant_copy(struct gntdev_priv *priv, void __user *u)
 
 	batch->nr_ops = 0;
 	batch->nr_pages = 0;
+	batch->writeable = false;
 
 	for (i = 0; i < copy.count; i++) {
 		struct gntdev_grant_copy_segment seg;
