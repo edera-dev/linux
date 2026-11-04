@@ -467,7 +467,7 @@ static unsigned long spare_blocks(int node)
 }
 
 /**
- * xen_alloc_unpopulated_blocks - take 2 MiB blocks for dom0's balloon
+ * xen_alloc_unpopulated_blocks - take 2 MiB blocks for the balloon
  * @heads: first page of each block taken
  * @nr_blocks: number of blocks wanted
  *
@@ -478,16 +478,51 @@ static unsigned long spare_blocks(int node)
  *
  * Returns the number of blocks taken, which may be less than @nr_blocks.
  */
-unsigned int xen_alloc_unpopulated_blocks(struct page **heads,
-					  unsigned int nr_blocks)
+static unsigned int pop_spare_blocks(struct page **heads,
+				     unsigned int nr_blocks)
 {
 	unsigned int nr = 0;
 	int node;
 
-	mutex_lock(&list_lock);
+	lockdep_assert_held(&list_lock);
 	for (node = 0; node < MAX_NUMNODES; node++)
 		while (nr < nr_blocks && spare_blocks(node))
 			heads[nr++] = pop_block(node);
+
+	return nr;
+}
+
+unsigned int xen_alloc_unpopulated_blocks(struct page **heads,
+					  unsigned int nr_blocks)
+{
+	unsigned int nr;
+
+	mutex_lock(&list_lock);
+	nr = pop_spare_blocks(heads, nr_blocks);
+	mutex_unlock(&list_lock);
+
+	return nr;
+}
+
+/**
+ * xen_try_alloc_unpopulated_blocks - xen_alloc_unpopulated_blocks() for the
+ * OOM path
+ * @heads: first page of each block taken
+ * @nr_blocks: number of blocks wanted
+ *
+ * The allocator allocates memory with its lock held, so a caller that may be
+ * reclaiming for that allocation must not wait for the lock.
+ *
+ * Returns the number of blocks taken, 0 if the lock is held.
+ */
+unsigned int xen_try_alloc_unpopulated_blocks(struct page **heads,
+					      unsigned int nr_blocks)
+{
+	unsigned int nr;
+
+	if (!mutex_trylock(&list_lock))
+		return 0;
+	nr = pop_spare_blocks(heads, nr_blocks);
 	mutex_unlock(&list_lock);
 
 	return nr;
