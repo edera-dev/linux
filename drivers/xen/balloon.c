@@ -1044,6 +1044,7 @@ static int balloon_oom_notify(struct notifier_block *nb, unsigned long dummy,
 {
 	unsigned long *freed = parm;
 	unsigned long before, nr;
+	struct page *head;
 
 	/*
 	 * The balloon worker (or an inflate) may hold balloon_mutex and could
@@ -1056,6 +1057,18 @@ static int balloon_oom_notify(struct notifier_block *nb, unsigned long dummy,
 	/* nr: number of pages parked on the balloon that we can reclaim */
 	nr = balloon_stats.balloon_low + balloon_stats.balloon_high +
 	     balloon_stats.balloon_blocks * BALLOON_BLOCK_NR_PAGES;
+
+	/*
+	 * A domU built below its maximum hands the rest of its physmap to the
+	 * unpopulated allocator at boot, so its balloon is empty until the
+	 * toolstack first resizes it. Grow into a block of that space, as
+	 * dom0's balloon does.
+	 */
+	if (!nr && xen_try_alloc_unpopulated_blocks(&head, 1)) {
+		balloon_append_block(head);
+		balloon_stats.total_pages += BALLOON_BLOCK_NR_PAGES;
+		nr = BALLOON_BLOCK_NR_PAGES;
+	}
 
 	/* clamp, so we don't release all of them at once */
 	nr = min_t(unsigned long, nr, BALLOON_OOM_DEFLATE_BATCH);
