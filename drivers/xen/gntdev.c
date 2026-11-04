@@ -793,15 +793,35 @@ static long gntdev_ioctl_map_grant_ref(struct gntdev_priv *priv,
 	mutex_lock(&priv->lock);
 	gntdev_add_map(priv, map);
 	op.index = map->index << PAGE_SHIFT;
+	/* The list holds one reference; this one lasts until the copy is done. */
+	refcount_inc(&map->users);
+	mutex_unlock(&priv->lock);
 
+	/*
+	 * Not under priv->lock: a fault here takes mmap_lock, and
+	 * gntdev_mmap() runs with mmap_lock held and takes priv->lock.
+	 */
 	if (copy_to_user(u, &op, sizeof(op)) != 0) {
-		list_del(&map->next);
+		struct gntdev_grant_map *m;
+		bool listed = false;
+
+		/* An unmap ioctl may already have taken it off the list. */
+		mutex_lock(&priv->lock);
+		list_for_each_entry(m, &priv->maps, next) {
+			if (m == map) {
+				list_del(&map->next);
+				listed = true;
+				break;
+			}
+		}
 		mutex_unlock(&priv->lock);
+		if (listed)
+			gntdev_put_map(priv, map);
 		gntdev_put_map(priv, map);
 		return -EFAULT;
 	}
 
-	mutex_unlock(&priv->lock);
+	gntdev_put_map(priv, map);
 	return 0;
 }
 
