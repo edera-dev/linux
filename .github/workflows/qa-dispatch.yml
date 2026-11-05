@@ -1,0 +1,53 @@
+name: QA dispatch
+
+# Hands each pull request to the QA runner in edera-dev/linux-qa, which
+# builds the change's kernels, boots them under Xen and reports the result
+# back as the `linux-qa` commit status. Advisory, and not a required check.
+#
+# Only pull requests from branches in this repository are handed over, since
+# fork pull requests get no secrets. Without the LXQA_DISPATCH_TOKEN secret
+# (a token that may send repository_dispatch to edera-dev/linux-qa) this does
+# nothing.
+
+on:
+  pull_request:
+    types: [opened, synchronize, ready_for_review]
+    branches: ['edera/**']
+
+permissions:
+  contents: read
+
+concurrency:
+  group: qa-dispatch-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  dispatch:
+    if: github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Harden runner
+        uses: step-security/harden-runner@05e31511f85b41b11d1cf0ef85d0992719546e2c # v2.21.0
+        with:
+          egress-policy: audit
+
+      - name: Dispatch
+        env:
+          GH_TOKEN: ${{ secrets.LXQA_DISPATCH_TOKEN }}
+          PR: ${{ github.event.pull_request.number }}
+          HEAD: ${{ github.event.pull_request.head.sha }}
+          BASE: ${{ github.event.pull_request.base.sha }}
+          BASE_REF: ${{ github.event.pull_request.base.ref }}
+        run: |
+          set -euo pipefail
+          if [ -z "$GH_TOKEN" ]; then
+            echo "LXQA_DISPATCH_TOKEN is not set; nothing dispatched."
+            exit 0
+          fi
+          gh api repos/edera-dev/linux-qa/dispatches \
+            -f event_type=linux-pr \
+            -f "client_payload[pr]=$PR" \
+            -f "client_payload[head]=$HEAD" \
+            -f "client_payload[base]=$BASE" \
+            -f "client_payload[base_ref]=$BASE_REF"
