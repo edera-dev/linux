@@ -150,12 +150,12 @@ static void pcistub_device_release(struct kref *kref)
 	/* Disable the device */
 	xen_pcibk_reset_device(dev);
 
-	kfree(dev_data);
-	pci_set_drvdata(dev, NULL);
-
-	/* Clean-up the device */
+	/* Clean-up the device. Both find the fields through drvdata. */
 	xen_pcibk_config_free_dyn_fields(dev);
 	xen_pcibk_config_free_dev(dev);
+
+	kfree(dev_data);
+	pci_set_drvdata(dev, NULL);
 
 	pci_clear_dev_assigned(dev);
 	pci_dev_put(dev);
