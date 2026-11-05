@@ -1239,7 +1239,13 @@ NOKPROBE_SYMBOL(openpax_fault_is_trampoline);
 static inline
 bool openpax_emulate_trampoline_32(struct pt_regs *regs)
 {
+	unsigned long ip = regs->ip;
+	unsigned int endbr;
 	int err;
+
+	/* With -fcf-protection, gcc starts its trampolines with endbr32. */
+	if (!get_user(endbr, (unsigned int __user *) ip) && endbr == 0xFB1E0FF3)
+		ip += 4;
 
 	/* libffi trampoline type 1, gcc trampoline type 2 */
 	do {
@@ -1247,14 +1253,14 @@ bool openpax_emulate_trampoline_32(struct pt_regs *regs)
 		unsigned int addr1, addr2;
 
 #ifdef CONFIG_X86_64
-		if ((regs->ip + 9) >> 32)
+		if ((ip + 9) >> 32)
 			break;
 #endif
 
-		err = get_user(mov, (unsigned char __user *) regs->ip);
-		err |= get_user(addr1, (unsigned int __user *) (regs->ip + 1));
-		err |= get_user(jmp, (unsigned char __user *) (regs->ip + 5));
-		err |= get_user(addr2, (unsigned int __user *) (regs->ip + 6));
+		err = get_user(mov, (unsigned char __user *) ip);
+		err |= get_user(addr1, (unsigned int __user *) (ip + 1));
+		err |= get_user(jmp, (unsigned char __user *) (ip + 5));
+		err |= get_user(addr2, (unsigned int __user *) (ip + 6));
 
 		if (err)
 			break;
@@ -1265,7 +1271,7 @@ bool openpax_emulate_trampoline_32(struct pt_regs *regs)
 			else
 				regs->cx = addr1;
 
-			regs->ip = (unsigned int)(regs->ip + addr2 + 10);
+			regs->ip = (unsigned int)(ip + addr2 + 10);
 			return true;
 		}
 	} while (0);
@@ -1277,15 +1283,15 @@ bool openpax_emulate_trampoline_32(struct pt_regs *regs)
 		unsigned int addr1, addr2;
 
 #ifdef CONFIG_X86_64
-		if ((regs->ip + 11) >> 32)
+		if ((ip + 11) >> 32)
 			break;
 #endif
 
-		err = get_user(mov1, (unsigned char __user *) regs->ip);
-		err |= get_user(addr1, (unsigned int __user *) (regs->ip + 1));
-		err |= get_user(mov2, (unsigned char __user *) (regs->ip + 5));
-		err |= get_user(addr2, (unsigned int __user *) (regs->ip + 6));
-		err |= get_user(jmp, (unsigned short __user *) (regs->ip + 10));
+		err = get_user(mov1, (unsigned char __user *) ip);
+		err |= get_user(addr1, (unsigned int __user *) (ip + 1));
+		err |= get_user(mov2, (unsigned char __user *) (ip + 5));
+		err |= get_user(addr2, (unsigned int __user *) (ip + 6));
+		err |= get_user(jmp, (unsigned short __user *) (ip + 10));
 
 		if (err)
 			break;
@@ -1306,7 +1312,16 @@ NOKPROBE_SYMBOL(openpax_emulate_trampoline_32);
 static inline
 bool openpax_emulate_trampoline_64(struct pt_regs *regs)
 {
+	unsigned long ip = regs->ip;
+	unsigned int endbr;
 	int err;
+
+	/*
+	 * gcc built with -fcf-protection, the default on Ubuntu and Fedora,
+	 * starts its trampolines with endbr64.
+	 */
+	if (!get_user(endbr, (unsigned int __user *) ip) && endbr == 0xFA1E0FF3)
+		ip += 4;
 
 	/* libffi trampoline type 1 */
 	do {
@@ -1314,13 +1329,13 @@ bool openpax_emulate_trampoline_64(struct pt_regs *regs)
 		unsigned char stcclc, jmp2;
 		unsigned long addr1, addr2;
 
-		err = get_user(mov1, (unsigned short __user *) regs->ip);
-		err |= get_user(addr1, (unsigned long __user *) (regs->ip + 2));
-		err |= get_user(mov2, (unsigned short __user *) (regs->ip + 10));
-		err |= get_user(addr2, (unsigned long __user *) (regs->ip + 12));
-		err |= get_user(stcclc, (unsigned char __user *) (regs->ip + 20));
-		err |= get_user(jmp1, (unsigned short __user *) (regs->ip + 21));
-		err |= get_user(jmp2, (unsigned char __user *) (regs->ip + 23));
+		err = get_user(mov1, (unsigned short __user *) ip);
+		err |= get_user(addr1, (unsigned long __user *) (ip + 2));
+		err |= get_user(mov2, (unsigned short __user *) (ip + 10));
+		err |= get_user(addr2, (unsigned long __user *) (ip + 12));
+		err |= get_user(stcclc, (unsigned char __user *) (ip + 20));
+		err |= get_user(jmp1, (unsigned short __user *) (ip + 21));
+		err |= get_user(jmp2, (unsigned char __user *) (ip + 23));
 
 		if (err)
 			break;
@@ -1346,12 +1361,12 @@ bool openpax_emulate_trampoline_64(struct pt_regs *regs)
 		unsigned int addr1;
 		unsigned long addr2;
 
-		err = get_user(mov1, (unsigned short __user *) regs->ip);
-		err |= get_user(addr1, (unsigned int __user *) (regs->ip + 2));
-		err |= get_user(mov2, (unsigned short __user *) (regs->ip + 6));
-		err |= get_user(addr2, (unsigned long __user *) (regs->ip + 8));
-		err |= get_user(jmp1, (unsigned short __user *) (regs->ip + 16));
-		err |= get_user(jmp2, (unsigned char __user *) (regs->ip + 18));
+		err = get_user(mov1, (unsigned short __user *) ip);
+		err |= get_user(addr1, (unsigned int __user *) (ip + 2));
+		err |= get_user(mov2, (unsigned short __user *) (ip + 6));
+		err |= get_user(addr2, (unsigned long __user *) (ip + 8));
+		err |= get_user(jmp1, (unsigned short __user *) (ip + 16));
+		err |= get_user(jmp2, (unsigned char __user *) (ip + 18));
 
 		if (err)
 			break;
@@ -1370,12 +1385,12 @@ bool openpax_emulate_trampoline_64(struct pt_regs *regs)
 		unsigned char jmp2;
 		unsigned long addr1, addr2;
 
-		err = get_user(mov1, (unsigned short __user *) regs->ip);
-		err |= get_user(addr1, (unsigned long __user *) (regs->ip + 2));
-		err |= get_user(mov2, (unsigned short __user *) (regs->ip + 10));
-		err |= get_user(addr2, (unsigned long __user *) (regs->ip + 12));
-		err |= get_user(jmp1, (unsigned short __user *) (regs->ip + 20));
-		err |= get_user(jmp2, (unsigned char __user *) (regs->ip + 22));
+		err = get_user(mov1, (unsigned short __user *) ip);
+		err |= get_user(addr1, (unsigned long __user *) (ip + 2));
+		err |= get_user(mov2, (unsigned short __user *) (ip + 10));
+		err |= get_user(addr2, (unsigned long __user *) (ip + 12));
+		err |= get_user(jmp1, (unsigned short __user *) (ip + 20));
+		err |= get_user(jmp2, (unsigned char __user *) (ip + 22));
 
 		if (err)
 			break;
