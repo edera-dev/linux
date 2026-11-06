@@ -1478,8 +1478,15 @@ static void xen_pgd_free(struct mm_struct *mm, pgd_t *pgd)
 {
 	pgd_t *user_pgd = xen_get_user_pgd(pgd);
 
-	if (user_pgd)
+	if (user_pgd) {
 		free_page((unsigned long)user_pgd);
+		/*
+		 * page->private shares its slot with ptdesc->ptl, which
+		 * pagetable_dtor() frees when split ptlocks are allocated
+		 * separately (lock debugging, PREEMPT_RT).
+		 */
+		set_page_private(virt_to_page(pgd), 0);
+	}
 }
 
 /*
