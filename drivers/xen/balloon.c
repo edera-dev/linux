@@ -41,6 +41,7 @@
 #include <linux/cpu.h>
 #include <linux/kernel.h>
 #include <linux/sched.h>
+#include <linux/sched/mm.h>
 #include <linux/cred.h>
 #include <linux/errno.h>
 #include <linux/freezer.h>
@@ -1079,8 +1080,24 @@ static int balloon_oom_notify(struct notifier_block *nb, unsigned long dummy,
 	before = balloon_stats.current_pages;
 
 	/* runs XENMEM_populate_physmap, updates current_pages */
-	if (nr > 0)
+	if (nr > 0) {
+		unsigned int noreclaim_flag;
+
+		/*
+		 * out_of_memory() calls us with oom_lock held.  On PV,
+		 * populating a page whose p2m leaf is still the shared missing
+		 * page allocates the leaf with GFP_KERNEL; with reclaim already
+		 * beaten, that allocation would try the OOM killer, find
+		 * oom_lock taken, count that as progress and retry forever,
+		 * and the OOM killer would never run.  Run the deflate as a
+		 * memory-freeing context: no reclaim, no OOM, and the reserves
+		 * may be dipped into, which a leaf that lets 512 pages come
+		 * back repays at once.
+		 */
+		noreclaim_flag = memalloc_noreclaim_save();
 		balloon_deflate(nr);
+		memalloc_noreclaim_restore(noreclaim_flag);
+	}
 
 	/*
 	 * balloon_deflate() bumped current_pages by however many Xen
