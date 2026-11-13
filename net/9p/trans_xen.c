@@ -61,6 +61,10 @@ struct xen_9pfs_dataring {
 
 	struct xen_9pfs_data_intf *intf;
 	grant_ref_t ref;
+	/* The data pages' grant refs, as granted.  intf->ref[] holds the
+	 * backend's copy and the backend can rewrite it.
+	 */
+	grant_ref_t data_refs[1 << XEN_9PFS_RING_ORDER];
 	int evtchn;
 	int irq;
 	/* protect a ring from concurrent accesses */
@@ -423,16 +427,15 @@ static void xen_9pfs_front_free_rings(struct xen_9pfs_front_priv *priv)
 		if (priv->rings[i].irq > 0)
 			unbind_from_irqhandler(priv->rings[i].irq, ring);
 		if (priv->rings[i].data.in) {
-			for (j = 0;
-			     j < (1 << priv->rings[i].intf->ring_order);
-			     j++) {
-				grant_ref_t ref;
-
-				ref = priv->rings[i].intf->ref[j];
-				gnttab_end_foreign_access(ref, NULL);
-			}
+			/* Not from the intf page: a backend that is still
+			 * running, as it is on resume, can have rewritten
+			 * ring_order and ref[] there.
+			 */
+			for (j = 0; j < (1 << priv->ring_order); j++)
+				gnttab_end_foreign_access(ring->data_refs[j],
+							  NULL);
 			free_pages_exact(priv->rings[i].data.in,
-			   1UL << (priv->rings[i].intf->ring_order +
+			   1UL << (priv->ring_order +
 				   XEN_PAGE_SHIFT));
 		}
 		gnttab_end_foreign_access(priv->rings[i].ref, NULL);
@@ -734,6 +737,7 @@ static int xen_9pfs_front_alloc_dataring(struct xenbus_device *dev,
 				virt_to_gfn(bytes + i * XEN_PAGE_SIZE), 0);
 		if (ret < 0)
 			goto out;
+		ring->data_refs[i] = ret;
 		ring->intf->ref[i] = ret;
 	}
 	ring->intf->ring_order = order;
@@ -754,7 +758,7 @@ static int xen_9pfs_front_alloc_dataring(struct xenbus_device *dev,
 out:
 	if (bytes) {
 		for (i--; i >= 0; i--)
-			gnttab_end_foreign_access(ring->intf->ref[i], NULL);
+			gnttab_end_foreign_access(ring->data_refs[i], NULL);
 		free_pages_exact(bytes, 1UL << (order + XEN_PAGE_SHIFT));
 	}
 	gnttab_end_foreign_access(ring->ref, NULL);
