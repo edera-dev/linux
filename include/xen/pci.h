@@ -8,7 +8,8 @@
 
 struct pci_dev;
 
-#if defined(CONFIG_XEN_PCIDEV_FRONTEND)
+/* Called from built-in code, so a modular pcifront is as good as none. */
+#if IS_BUILTIN(CONFIG_XEN_PCIDEV_FRONTEND)
 int pcifront_machine_sbdf(const struct pci_dev *dev, u32 *sbdf);
 #else
 static inline int pcifront_machine_sbdf(const struct pci_dev *dev, u32 *sbdf)
