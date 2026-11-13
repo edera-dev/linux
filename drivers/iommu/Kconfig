@@ -366,6 +366,8 @@ config VIRTIO_IOMMU
 config XEN_IOMMU
 	bool "Xen IOMMU driver"
 	depends on X86 && XEN
+	# Built-in, and asks pcifront for a device's machine BDF.
+	depends on XEN_PCIDEV_FRONTEND != m
 	select IOMMU_API
 	select IOMMU_IO_PGTABLE
 	help
