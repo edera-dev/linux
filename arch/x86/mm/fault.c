@@ -782,6 +782,13 @@ show_signal_msg(struct pt_regs *regs, unsigned long error_code,
 	show_opcodes(regs, loglvl);
 }
 
+#ifdef CONFIG_OPENPAX_EMUTRAMP
+static inline bool openpax_fault_is_trampoline(unsigned long error_code,
+					       struct pt_regs *regs,
+					       unsigned long address);
+static inline bool openpax_emulate_trampoline(struct pt_regs *regs);
+#endif
+
 static void
 __bad_area_nosemaphore(struct pt_regs *regs, unsigned long error_code,
 		       unsigned long address, u32 pkey, int si_code)
@@ -805,6 +812,19 @@ __bad_area_nosemaphore(struct pt_regs *regs, unsigned long error_code,
 	 * It's possible to have interrupts off here:
 	 */
 	local_irq_enable();
+
+#ifdef CONFIG_OPENPAX_EMUTRAMP
+	/*
+	 * A trampoline in non-executable memory is an instruction fetch the
+	 * task's mappings do not permit, so it is only here, with the fault
+	 * otherwise about to become SIGSEGV, that one can be emulated.  A
+	 * fetch from executable memory that merely needs its page brought
+	 * in is resolved as an ordinary fault above and never reaches this.
+	 */
+	if (openpax_fault_is_trampoline(error_code, regs, address) &&
+	    openpax_emulate_trampoline(regs))
+		return;
+#endif
 
 	/*
 	 * Valid to do another page fault here because this one came
@@ -1550,13 +1570,6 @@ void do_user_addr_fault(struct pt_regs *regs,
 	 */
 	if (is_vsyscall_vaddr(address)) {
 		if (emulate_vsyscall_pf(error_code, regs, address))
-			return;
-	}
-#endif
-
-#ifdef CONFIG_OPENPAX_EMUTRAMP
-	if (openpax_fault_is_trampoline(error_code, regs, address)) {
-		if (openpax_emulate_trampoline(regs))
 			return;
 	}
 #endif
