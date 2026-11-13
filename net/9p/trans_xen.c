@@ -567,8 +567,19 @@ static int xen_9pfs_front_ctl(struct xen_9pfs_front_priv *priv,
 	reply_len = priv->ctl_reply_len;
 	if (reply_len < P9_HDRSZ || get_unaligned_le32(reply) != reply_len)
 		return -EPROTO;
-	if (reply[4] == P9_RLERROR && reply_len >= P9_HDRSZ + 4)
-		return -(int)get_unaligned_le32(reply + P9_HDRSZ);
+	if (reply[4] == P9_RLERROR) {
+		u32 ecode;
+
+		/* The backend chooses the ecode; only an errno may come back
+		 * from here, or a caller would take it for a reply length.
+		 */
+		if (reply_len < P9_HDRSZ + 4)
+			return -EPROTO;
+		ecode = get_unaligned_le32(reply + P9_HDRSZ);
+		if (!ecode || ecode > MAX_ERRNO)
+			return -EPROTO;
+		return -(int)ecode;
+	}
 	if (reply[4] != id || reply_len < P9_HDRSZ + body)
 		return -EPROTO;
 	return reply_len;
