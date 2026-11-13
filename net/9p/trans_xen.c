@@ -321,7 +321,7 @@ static void p9_xen_response(struct work_struct *work)
 		 * ring 0; see xen_9pfs_front_ctl().
 		 */
 		if (ring == priv->rings && h.tag == P9_NOTAG &&
-		    READ_ONCE(priv->ctl_pending)) {
+		    smp_load_acquire(&priv->ctl_pending)) {
 			if (h.size <= priv->ctl_reply_cap) {
 				u32 size = XEN_9PFS_RING_SIZE(ring);
 
@@ -561,7 +561,8 @@ static int xen_9pfs_front_ctl(struct xen_9pfs_front_priv *priv,
 	priv->ctl_reply = reply;
 	priv->ctl_reply_cap = cap;
 	priv->ctl_reply_len = 0;
-	WRITE_ONCE(priv->ctl_pending, true);
+	/* Publish the buffer before the flag the response worker tests. */
+	smp_store_release(&priv->ctl_pending, true);
 
 	spin_lock_irqsave(&ring->lock, flags);
 	cons = ring->intf->out_cons;
