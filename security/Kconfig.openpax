@@ -76,7 +76,7 @@ config OPENPAX_EMUTRAMP
 config OPENPAX_EMUTRAMP_DEFAULT
 	bool "Enable trampoline emulation by default"
 	depends on OPENPAX_EMUTRAMP
-	default y
+	default n
 	help
 	  Enabling this option allows programs which require
 	  trampolines to be emulated to continue working by default.
@@ -84,7 +84,12 @@ config OPENPAX_EMUTRAMP_DEFAULT
 	  Otherwise, the emulation flag must be enabled in a binary's
 	  PaX marking, e.g. with paxmark -E <binary>.
 
-	  If you do not say 'y' here, you will have to manually mark
-	  all programs which require trampoline emulation.
+	  Trampoline emulation lets a task load fixed values into two
+	  registers and jump to an arbitrary address from any readable
+	  memory, without that memory being executable.  Enabling it
+	  for every program weakens PAGEEXEC and MPROTECT for all of
+	  them, so prefer marking only the programs which need it.
+
+	  If unsure, say 'n'.
 
 endmenu
