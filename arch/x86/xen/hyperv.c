@@ -424,6 +424,7 @@ struct irq_domain *hyperv_xen_vpci_root_domain(void)
 		pr_err("Xen: can't bind the Hyper-V vPCI VIRQ: %d\n", ret);
 		irq_domain_remove(xen_hv_vpci_domain);
 		xen_hv_vpci_domain = NULL;
+		irq_domain_free_fwnode(fn);
 		return NULL;
 	}
 
