@@ -384,6 +384,16 @@ static int gntdev_relocate_map(struct gntdev_grant_map *map)
 	}
 	err = gnttab_unmap_refs(map->unmap_ops, map->kunmap_ops, map->pages,
 				map->count);
+	/*
+	 * A successful hypercall only says the batch was processed; each op
+	 * reports its own fate, and a refused one leaves its grant mapped.
+	 */
+	for (i = 0; !err && i < map->count; i++) {
+		if (map->unmap_ops[i].status != GNTST_okay ||
+		    (map->kunmap_ops &&
+		     map->kunmap_ops[i].status != GNTST_okay))
+			err = -EIO;
+	}
 	if (err) {
 		/*
 		 * The old placeholders may still carry live foreign
