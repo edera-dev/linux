@@ -607,14 +607,17 @@ static int xen_9pfs_front_suspend(struct xenbus_device *dev)
 
 	if (!priv)
 		return 0;
-	xen_9pfs_front_session_free(priv);
 	if (!xenbus_read_unsigned(dev->otherend, "feature-session-transfer", 0))
 		return 0;
 
 	down_read(&priv->rings_sem);
 	client = priv->client;
+	/* A frontend the backend has not reconnected since the last suspend
+	 * has nothing newer to save: keep what that suspend saved.
+	 */
 	if (!READ_ONCE(priv->connected) || !client)
 		goto out;
+	xen_9pfs_front_session_free(priv);
 	priv->session_client = client;
 	priv->session_msize = client->msize;
 
