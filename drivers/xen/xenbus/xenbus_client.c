@@ -67,6 +67,10 @@ struct xenbus_map_node {
 			struct page *pages[XENBUS_MAX_RING_PAGES];
 			unsigned long addrs[XENBUS_MAX_RING_GRANTS];
 			void *addr;
+			/* Host node of the foreign frames; NUMA_NO_NODE if Xen
+			 * did not say.
+			 */
+			int host_node;
 		} hvm;
 	};
 	grant_handle_t handles[XENBUS_MAX_RING_GRANTS];
@@ -868,6 +872,7 @@ static int xenbus_map_ring_hvm(struct xenbus_device *dev,
 	}
 
 	node->hvm.addr = addr;
+	node->hvm.host_node = host_node;
 
 	spin_lock(&xenbus_valloc_lock);
 	list_add(&node->next, &xenbus_valloc_pages);
@@ -912,24 +917,32 @@ EXPORT_SYMBOL_GPL(xenbus_unmap_ring_vfree);
 
 int xenbus_ring_host_node(struct xenbus_device *dev, void *vaddr)
 {
-	struct page *page;
+	struct xenbus_map_node *node;
+	int host_node = NUMA_NO_NODE;
 
 	/*
 	 * PV mappings install foreign MFNs directly in the PTEs and have
-	 * no struct page in dom0's mem_map for the foreign frame.  PVH
-	 * dom0 keeps a placeholder struct page (allocated from the
-	 * matching per-node pool of xen_alloc_unpopulated_pages_node)
-	 * whose page_to_nid() reports the host node of the foreign frame
-	 * by construction.
+	 * no struct page in dom0's mem_map for the foreign frame.  An HVM
+	 * mapping records the node Xen reported for the frame when it was
+	 * mapped.  Its placeholder pages' own node is no substitute: when
+	 * Xen did not say (a driver domain, a hypervisor without the query,
+	 * a kernel without CONFIG_XEN_BACKEND_NUMA_AFFINITY), they come from
+	 * the pool of whichever CPU xenwatch happened to run on, and every
+	 * ring would report that one node.
 	 */
 	if (xen_pv_domain())
 		return NUMA_NO_NODE;
 
-	page = vmalloc_to_page(vaddr);
-	if (!page)
-		return NUMA_NO_NODE;
+	spin_lock(&xenbus_valloc_lock);
+	list_for_each_entry(node, &xenbus_valloc_pages, next) {
+		if (node->hvm.addr == vaddr) {
+			host_node = node->hvm.host_node;
+			break;
+		}
+	}
+	spin_unlock(&xenbus_valloc_lock);
 
-	return page_to_nid(page);
+	return host_node;
 }
 EXPORT_SYMBOL_GPL(xenbus_ring_host_node);
 
