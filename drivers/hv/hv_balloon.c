@@ -1932,6 +1932,22 @@ static int balloon_probe(struct hv_device *dev,
 {
 	int ret;
 
+	/*
+	 * A Xen PV dom0 nested under Hyper-V does not own the machine memory
+	 * it runs on; Xen does.  Every page range this driver would hand the
+	 * L0 host (balloon, free-page report, hot-add) is a dom0
+	 * pseudo-physical range, which L0 reads as a range of Xen machine
+	 * frames: a balloon request would have the host reclaim Xen's own or
+	 * another domain's memory, and a hot-add would add a range dom0's
+	 * physmap does not back.  Dynamic memory for the L1 VM is Xen's to
+	 * manage, so leave the device unbound.
+	 */
+	if (hyperv_nested_on_xen) {
+		dev_info(&dev->device,
+			 "dynamic memory is not supported on a Xen PV dom0 nested under Hyper-V\n");
+		return -ENODEV;
+	}
+
 	allow_hibernation = hv_is_hibernation_supported();
 	if (allow_hibernation)
 		hot_add = false;
