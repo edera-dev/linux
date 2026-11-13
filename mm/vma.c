@@ -3024,6 +3024,20 @@ int do_brk_flags(struct vma_iterator *vmi, struct vm_area_struct *vma,
 	vma_flags_set(&vma_flags, VMA_ACCOUNT_BIT);
 	vma_flags_set_mask(&vma_flags, mm->def_vma_flags);
 
+#ifdef CONFIG_OPENPAX_MPROTECT
+	/*
+	 * Under MPROTECT the brk area is never executable.  Its only routes
+	 * to VM_EXEC are READ_IMPLIES_EXEC, which personality(2) lets any
+	 * task set for itself, and the ELF loader's vm_brk_flags() for the
+	 * bss of an executable segment.  Every other path refuses the
+	 * resulting writable and executable mapping in map_deny_write_exec();
+	 * strip the execute bits here rather than fail, as PaX did, so brk(2)
+	 * keeps working for such tasks.
+	 */
+	if (test_bit(PAXF_MPROTECT, &mm->pax_flags))
+		vma_flags_clear(&vma_flags, VMA_EXEC_BIT, VMA_MAYEXEC_BIT);
+#endif
+
 	vma_flags = ksm_vma_flags(mm, NULL, vma_flags);
 	if (!may_expand_vm(mm, &vma_flags, len >> PAGE_SHIFT))
 		return -ENOMEM;
