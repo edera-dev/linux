@@ -90,6 +90,12 @@ struct xen_9pfs_front_priv {
 	 * they survive into a restored or forked domain.
 	 */
 	struct list_head session;
+	/* The client whose fids those are, and its msize.  The restore only
+	 * compares the pointer: nothing keeps the client alive until then, and
+	 * if it was destroyed in between its fids are not wanted back.
+	 */
+	struct p9_client *session_client;
+	u32 session_msize;
 	/* A control request on ring 0, answered with tag P9_NOTAG. */
 	bool ctl_pending;
 	struct completion ctl_done;
@@ -627,6 +633,8 @@ static int xen_9pfs_front_suspend(struct xenbus_device *dev)
 	client = priv->client;
 	if (!READ_ONCE(priv->connected) || !client)
 		goto out;
+	priv->session_client = client;
+	priv->session_msize = client->msize;
 
 	/* Let what is in flight finish first, so that the saved fids match
 	 * what the guest has seen answered.
@@ -994,15 +1002,21 @@ static void xen_9pfs_front_changed(struct xenbus_device *dev,
 		}
 
 		/* Replay the fids saved at suspend before any request can use
-		 * them.
+		 * them.  Processes are running again by now, so the client
+		 * that owns them can be destroyed under us at any point, which
+		 * p9_xen_close() records by clearing priv->client: never
+		 * dereference it here, only compare it with the owner.
 		 */
 		down_read(&priv->rings_sem);
 		ret = 0;
 		flags = P9_XEN_SESSION_RESET;
-		if (!list_empty(&priv->session) && priv->client &&
+		if (!list_empty(&priv->session) &&
+		    READ_ONCE(priv->client) == priv->session_client &&
 		    xenbus_read_unsigned(dev->otherend,
 					 "feature-session-transfer", 0)) {
 			list_for_each_entry(chunk, &priv->session, list) {
+				if (READ_ONCE(priv->client) != priv->session_client)
+					break;
 				len = P9_HDRSZ + 8 + chunk->len;
 				req = kvmalloc(len, GFP_KERNEL);
 				if (!req) {
@@ -1012,7 +1026,7 @@ static void xen_9pfs_front_changed(struct xenbus_device *dev,
 				put_unaligned_le32(len, req);
 				req[4] = P9_XEN_TSESSION_RESTORE;
 				put_unaligned_le16(P9_NOTAG, req + 5);
-				put_unaligned_le32(priv->client->msize,
+				put_unaligned_le32(priv->session_msize,
 						   req + P9_HDRSZ);
 				put_unaligned_le32(flags, req + P9_HDRSZ + 4);
 				memcpy(req + P9_HDRSZ + 8, chunk->data,
