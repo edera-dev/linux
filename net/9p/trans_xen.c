@@ -61,6 +61,10 @@ struct xen_9pfs_dataring {
 
 	struct xen_9pfs_data_intf *intf;
 	grant_ref_t ref;
+	/* The data pages' grant refs, as granted.  intf->ref[] holds the
+	 * backend's copy and the backend can rewrite it.
+	 */
+	grant_ref_t data_refs[1 << XEN_9PFS_RING_ORDER];
 	int evtchn;
 	int irq;
 	/* protect a ring from concurrent accesses */
@@ -90,6 +94,12 @@ struct xen_9pfs_front_priv {
 	 * they survive into a restored or forked domain.
 	 */
 	struct list_head session;
+	/* The client whose fids those are, and its msize.  The restore only
+	 * compares the pointer: nothing keeps the client alive until then, and
+	 * if it was destroyed in between its fids are not wanted back.
+	 */
+	struct p9_client *session_client;
+	u32 session_msize;
 	/* A control request on ring 0, answered with tag P9_NOTAG. */
 	bool ctl_pending;
 	struct completion ctl_done;
@@ -311,7 +321,7 @@ static void p9_xen_response(struct work_struct *work)
 		 * ring 0; see xen_9pfs_front_ctl().
 		 */
 		if (ring == priv->rings && h.tag == P9_NOTAG &&
-		    READ_ONCE(priv->ctl_pending)) {
+		    smp_load_acquire(&priv->ctl_pending)) {
 			if (h.size <= priv->ctl_reply_cap) {
 				u32 size = XEN_9PFS_RING_SIZE(ring);
 
@@ -417,16 +427,15 @@ static void xen_9pfs_front_free_rings(struct xen_9pfs_front_priv *priv)
 		if (priv->rings[i].irq > 0)
 			unbind_from_irqhandler(priv->rings[i].irq, ring);
 		if (priv->rings[i].data.in) {
-			for (j = 0;
-			     j < (1 << priv->rings[i].intf->ring_order);
-			     j++) {
-				grant_ref_t ref;
-
-				ref = priv->rings[i].intf->ref[j];
-				gnttab_end_foreign_access(ref, NULL);
-			}
+			/* Not from the intf page: a backend that is still
+			 * running, as it is on resume, can have rewritten
+			 * ring_order and ref[] there.
+			 */
+			for (j = 0; j < (1 << priv->ring_order); j++)
+				gnttab_end_foreign_access(ring->data_refs[j],
+							  NULL);
 			free_pages_exact(priv->rings[i].data.in,
-			   1UL << (priv->rings[i].intf->ring_order +
+			   1UL << (priv->ring_order +
 				   XEN_PAGE_SHIFT));
 		}
 		gnttab_end_foreign_access(priv->rings[i].ref, NULL);
@@ -552,7 +561,8 @@ static int xen_9pfs_front_ctl(struct xen_9pfs_front_priv *priv,
 	priv->ctl_reply = reply;
 	priv->ctl_reply_cap = cap;
 	priv->ctl_reply_len = 0;
-	WRITE_ONCE(priv->ctl_pending, true);
+	/* Publish the buffer before the flag the response worker tests. */
+	smp_store_release(&priv->ctl_pending, true);
 
 	spin_lock_irqsave(&ring->lock, flags);
 	cons = ring->intf->out_cons;
@@ -585,8 +595,19 @@ static int xen_9pfs_front_ctl(struct xen_9pfs_front_priv *priv,
 	reply_len = priv->ctl_reply_len;
 	if (reply_len < P9_HDRSZ || get_unaligned_le32(reply) != reply_len)
 		return -EPROTO;
-	if (reply[4] == P9_RLERROR && reply_len >= P9_HDRSZ + 4)
-		return -(int)get_unaligned_le32(reply + P9_HDRSZ);
+	if (reply[4] == P9_RLERROR) {
+		u32 ecode;
+
+		/* The backend chooses the ecode; only an errno may come back
+		 * from here, or a caller would take it for a reply length.
+		 */
+		if (reply_len < P9_HDRSZ + 4)
+			return -EPROTO;
+		ecode = get_unaligned_le32(reply + P9_HDRSZ);
+		if (!ecode || ecode > MAX_ERRNO)
+			return -EPROTO;
+		return -(int)ecode;
+	}
 	if (reply[4] != id || reply_len < P9_HDRSZ + body)
 		return -EPROTO;
 	return reply_len;
@@ -608,14 +629,19 @@ static int xen_9pfs_front_suspend(struct xenbus_device *dev)
 
 	if (!priv)
 		return 0;
-	xen_9pfs_front_session_free(priv);
 	if (!xenbus_read_unsigned(dev->otherend, "feature-session-transfer", 0))
 		return 0;
 
 	down_read(&priv->rings_sem);
 	client = priv->client;
+	/* A frontend the backend has not reconnected since the last suspend
+	 * has nothing newer to save: keep what that suspend saved.
+	 */
 	if (!READ_ONCE(priv->connected) || !client)
 		goto out;
+	xen_9pfs_front_session_free(priv);
+	priv->session_client = client;
+	priv->session_msize = client->msize;
 
 	/* Let what is in flight finish first, so that the saved fids match
 	 * what the guest has seen answered.
@@ -712,6 +738,7 @@ static int xen_9pfs_front_alloc_dataring(struct xenbus_device *dev,
 				virt_to_gfn(bytes + i * XEN_PAGE_SIZE), 0);
 		if (ret < 0)
 			goto out;
+		ring->data_refs[i] = ret;
 		ring->intf->ref[i] = ret;
 	}
 	ring->intf->ring_order = order;
@@ -732,7 +759,7 @@ static int xen_9pfs_front_alloc_dataring(struct xenbus_device *dev,
 out:
 	if (bytes) {
 		for (i--; i >= 0; i--)
-			gnttab_end_foreign_access(ring->intf->ref[i], NULL);
+			gnttab_end_foreign_access(ring->data_refs[i], NULL);
 		free_pages_exact(bytes, 1UL << (order + XEN_PAGE_SHIFT));
 	}
 	gnttab_end_foreign_access(ring->ref, NULL);
@@ -983,15 +1010,21 @@ static void xen_9pfs_front_changed(struct xenbus_device *dev,
 		}
 
 		/* Replay the fids saved at suspend before any request can use
-		 * them.
+		 * them.  Processes are running again by now, so the client
+		 * that owns them can be destroyed under us at any point, which
+		 * p9_xen_close() records by clearing priv->client: never
+		 * dereference it here, only compare it with the owner.
 		 */
 		down_read(&priv->rings_sem);
 		ret = 0;
 		flags = P9_XEN_SESSION_RESET;
-		if (!list_empty(&priv->session) && priv->client &&
+		if (!list_empty(&priv->session) &&
+		    READ_ONCE(priv->client) == priv->session_client &&
 		    xenbus_read_unsigned(dev->otherend,
 					 "feature-session-transfer", 0)) {
 			list_for_each_entry(chunk, &priv->session, list) {
+				if (READ_ONCE(priv->client) != priv->session_client)
+					break;
 				len = P9_HDRSZ + 8 + chunk->len;
 				req = kvmalloc(len, GFP_KERNEL);
 				if (!req) {
@@ -1001,7 +1034,7 @@ static void xen_9pfs_front_changed(struct xenbus_device *dev,
 				put_unaligned_le32(len, req);
 				req[4] = P9_XEN_TSESSION_RESTORE;
 				put_unaligned_le16(P9_NOTAG, req + 5);
-				put_unaligned_le32(priv->client->msize,
+				put_unaligned_le32(priv->session_msize,
 						   req + P9_HDRSZ);
 				put_unaligned_le32(flags, req + P9_HDRSZ + 4);
 				memcpy(req + P9_HDRSZ + 8, chunk->data,
