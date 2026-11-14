@@ -568,7 +568,9 @@ static int iova_reserve_iommu_regions(struct device *dev,
 	 * are invented -- pcifront hands out iomem_resource itself, and a PVH
 	 * guest with no host bridge _CRS gets Linux's catch-all default. There
 	 * is nothing meaningful to reserve, and reserving it leaves no usable
-	 * IOVA space whatsoever.
+	 * IOVA space whatsoever. Dom0 sees the real host bridges and keeps the
+	 * reservation: without it an IOVA can land on a sibling's BAR, and a
+	 * fabric without ACS delivers the DMA there instead of to the IOMMU.
 	 */
 	if (dev_is_pci(dev) && !xen_iommu_manages_iova(dev)) {
 		ret = iova_reserve_pci_windows(to_pci_dev(dev), iovad);
