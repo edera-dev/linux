@@ -2795,8 +2795,12 @@ static int nvme_setup_io_queues(struct nvme_dev *dev)
 	result = nvme_setup_io_queues_trylock(dev);
 	if (result)
 		return result;
-	if (test_and_clear_bit(NVMEQ_ENABLED, &adminq->flags))
-		pci_free_irq(pdev, 0, adminq);
+	if (test_and_clear_bit(NVMEQ_ENABLED, &adminq->flags)) {
+		if (adminq->ebind.irq)
+			edera_nvme_unbind_queue(&adminq->ebind);
+		else
+			pci_free_irq(pdev, 0, adminq);
+	}
 
 	if (dev->cmb_use_sqes) {
 		result = nvme_cmb_qdepth(dev, nr_io_queues,
@@ -2823,8 +2827,12 @@ static int nvme_setup_io_queues(struct nvme_dev *dev)
 
  retry:
 	/* Deregister the admin queue's interrupt */
-	if (test_and_clear_bit(NVMEQ_ENABLED, &adminq->flags))
-		pci_free_irq(pdev, 0, adminq);
+	if (test_and_clear_bit(NVMEQ_ENABLED, &adminq->flags)) {
+		if (adminq->ebind.irq)
+			edera_nvme_unbind_queue(&adminq->ebind);
+		else
+			pci_free_irq(pdev, 0, adminq);
+	}
 
 	/*
 	 * If we enable msix early due to not intx, disable it again before
