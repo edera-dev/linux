@@ -30,6 +30,7 @@
 
 #include "trace.h"
 #include "nvme.h"
+#include "edera.h"
 
 #define SQ_SIZE(q)	((q)->q_depth << (q)->sqes)
 #define CQ_SIZE(q)	((q)->q_depth * sizeof(struct nvme_completion))
@@ -190,6 +191,7 @@ struct nvme_dev {
 	unsigned int nr_allocated_queues;
 	unsigned int nr_write_queues;
 	unsigned int nr_poll_queues;
+	struct edera_nvme *edera;
 	struct nvme_descriptor_pools descriptor_pools[];
 };
 
@@ -246,6 +248,7 @@ struct nvme_queue {
 	__le32 *dbbuf_cq_db;
 	__le32 *dbbuf_sq_ei;
 	__le32 *dbbuf_cq_ei;
+	struct edera_nvme_qbind ebind;
 	struct completion delete_done;
 };
 
@@ -571,7 +574,8 @@ static inline void nvme_write_sq_db(struct nvme_queue *nvmeq, bool write_sq)
 	}
 
 	if (nvme_dbbuf_update_and_check_event(nvmeq->sq_tail,
-			nvmeq->dbbuf_sq_db, nvmeq->dbbuf_sq_ei))
+			nvmeq->dbbuf_sq_db, nvmeq->dbbuf_sq_ei) &&
+	    !edera_nvme_notify(&nvmeq->ebind, nvmeq->dbbuf_sq_db))
 		writel(nvmeq->sq_tail, nvmeq->q_db);
 	nvmeq->last_sq_tail = nvmeq->sq_tail;
 }
@@ -1343,7 +1347,8 @@ static inline void nvme_ring_cq_doorbell(struct nvme_queue *nvmeq)
 	u16 head = nvmeq->cq_head;
 
 	if (nvme_dbbuf_update_and_check_event(head, nvmeq->dbbuf_cq_db,
-					      nvmeq->dbbuf_cq_ei))
+					      nvmeq->dbbuf_cq_ei) &&
+	    !edera_nvme_notify(&nvmeq->ebind, nvmeq->dbbuf_cq_db))
 		writel(head, nvmeq->q_db + nvmeq->dev->db_stride);
 }
 
@@ -1455,7 +1460,7 @@ static void nvme_poll_irqdisable(struct nvme_queue *nvmeq)
 
 	WARN_ON_ONCE(test_bit(NVMEQ_POLLED, &nvmeq->flags));
 
-	irq = pci_irq_vector(pdev, nvmeq->cq_vector);
+	irq = nvmeq->ebind.irq ?: pci_irq_vector(pdev, nvmeq->cq_vector);
 	disable_irq(irq);
 	spin_lock(&nvmeq->cq_poll_lock);
 	nvme_poll_cq(nvmeq, NULL);
@@ -1845,7 +1850,11 @@ static void nvme_suspend_queue(struct nvme_dev *dev, unsigned int qid)
 	nvmeq->dev->online_queues--;
 	if (!nvmeq->qid && nvmeq->dev->ctrl.admin_q)
 		nvme_quiesce_admin_queue(&nvmeq->dev->ctrl);
-	if (!test_and_clear_bit(NVMEQ_POLLED, &nvmeq->flags))
+	if (test_and_clear_bit(NVMEQ_POLLED, &nvmeq->flags))
+		return;
+	if (nvmeq->ebind.irq)
+		edera_nvme_unbind_queue(&nvmeq->ebind);
+	else
 		pci_free_irq(to_pci_dev(dev->dev), nvmeq->cq_vector, nvmeq);
 }
 
@@ -1964,6 +1973,14 @@ static int queue_request_irq(struct nvme_queue *nvmeq)
 {
 	struct pci_dev *pdev = to_pci_dev(nvmeq->dev->dev);
 	int nr = nvmeq->dev->ctrl.instance;
+	int ret;
+
+	ret = edera_nvme_bind_queue(nvmeq->dev->edera, &nvmeq->ebind,
+				    nvmeq->qid, nvme_irq, nvmeq,
+				    pci_irq_get_affinity(pdev, nvmeq->cq_vector),
+				    nr);
+	if (ret != -EOPNOTSUPP)
+		return ret;
 
 	if (use_threaded_interrupts) {
 		return pci_request_irq(pdev, nvmeq->cq_vector, nvme_irq_check,
@@ -2170,6 +2187,10 @@ static int nvme_pci_configure_admin_queue(struct nvme_dev *dev)
 		dev_info(dev->ctrl.device,
 			"controller reset completed after pcie flr\n");
 	}
+
+	result = edera_nvme_enable(dev->edera);
+	if (result)
+		return result;
 
 	result = nvme_alloc_queue(dev, 0, NVME_AQ_DEPTH);
 	if (result)
@@ -3156,6 +3177,7 @@ static void nvme_pci_free_ctrl(struct nvme_ctrl *ctrl)
 	struct nvme_dev *dev = to_nvme_dev(ctrl);
 
 	nvme_free_tagset(dev);
+	edera_nvme_release(dev->edera);
 	put_device(dev->dev);
 	kfree(dev->queues);
 	kfree(dev);
@@ -3479,6 +3501,9 @@ static struct nvme_dev *nvme_pci_alloc_dev(struct pci_dev *pdev,
 	if (ret)
 		goto out_put_device;
 
+	/* Before the DMA mask and transfer size, which depend on the DMA ops. */
+	dev->edera = edera_nvme_probe(pdev);
+
 	if (dev->ctrl.quirks & NVME_QUIRK_DMA_ADDRESS_BITS_48)
 		dma_set_mask_and_coherent(&pdev->dev, DMA_BIT_MASK(48));
 	else
@@ -3666,6 +3691,9 @@ static void nvme_remove(struct pci_dev *pdev)
 	nvme_free_queues(dev, 0);
 	mempool_destroy(dev->dmavec_mempool);
 	nvme_release_descriptor_pools(dev);
+	/* The DMA ops must go before another driver can bind the function. */
+	edera_nvme_release(dev->edera);
+	dev->edera = NULL;
 	nvme_dev_unmap(dev);
 	nvme_uninit_ctrl(&dev->ctrl);
 }

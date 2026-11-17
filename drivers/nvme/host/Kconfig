@@ -14,6 +14,18 @@ config BLK_DEV_NVME
 	  To compile this driver as a module, choose M here: the
 	  module will be called nvme.
 
+config NVME_EDERA
+	bool "Edera enlightened mode for emulated NVMe on Xen"
+	depends on BLK_DEV_NVME && XEN
+	help
+	  Lets the NVMe PCI driver switch an Edera emulated NVMe controller
+	  into enlightened mode: event channels replace MSI-X and doorbell
+	  writes, and the controller only sees granted memory, so its
+	  backend does not need to map arbitrary guest memory. Controllers
+	  without the Edera capability are driven as before.
+
+	  If unsure, say N.
+
 config NVME_MULTIPATH
 	bool "NVMe multipath support"
 	depends on NVME_CORE
