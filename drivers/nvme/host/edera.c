@@ -115,10 +115,10 @@ module_param(edera_fill_reads, bool, 0444);
 MODULE_PARM_DESC(edera_fill_reads,
 		 "copy a read's pages into its pool range before the device writes it, so a short device write cannot return another request's data");
 
-static bool edera_db_page;
-module_param(edera_db_page, bool, 0444);
+static unsigned int edera_db_page;
+module_param(edera_db_page, uint, 0444);
 MODULE_PARM_DESC(edera_db_page,
-		 "write doorbells to a granted page that the backend polls, and take MSI-X instead of event channels");
+		 "write doorbells to a granted page that the backend polls: 1 with MSI-X interrupts, 2 with event channel interrupts");
 
 static bool edera_grant_only;
 module_param(edera_grant_only, bool, 0444);
@@ -779,7 +779,9 @@ struct edera_nvme *edera_nvme_probe(struct pci_dev *pdev)
 	}
 
 	if (edera_db_page && (e->features & EDERA_F_GRANT_DOORBELLS)) {
-		e->features &= ~(EDERA_F_EVTCHN_QUEUES | EDERA_F_EVTCHN_DOORBELL);
+		e->features &= ~EDERA_F_EVTCHN_DOORBELL;
+		if (edera_db_page == 1)
+			e->features &= ~EDERA_F_EVTCHN_QUEUES;
 		e->db = edera_region_alloc(e, XEN_PAGE_SIZE, GFP_KERNEL);
 		if (!e->db)
 			goto free_bounce;
