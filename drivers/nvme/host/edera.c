@@ -102,7 +102,7 @@ module_param(edera_enlighten, bool, 0444);
 MODULE_PARM_DESC(edera_enlighten,
 		 "use the Edera enlightened mode when the controller offers it");
 
-static unsigned int edera_bounce_kb = 4096;
+static unsigned int edera_bounce_kb = 16384;
 module_param(edera_bounce_kb, uint, 0444);
 MODULE_PARM_DESC(edera_bounce_kb,
 		 "size in KiB of the persistent granted data pool per controller");
@@ -122,6 +122,25 @@ struct edera_region {
 struct edera_slot {
 	phys_addr_t orig;
 	unsigned int npages;
+};
+
+/* The largest physically contiguous allocation, and so the largest pool part. */
+#define EDERA_POOL_PAGES	(1U << MAX_PAGE_ORDER)
+#define EDERA_MAX_POOLS		16
+
+/*
+ * One physically contiguous, persistently granted part of the data pool. Each
+ * has its own lock, and a CPU starts at its own part, so mappings on different
+ * CPUs rarely contend.
+ */
+struct edera_pool {
+	/* Protects map and hint. */
+	spinlock_t lock;
+	struct edera_region *region;
+	unsigned long *map;
+	struct edera_slot *slots;
+	/* Next-fit start, so a search does not rescan the busy front each time. */
+	unsigned int hint;
 };
 
 struct edera_nvme {
@@ -149,11 +168,8 @@ struct edera_nvme {
 	unsigned int nr_regions;
 	unsigned int region_pages;
 
-	/* Protects bounce_map. */
-	spinlock_t bounce_lock;
-	struct edera_region *bounce;
-	unsigned long *bounce_map;
-	struct edera_slot *slots;
+	struct edera_pool pools[EDERA_MAX_POOLS];
+	unsigned int nr_pools;
 };
 
 static struct edera_nvme *edera_from_dev(struct device *dev)
@@ -347,11 +363,11 @@ static void edera_dma_free(struct device *dev, size_t size, void *vaddr,
 }
 
 /* Copies between a bounce slot range and the original pages it shadows. */
-static void edera_bounce_copy(struct edera_nvme *e, unsigned int slot,
+static void edera_bounce_copy(struct edera_pool *p, unsigned int slot,
 			      unsigned int off, size_t size, bool to_bounce)
 {
-	void *bounce = e->bounce->vaddr + slot * XEN_PAGE_SIZE + off;
-	phys_addr_t orig = e->slots[slot].orig + off;
+	void *bounce = p->region->vaddr + slot * XEN_PAGE_SIZE + off;
+	phys_addr_t orig = p->slots[slot].orig + off;
 
 	while (size) {
 		size_t chunk = min_t(size_t, size,
@@ -369,17 +385,76 @@ static void edera_bounce_copy(struct edera_nvme *e, unsigned int slot,
 	}
 }
 
-static bool edera_bounce_slot(struct edera_nvme *e, dma_addr_t addr,
-			      unsigned int *slot)
+static struct edera_pool *edera_pool_of(struct edera_nvme *e, dma_addr_t addr,
+					unsigned int *slot)
 {
 	grant_ref_t gref = EDERA_GADDR_GREF(addr);
-	unsigned int npages = e->bounce->npages;
+	unsigned int i;
 
-	if (WARN_ON_ONCE(!(addr & EDERA_GADDR_FLAG) || gref < e->bounce->first ||
-			 gref - e->bounce->first >= npages))
-		return false;
-	*slot = gref - e->bounce->first;
-	return true;
+	if (WARN_ON_ONCE(!(addr & EDERA_GADDR_FLAG)))
+		return NULL;
+	for (i = 0; i < e->nr_pools; i++) {
+		struct edera_region *r = e->pools[i].region;
+
+		if (gref >= r->first && gref - r->first < r->npages) {
+			*slot = gref - r->first;
+			return &e->pools[i];
+		}
+	}
+	WARN_ON_ONCE(1);
+	return NULL;
+}
+
+/* Takes @npages consecutive pages of one pool part, this CPU's first. */
+static struct edera_pool *edera_pool_get(struct edera_nvme *e,
+					 unsigned int npages,
+					 unsigned int *slot)
+{
+	unsigned int first = raw_smp_processor_id() % e->nr_pools;
+	unsigned long flags, s;
+	unsigned int i;
+
+	for (i = 0; i < e->nr_pools; i++) {
+		struct edera_pool *p = &e->pools[(first + i) % e->nr_pools];
+		unsigned int size = p->region->npages;
+
+		spin_lock_irqsave(&p->lock, flags);
+		s = bitmap_find_next_zero_area(p->map, size, p->hint, npages, 0);
+		if (s >= size)
+			s = bitmap_find_next_zero_area(p->map, size, 0, npages,
+						       0);
+		if (s < size) {
+			bitmap_set(p->map, s, npages);
+			p->hint = s + npages;
+			spin_unlock_irqrestore(&p->lock, flags);
+			*slot = s;
+			return p;
+		}
+		spin_unlock_irqrestore(&p->lock, flags);
+	}
+	return NULL;
+}
+
+/* Shadows @size bytes at @phys with pool pages from @slot on. */
+static dma_addr_t edera_map_into(struct edera_pool *p, unsigned int slot,
+				 phys_addr_t phys, size_t size,
+				 unsigned long attrs)
+{
+	unsigned int off = offset_in_page(phys);
+	unsigned int npages = DIV_ROUND_UP(off + size, XEN_PAGE_SIZE);
+	unsigned int i;
+
+	for (i = 0; i < npages; i++)
+		p->slots[slot + i].orig = (phys & PAGE_MASK) + i * PAGE_SIZE;
+	p->slots[slot].npages = npages;
+
+	/*
+	 * Fill the slot even for DMA_FROM_DEVICE, so a short device write
+	 * cannot copy another request's stale data back to the caller.
+	 */
+	if (!(attrs & DMA_ATTR_SKIP_CPU_SYNC))
+		edera_bounce_copy(p, slot, off, size, true);
+	return edera_gaddr(p->region->first + slot, off);
 }
 
 static dma_addr_t edera_dma_map_page(struct device *dev, struct page *page,
@@ -389,35 +464,17 @@ static dma_addr_t edera_dma_map_page(struct device *dev, struct page *page,
 {
 	struct edera_nvme *e = edera_from_dev(dev);
 	phys_addr_t phys = page_to_phys(page) + offset;
-	unsigned int off = offset_in_page(phys);
-	unsigned int npages = DIV_ROUND_UP(off + size, XEN_PAGE_SIZE);
-	unsigned long flags, slot;
-	unsigned int i;
+	unsigned int npages = DIV_ROUND_UP(offset_in_page(phys) + size,
+					   XEN_PAGE_SIZE);
+	struct edera_pool *p;
+	unsigned int slot;
 
 	if (!size || size > EDERA_MAX_MAPPING)
 		return DMA_MAPPING_ERROR;
-
-	spin_lock_irqsave(&e->bounce_lock, flags);
-	slot = bitmap_find_next_zero_area(e->bounce_map, e->bounce->npages, 0,
-					  npages, 0);
-	if (slot >= e->bounce->npages) {
-		spin_unlock_irqrestore(&e->bounce_lock, flags);
+	p = edera_pool_get(e, npages, &slot);
+	if (!p)
 		return DMA_MAPPING_ERROR;
-	}
-	bitmap_set(e->bounce_map, slot, npages);
-	spin_unlock_irqrestore(&e->bounce_lock, flags);
-
-	for (i = 0; i < npages; i++)
-		e->slots[slot + i].orig = (phys & PAGE_MASK) + i * PAGE_SIZE;
-	e->slots[slot].npages = npages;
-
-	/*
-	 * Fill the slot even for DMA_FROM_DEVICE, so a short device write
-	 * cannot copy another request's stale data back to the caller.
-	 */
-	if (!(attrs & DMA_ATTR_SKIP_CPU_SYNC))
-		edera_bounce_copy(e, slot, off, size, true);
-	return edera_gaddr(e->bounce->first + slot, off);
+	return edera_map_into(p, slot, phys, size, attrs);
 }
 
 static void edera_dma_unmap_page(struct device *dev, dma_addr_t addr,
@@ -426,38 +483,46 @@ static void edera_dma_unmap_page(struct device *dev, dma_addr_t addr,
 {
 	struct edera_nvme *e = edera_from_dev(dev);
 	unsigned int off = addr & ~XEN_PAGE_MASK;
+	struct edera_pool *p;
 	unsigned long flags;
 	unsigned int slot;
 
-	if (!edera_bounce_slot(e, addr, &slot))
+	p = edera_pool_of(e, addr, &slot);
+	if (!p)
 		return;
 	if (!(attrs & DMA_ATTR_SKIP_CPU_SYNC) &&
 	    (dir == DMA_FROM_DEVICE || dir == DMA_BIDIRECTIONAL))
-		edera_bounce_copy(e, slot, off, size, false);
+		edera_bounce_copy(p, slot, off, size, false);
 
-	spin_lock_irqsave(&e->bounce_lock, flags);
-	bitmap_clear(e->bounce_map, slot, e->slots[slot].npages);
-	spin_unlock_irqrestore(&e->bounce_lock, flags);
+	spin_lock_irqsave(&p->lock, flags);
+	bitmap_clear(p->map, slot, p->slots[slot].npages);
+	spin_unlock_irqrestore(&p->lock, flags);
 }
 
 static void edera_dma_sync_for_cpu(struct device *dev, dma_addr_t addr,
 				   size_t size, enum dma_data_direction dir)
 {
 	struct edera_nvme *e = edera_from_dev(dev);
+	struct edera_pool *p;
 	unsigned int slot;
 
-	if (dir != DMA_TO_DEVICE && edera_bounce_slot(e, addr, &slot))
-		edera_bounce_copy(e, slot, addr & ~XEN_PAGE_MASK, size, false);
+	if (dir == DMA_TO_DEVICE)
+		return;
+	p = edera_pool_of(e, addr, &slot);
+	if (p)
+		edera_bounce_copy(p, slot, addr & ~XEN_PAGE_MASK, size, false);
 }
 
 static void edera_dma_sync_for_device(struct device *dev, dma_addr_t addr,
 				      size_t size, enum dma_data_direction dir)
 {
 	struct edera_nvme *e = edera_from_dev(dev);
+	struct edera_pool *p;
 	unsigned int slot;
 
-	if (edera_bounce_slot(e, addr, &slot))
-		edera_bounce_copy(e, slot, addr & ~XEN_PAGE_MASK, size, true);
+	p = edera_pool_of(e, addr, &slot);
+	if (p)
+		edera_bounce_copy(p, slot, addr & ~XEN_PAGE_MASK, size, true);
 }
 
 static void edera_dma_unmap_sg(struct device *dev, struct scatterlist *sgl,
@@ -476,8 +541,34 @@ static int edera_dma_map_sg(struct device *dev, struct scatterlist *sgl,
 			    int nents, enum dma_data_direction dir,
 			    unsigned long attrs)
 {
+	struct edera_nvme *e = edera_from_dev(dev);
+	unsigned int total = 0, slot;
 	struct scatterlist *sg;
+	struct edera_pool *p;
 	int i;
+
+	/* One pool range for the whole list: one lock instead of one per segment. */
+	for_each_sg(sgl, sg, nents, i) {
+		if (!sg->length || sg->length > EDERA_MAX_MAPPING) {
+			total = 0;
+			break;
+		}
+		total += DIV_ROUND_UP(offset_in_page(sg_phys(sg)) + sg->length,
+				      XEN_PAGE_SIZE);
+	}
+	p = total ? edera_pool_get(e, total, &slot) : NULL;
+	if (p) {
+		for_each_sg(sgl, sg, nents, i) {
+			phys_addr_t phys = sg_phys(sg);
+
+			sg->dma_address = edera_map_into(p, slot, phys,
+							 sg->length, attrs);
+			sg_dma_len(sg) = sg->length;
+			slot += DIV_ROUND_UP(offset_in_page(phys) + sg->length,
+					     XEN_PAGE_SIZE);
+		}
+		return nents;
+	}
 
 	for_each_sg(sgl, sg, nents, i) {
 		sg->dma_address = edera_dma_map_page(dev, sg_page(sg),
@@ -563,19 +654,26 @@ static int edera_find_cap(struct pci_dev *pdev)
 
 static void edera_free_bounce(struct edera_nvme *e)
 {
-	if (e->bounce)
-		edera_region_free(e, e->bounce);
-	e->bounce = NULL;
-	bitmap_free(e->bounce_map);
-	e->bounce_map = NULL;
-	kvfree(e->slots);
-	e->slots = NULL;
+	unsigned int i;
+
+	for (i = 0; i < EDERA_MAX_POOLS; i++) {
+		struct edera_pool *p = &e->pools[i];
+
+		if (p->region)
+			edera_region_free(e, p->region);
+		p->region = NULL;
+		bitmap_free(p->map);
+		p->map = NULL;
+		kvfree(p->slots);
+		p->slots = NULL;
+	}
+	e->nr_pools = 0;
 }
 
 /* Returns NULL, and so stock emulated mode, unless enlightenment is usable. */
 struct edera_nvme *edera_nvme_probe(struct pci_dev *pdev)
 {
-	unsigned int bounce_pages;
+	unsigned int bounce_pages, per_pool, nr, i;
 	struct edera_nvme *e;
 	u32 version, class, lo, hi, limits, limits2;
 	int cap;
@@ -627,35 +725,43 @@ struct edera_nvme *edera_nvme_probe(struct pci_dev *pdev)
 	e->ops = edera_dma_ops;
 	spin_lock_init(&e->mbox_lock);
 	spin_lock_init(&e->region_lock);
-	spin_lock_init(&e->bounce_lock);
 	INIT_LIST_HEAD(&e->regions);
 
 	/*
-	 * Leave at least half of the backend's page budget for queues. The
-	 * pool is one physically contiguous allocation.
+	 * Leave at least half of the backend's page and region budgets for
+	 * queues. Each pool part is one physically contiguous allocation.
 	 */
-	bounce_pages = min3(edera_bounce_kb / (XEN_PAGE_SIZE / SZ_1K),
-			    e->max_region_pages / 2, 1U << MAX_PAGE_ORDER);
-	if (bounce_pages < 4 * EDERA_MAX_MAPPING_PAGES) {
+	bounce_pages = min(edera_bounce_kb / (XEN_PAGE_SIZE / SZ_1K),
+			   e->max_region_pages / 2);
+	nr = min3(DIV_ROUND_UP(bounce_pages, EDERA_POOL_PAGES),
+		  (unsigned int)EDERA_MAX_POOLS, e->max_regions / 2U);
+	per_pool = nr ? min(bounce_pages / nr, EDERA_POOL_PAGES) : 0;
+	if (per_pool < 4 * EDERA_MAX_MAPPING_PAGES) {
 		dev_info(&pdev->dev,
 			 "edera: data pool of %u pages is too small, using emulated mode\n",
 			 bounce_pages);
 		goto free;
 	}
-	e->bounce_map = bitmap_zalloc(bounce_pages, GFP_KERNEL);
-	e->slots = kvcalloc(bounce_pages, sizeof(*e->slots), GFP_KERNEL);
-	if (!e->bounce_map || !e->slots)
-		goto free_bounce;
-	e->bounce = edera_region_alloc(e, bounce_pages << XEN_PAGE_SHIFT,
-				       GFP_KERNEL);
-	if (!e->bounce)
-		goto free_bounce;
+	for (i = 0; i < nr; i++) {
+		struct edera_pool *p = &e->pools[i];
+
+		spin_lock_init(&p->lock);
+		p->map = bitmap_zalloc(per_pool, GFP_KERNEL);
+		p->slots = kvcalloc(per_pool, sizeof(*p->slots), GFP_KERNEL);
+		if (!p->map || !p->slots)
+			goto free_bounce;
+		p->region = edera_region_alloc(e, per_pool << XEN_PAGE_SHIFT,
+					       GFP_KERNEL);
+		if (!p->region)
+			goto free_bounce;
+		e->nr_pools++;
+	}
 
 	set_dma_ops(&pdev->dev, &e->ops);
 	dev_info(&pdev->dev,
-		 "edera: capability v%u.%u, backend domain %u, features %#llx, data pool %u pages\n",
+		 "edera: capability v%u.%u, backend domain %u, features %#llx, data pool %u x %u pages\n",
 		 version & 0xffff, version >> 16, e->backend, e->features,
-		 bounce_pages);
+		 nr, per_pool);
 	return e;
 
 free_bounce:
