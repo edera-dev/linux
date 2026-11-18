@@ -110,7 +110,7 @@ module_param(edera_bounce_kb, uint, 0444);
 MODULE_PARM_DESC(edera_bounce_kb,
 		 "size in KiB of the persistent granted data pool per controller");
 
-static bool edera_fill_reads = true;
+static bool edera_fill_reads;
 module_param(edera_fill_reads, bool, 0444);
 MODULE_PARM_DESC(edera_fill_reads,
 		 "copy a read's pages into its pool range before the device writes it, so a short device write cannot return another request's data");
