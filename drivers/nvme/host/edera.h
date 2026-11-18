@@ -36,6 +36,7 @@ int edera_nvme_bind_queue(struct edera_nvme *e, struct edera_nvme_qbind *b,
 			  u16 qid, irq_handler_t handler, void *data,
 			  const struct cpumask *affinity, int instance);
 void edera_nvme_unbind_queue(struct edera_nvme_qbind *b);
+void __iomem *edera_nvme_dbs(struct edera_nvme *e, void __iomem *dbs);
 
 /*
  * An event channel carries no value, so it can only replace a doorbell write
@@ -79,6 +80,12 @@ static inline void edera_nvme_unbind_queue(struct edera_nvme_qbind *b)
 static inline bool edera_nvme_notify(struct edera_nvme_qbind *b, bool shadowed)
 {
 	return false;
+}
+
+static inline void __iomem *edera_nvme_dbs(struct edera_nvme *e,
+					   void __iomem *dbs)
+{
+	return dbs;
 }
 #endif
 

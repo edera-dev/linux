@@ -2135,7 +2135,7 @@ static int nvme_remap_bar(struct nvme_dev *dev, unsigned long size)
 		return -ENOMEM;
 	}
 	dev->bar_mapped_size = size;
-	dev->dbs = dev->bar + NVME_REG_DBS;
+	dev->dbs = edera_nvme_dbs(dev->edera, dev->bar + NVME_REG_DBS);
 
 	return 0;
 }
@@ -2191,6 +2191,7 @@ static int nvme_pci_configure_admin_queue(struct nvme_dev *dev)
 	result = edera_nvme_enable(dev->edera);
 	if (result)
 		return result;
+	dev->dbs = edera_nvme_dbs(dev->edera, dev->dbs);
 
 	result = nvme_alloc_queue(dev, 0, NVME_AQ_DEPTH);
 	if (result)

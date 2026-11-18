@@ -56,10 +56,12 @@
 #define EDERA_F_EVTCHN_QUEUES		BIT_ULL(1)
 #define EDERA_F_EVTCHN_DOORBELL		BIT_ULL(2)
 #define EDERA_F_GRANT_ONLY_LOCK		BIT_ULL(3)
+#define EDERA_F_GRANT_DOORBELLS		BIT_ULL(4)
 #define EDERA_F_DRIVER_SUPPORTED	(EDERA_F_GRANT_ADDRESSING | \
 					 EDERA_F_EVTCHN_QUEUES | \
 					 EDERA_F_EVTCHN_DOORBELL | \
-					 EDERA_F_GRANT_ONLY_LOCK)
+					 EDERA_F_GRANT_ONLY_LOCK | \
+					 EDERA_F_GRANT_DOORBELLS)
 
 enum edera_cmd {
 	EDERA_CMD_NEGOTIATE	= 0x01,
@@ -70,6 +72,7 @@ enum edera_cmd {
 	EDERA_CMD_QUEUE_UNBIND	= 0x06,
 	EDERA_CMD_RESET		= 0x07,
 	EDERA_CMD_LOCK		= 0x08,
+	EDERA_CMD_DOORBELL_PAGE	= 0x09,
 };
 
 enum edera_status {
@@ -106,6 +109,16 @@ static unsigned int edera_bounce_kb = 16384;
 module_param(edera_bounce_kb, uint, 0444);
 MODULE_PARM_DESC(edera_bounce_kb,
 		 "size in KiB of the persistent granted data pool per controller");
+
+static bool edera_fill_reads = true;
+module_param(edera_fill_reads, bool, 0444);
+MODULE_PARM_DESC(edera_fill_reads,
+		 "copy a read's pages into its pool range before the device writes it, so a short device write cannot return another request's data");
+
+static bool edera_db_page;
+module_param(edera_db_page, bool, 0444);
+MODULE_PARM_DESC(edera_db_page,
+		 "write doorbells to a granted page that the backend polls, and take MSI-X instead of event channels");
 
 static bool edera_grant_only;
 module_param(edera_grant_only, bool, 0444);
@@ -170,6 +183,9 @@ struct edera_nvme {
 
 	struct edera_pool pools[EDERA_MAX_POOLS];
 	unsigned int nr_pools;
+
+	/* The doorbell array, in a granted page, with EDERA_F_GRANT_DOORBELLS. */
+	struct edera_region *db;
 };
 
 static struct edera_nvme *edera_from_dev(struct device *dev)
@@ -438,6 +454,7 @@ static struct edera_pool *edera_pool_get(struct edera_nvme *e,
 /* Shadows @size bytes at @phys with pool pages from @slot on. */
 static dma_addr_t edera_map_into(struct edera_pool *p, unsigned int slot,
 				 phys_addr_t phys, size_t size,
+				 enum dma_data_direction dir,
 				 unsigned long attrs)
 {
 	unsigned int off = offset_in_page(phys);
@@ -452,7 +469,8 @@ static dma_addr_t edera_map_into(struct edera_pool *p, unsigned int slot,
 	 * Fill the slot even for DMA_FROM_DEVICE, so a short device write
 	 * cannot copy another request's stale data back to the caller.
 	 */
-	if (!(attrs & DMA_ATTR_SKIP_CPU_SYNC))
+	if (!(attrs & DMA_ATTR_SKIP_CPU_SYNC) &&
+	    (dir != DMA_FROM_DEVICE || edera_fill_reads))
 		edera_bounce_copy(p, slot, off, size, true);
 	return edera_gaddr(p->region->first + slot, off);
 }
@@ -474,7 +492,7 @@ static dma_addr_t edera_dma_map_page(struct device *dev, struct page *page,
 	p = edera_pool_get(e, npages, &slot);
 	if (!p)
 		return DMA_MAPPING_ERROR;
-	return edera_map_into(p, slot, phys, size, attrs);
+	return edera_map_into(p, slot, phys, size, dir, attrs);
 }
 
 static void edera_dma_unmap_page(struct device *dev, dma_addr_t addr,
@@ -562,7 +580,7 @@ static int edera_dma_map_sg(struct device *dev, struct scatterlist *sgl,
 			phys_addr_t phys = sg_phys(sg);
 
 			sg->dma_address = edera_map_into(p, slot, phys,
-							 sg->length, attrs);
+							 sg->length, dir, attrs);
 			sg_dma_len(sg) = sg->length;
 			slot += DIV_ROUND_UP(offset_in_page(phys) + sg->length,
 					     XEN_PAGE_SIZE);
@@ -656,6 +674,9 @@ static void edera_free_bounce(struct edera_nvme *e)
 {
 	unsigned int i;
 
+	if (e->db)
+		edera_region_free(e, e->db);
+	e->db = NULL;
 	for (i = 0; i < EDERA_MAX_POOLS; i++) {
 		struct edera_pool *p = &e->pools[i];
 
@@ -757,6 +778,15 @@ struct edera_nvme *edera_nvme_probe(struct pci_dev *pdev)
 		e->nr_pools++;
 	}
 
+	if (edera_db_page && (e->features & EDERA_F_GRANT_DOORBELLS)) {
+		e->features &= ~(EDERA_F_EVTCHN_QUEUES | EDERA_F_EVTCHN_DOORBELL);
+		e->db = edera_region_alloc(e, XEN_PAGE_SIZE, GFP_KERNEL);
+		if (!e->db)
+			goto free_bounce;
+	} else {
+		e->features &= ~EDERA_F_GRANT_DOORBELLS;
+	}
+
 	set_dma_ops(&pdev->dev, &e->ops);
 	dev_info(&pdev->dev,
 		 "edera: capability v%u.%u, backend domain %u, features %#llx, data pool %u x %u pages\n",
@@ -819,6 +849,13 @@ int edera_nvme_enable(struct edera_nvme *e)
 	if (ret)
 		goto fail;
 
+	if (e->db) {
+		ret = edera_mbox(e, EDERA_CMD_DOORBELL_PAGE, e->db->first, 0, 0,
+				 NULL);
+		if (ret)
+			goto fail;
+	}
+
 	if (edera_grant_only) {
 		if (!(want & EDERA_F_GRANT_ONLY_LOCK) ||
 		    edera_mbox(e, EDERA_CMD_LOCK, 0, 0, 0, NULL))
@@ -838,13 +875,21 @@ fail:
 	 * Queue memory already lives in grant space after the first success,
 	 * so only a controller that never went live can return to emulation.
 	 */
-	if (!e->ever_active && e->nr_regions == 1) {
+	if (!e->ever_active && e->nr_regions == e->nr_pools + !!e->db) {
 		edera_fall_back(e, ret);
 		return 0;
 	}
 	edera_mbox(e, EDERA_CMD_RESET, 0, 0, 0, NULL);
 	dev_err(&e->pdev->dev, "edera: renegotiation failed (%d)\n", ret);
 	return ret;
+}
+
+/* Where the driver writes doorbells: the granted page while a session uses one. */
+void __iomem *edera_nvme_dbs(struct edera_nvme *e, void __iomem *dbs)
+{
+	if (!e || !e->active || !e->db)
+		return dbs;
+	return (void __iomem *)e->db->vaddr;
 }
 
 void edera_nvme_release(struct edera_nvme *e)
