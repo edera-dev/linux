@@ -115,10 +115,10 @@ module_param(edera_fill_reads, bool, 0444);
 MODULE_PARM_DESC(edera_fill_reads,
 		 "copy a read's pages into its pool range before the device writes it, so a short device write cannot return another request's data");
 
-static unsigned int edera_db_page;
+static unsigned int edera_db_page = 1;
 module_param(edera_db_page, uint, 0444);
 MODULE_PARM_DESC(edera_db_page,
-		 "write doorbells to a granted page that the backend polls: 1 with MSI-X interrupts, 2 with event channel interrupts");
+		 "write doorbells to a granted page that the backend polls: 1 with MSI-X interrupts, 2 with event channel interrupts, 0 for event channels in both directions");
 
 static bool edera_grant_only;
 module_param(edera_grant_only, bool, 0444);
