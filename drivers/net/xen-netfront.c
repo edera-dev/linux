@@ -111,6 +111,24 @@ struct netfront_stats {
 
 struct netfront_info;
 
+/*
+ * Pages registered with the backend as static grants. The backend keeps them
+ * mapped, so a request that names one of them needs no grant of its own: the
+ * frontend copies the data in or out of the page instead.
+ */
+struct xennet_pool {
+	unsigned int nr;
+	struct page **pages;
+	grant_ref_t *refs;
+	/* Stack of free page indices. */
+	unsigned short *free;
+	unsigned int nr_free;
+	/* Requests that needed a grant of their own because no page was free. */
+	unsigned long fallbacks;
+};
+
+static void xennet_register_pools(struct work_struct *work);
+
 struct netfront_queue {
 	unsigned int id; /* Queue ID, 0-based */
 	char name[QUEUE_NAME_SIZE]; /* DEVNAME-qN */
@@ -162,6 +180,10 @@ struct netfront_queue {
 
 	struct page_pool *page_pool;
 	struct xdp_rxq_info xdp_rxq;
+
+	/* Static grant pools: tx_pool is used under tx_lock, rx_pool under rx_lock. */
+	struct xennet_pool tx_pool;
+	struct xennet_pool rx_pool;
 };
 
 struct netfront_info {
@@ -195,6 +217,14 @@ struct netfront_info {
 	unsigned int ctrl_evtchn;
 	unsigned int ctrl_irq;
 	wait_queue_head_t ctrl_wq;
+	/* Serialises control requests, pool registration and teardown. */
+	struct mutex ctrl_lock;
+	u16 ctrl_id;
+	/* A request timed out, so later responses cannot be matched. */
+	bool ctrl_broken;
+	bool pools_registered;
+	/* Registers the pools; it waits on the backend, so not from xenwatch. */
+	struct work_struct pool_work;
 };
 
 struct netfront_rx_info {
@@ -1748,6 +1778,8 @@ static struct net_device *xennet_create_dev(struct xenbus_device *dev)
 	np->xbdev            = dev;
 
 	init_waitqueue_head(&np->ctrl_wq);
+	mutex_init(&np->ctrl_lock);
+	INIT_WORK(&np->pool_work, xennet_register_pools);
 
 	np->queues = NULL;
 
@@ -1873,6 +1905,7 @@ fail:
 	dev_warn(&dev->dev, "no control ring, so no static grants: %d\n", err);
 }
 
+/* Caller holds ctrl_lock. */
 static void xennet_disconnect_ctrl(struct netfront_info *info)
 {
 	if (info->ctrl_irq)
@@ -1883,6 +1916,230 @@ static void xennet_disconnect_ctrl(struct netfront_info *info)
 		xenbus_teardown_ring((void **)&info->ctrl.sring, 1,
 				     &info->ctrl_ring_ref);
 	info->ctrl.sring = NULL;
+	info->ctrl_broken = false;
+	info->pools_registered = false;
+}
+
+/*
+ * Send one control request and wait for its response. Caller holds ctrl_lock.
+ * Returns -EOPNOTSUPP when the backend answered with a status other than
+ * success.
+ */
+static int xennet_ctrl_request(struct netfront_info *info, u16 type,
+			       u32 data0, u32 data1, u32 data2, u32 *data)
+{
+	struct xen_netif_ctrl_request *req;
+	struct xen_netif_ctrl_response rsp;
+	u16 id = info->ctrl_id++;
+	int notify;
+
+	if (!info->ctrl.sring || info->ctrl_broken)
+		return -ENODEV;
+
+	/* Ask for an event when the response arrives. */
+	info->ctrl.sring->rsp_event = info->ctrl.rsp_cons + 1;
+
+	req = RING_GET_REQUEST(&info->ctrl, info->ctrl.req_prod_pvt);
+	req->id = id;
+	req->type = type;
+	req->data[0] = data0;
+	req->data[1] = data1;
+	req->data[2] = data2;
+	info->ctrl.req_prod_pvt++;
+
+	RING_PUSH_REQUESTS_AND_CHECK_NOTIFY(&info->ctrl, notify);
+	if (notify)
+		notify_remote_via_irq(info->ctrl_irq);
+
+	if (!wait_event_timeout(info->ctrl_wq,
+				READ_ONCE(info->ctrl.sring->rsp_prod) !=
+				info->ctrl.rsp_cons,
+				XENNET_TIMEOUT)) {
+		/* A late response would answer the next request. */
+		info->ctrl_broken = true;
+		return -ETIMEDOUT;
+	}
+	virt_rmb(); /* Read the response after its producer index. */
+
+	RING_COPY_RESPONSE(&info->ctrl, info->ctrl.rsp_cons, &rsp);
+	info->ctrl.rsp_cons++;
+
+	if (rsp.id != id || rsp.type != type) {
+		info->ctrl_broken = true;
+		return -EIO;
+	}
+	if (rsp.status != XEN_NETIF_CTRL_STATUS_SUCCESS)
+		return -EOPNOTSUPP;
+	if (data)
+		*data = rsp.data;
+	return 0;
+}
+
+/*
+ * End the backend's access to each pool page and free it. A page the backend
+ * still has mapped is freed once it unmaps the page.
+ */
+static void xennet_free_pool(struct xennet_pool *pool)
+{
+	unsigned int i;
+
+	/* Every page is free once the rings are released, so a missing one leaked. */
+	WARN_ON_ONCE(pool->nr_free != pool->nr);
+	for (i = 0; i < pool->nr; i++)
+		gnttab_end_foreign_access(pool->refs[i], pool->pages[i]);
+	kfree(pool->pages);
+	kfree(pool->refs);
+	kfree(pool->free);
+	memset(pool, 0, sizeof(*pool));
+}
+
+static int xennet_alloc_pool(struct netfront_info *info,
+			     struct xennet_pool *pool, unsigned int nr,
+			     bool readonly)
+{
+	unsigned int i;
+
+	pool->pages = kcalloc(nr, sizeof(*pool->pages), GFP_KERNEL);
+	pool->refs = kcalloc(nr, sizeof(*pool->refs), GFP_KERNEL);
+	pool->free = kcalloc(nr, sizeof(*pool->free), GFP_KERNEL);
+	if (!pool->pages || !pool->refs || !pool->free)
+		goto fail;
+
+	for (i = 0; i < nr; i++) {
+		/*
+		 * Zeroed, because the backend can read the whole page, not only
+		 * the packet data copied into it.
+		 */
+		struct page *page = alloc_page(GFP_KERNEL | __GFP_ZERO);
+		int ref;
+
+		if (!page)
+			goto fail;
+		ref = gnttab_grant_foreign_access(info->xbdev->otherend_id,
+						  xen_page_to_gfn(page),
+						  readonly);
+		if (ref < 0) {
+			__free_page(page);
+			goto fail;
+		}
+		pool->pages[i] = page;
+		pool->refs[i] = ref;
+		pool->free[i] = i;
+		pool->nr++;
+		pool->nr_free++;
+	}
+	return 0;
+
+fail:
+	xennet_free_pool(pool);
+	return -ENOMEM;
+}
+
+/*
+ * Register a pool of RX and TX pages for one queue with the backend, then let
+ * the queue use them. Caller holds ctrl_lock.
+ */
+static int xennet_register_queue_pool(struct netfront_info *info,
+				      struct netfront_queue *queue)
+{
+	struct xennet_pool rx = {}, tx = {};
+	struct xen_netif_gref *table;
+	struct page *table_page;
+	unsigned int nr_rx, nr_tx, i, n = 0;
+	unsigned long flags;
+	int table_ref;
+	u32 size;
+	int err;
+
+	err = xennet_ctrl_request(info, XEN_NETIF_CTRL_TYPE_GET_GREF_MAPPING_SIZE,
+				  queue->id, 0, 0, &size);
+	if (err)
+		return err;
+
+	/* One table page holds every entry of a request. */
+	size = min_t(u32, size, XEN_PAGE_SIZE / sizeof(*table));
+	nr_rx = min_t(u32, size / 2, NET_RX_RING_SIZE);
+	nr_tx = min_t(u32, size - nr_rx, NET_TX_RING_SIZE);
+	if (!nr_rx || !nr_tx)
+		return -ENOSPC;
+
+	err = xennet_alloc_pool(info, &rx, nr_rx, false);
+	if (err)
+		return err;
+	err = xennet_alloc_pool(info, &tx, nr_tx, true);
+	if (err)
+		goto free_rx;
+
+	table_page = alloc_page(GFP_KERNEL | __GFP_ZERO);
+	if (!table_page) {
+		err = -ENOMEM;
+		goto free_tx;
+	}
+	table = page_address(table_page);
+	for (i = 0; i < nr_rx; i++, n++)
+		table[n].ref = rx.refs[i];
+	for (i = 0; i < nr_tx; i++, n++) {
+		table[n].ref = tx.refs[i];
+		table[n].flags = XEN_NETIF_CTRLF_GREF_readonly;
+	}
+	table_ref = gnttab_grant_foreign_access(info->xbdev->otherend_id,
+						xen_page_to_gfn(table_page), 0);
+	if (table_ref < 0) {
+		__free_page(table_page);
+		err = table_ref;
+		goto free_tx;
+	}
+
+	err = xennet_ctrl_request(info, XEN_NETIF_CTRL_TYPE_ADD_GREF_MAPPING,
+				  queue->id, table_ref, n, NULL);
+	/* This also frees the table page. */
+	gnttab_end_foreign_access(table_ref, table_page);
+	if (err)
+		goto free_tx;
+
+	spin_lock_irqsave(&queue->tx_lock, flags);
+	queue->tx_pool = tx;
+	spin_unlock_irqrestore(&queue->tx_lock, flags);
+	spin_lock_bh(&queue->rx_lock);
+	queue->rx_pool = rx;
+	spin_unlock_bh(&queue->rx_lock);
+	return 0;
+
+free_tx:
+	xennet_free_pool(&tx);
+free_rx:
+	xennet_free_pool(&rx);
+	return err;
+}
+
+/* Register static grant pools once the backend is connected. */
+static void xennet_register_pools(struct work_struct *work)
+{
+	struct netfront_info *info = container_of(work, struct netfront_info,
+						  pool_work);
+	unsigned int num_queues = info->netdev->real_num_tx_queues;
+	unsigned int i;
+	int err = 0;
+
+	mutex_lock(&info->ctrl_lock);
+	if (info->pools_registered || !info->ctrl.sring || !info->queues)
+		goto out;
+	info->pools_registered = true;
+
+	for (i = 0; i < num_queues; i++) {
+		err = xennet_register_queue_pool(info, &info->queues[i]);
+		if (err)
+			break;
+	}
+	if (err && err != -EOPNOTSUPP)
+		dev_warn(&info->xbdev->dev,
+			 "static grants for %u of %u queues: %d\n", i,
+			 num_queues, err);
+	else if (!err)
+		dev_info(&info->xbdev->dev,
+			 "static grants for %u queues\n", num_queues);
+out:
+	mutex_unlock(&info->ctrl_lock);
 }
 
 static void xennet_end_access(int ref, void *page)
@@ -1896,6 +2153,9 @@ static void xennet_disconnect_backend(struct netfront_info *info)
 {
 	unsigned int i = 0;
 	unsigned int num_queues = info->netdev->real_num_tx_queues;
+
+	/* So that no registration installs a pool in a queue torn down below. */
+	cancel_work_sync(&info->pool_work);
 
 	netif_carrier_off(info->netdev);
 
@@ -1941,7 +2201,14 @@ static void xennet_disconnect_backend(struct netfront_info *info)
 		page_pool_destroy(queue->page_pool);
 	}
 
+	/* The queues are stopped, so nothing uses the pools any more. */
+	mutex_lock(&info->ctrl_lock);
+	for (i = 0; i < num_queues && info->queues; ++i) {
+		xennet_free_pool(&info->queues[i].tx_pool);
+		xennet_free_pool(&info->queues[i].rx_pool);
+	}
 	xennet_disconnect_ctrl(info);
+	mutex_unlock(&info->ctrl_lock);
 }
 
 /*
@@ -2693,6 +2960,7 @@ static void netback_changed(struct xenbus_device *dev,
 
 	case XenbusStateConnected:
 		netdev_notify_peers(netdev);
+		schedule_work(&np->pool_work);
 		break;
 
 	case XenbusStateClosed:
@@ -2715,11 +2983,19 @@ static const struct xennet_stat {
 	},
 };
 
+/* Static grant pool sizes and fallbacks, summed over the queues. */
+static const char xennet_pool_stats[][ETH_GSTRING_LEN] = {
+	"static_grant_rx_pages",
+	"static_grant_rx_fallbacks",
+	"static_grant_tx_pages",
+	"static_grant_tx_fallbacks",
+};
+
 static int xennet_get_sset_count(struct net_device *dev, int string_set)
 {
 	switch (string_set) {
 	case ETH_SS_STATS:
-		return ARRAY_SIZE(xennet_stats);
+		return ARRAY_SIZE(xennet_stats) + ARRAY_SIZE(xennet_pool_stats);
 	default:
 		return -EINVAL;
 	}
@@ -2729,10 +3005,23 @@ static void xennet_get_ethtool_stats(struct net_device *dev,
 				     struct ethtool_stats *stats, u64 * data)
 {
 	void *np = netdev_priv(dev);
+	struct netfront_info *info = np;
+	u64 *pool = data + ARRAY_SIZE(xennet_stats);
+	unsigned int q;
 	int i;
 
 	for (i = 0; i < ARRAY_SIZE(xennet_stats); i++)
 		data[i] = atomic_read((atomic_t *)(np + xennet_stats[i].offset));
+
+	memset(pool, 0, sizeof(*pool) * ARRAY_SIZE(xennet_pool_stats));
+	for (q = 0; info->queues && q < dev->real_num_tx_queues; q++) {
+		struct netfront_queue *queue = &info->queues[q];
+
+		pool[0] += READ_ONCE(queue->rx_pool.nr);
+		pool[1] += READ_ONCE(queue->rx_pool.fallbacks);
+		pool[2] += READ_ONCE(queue->tx_pool.nr);
+		pool[3] += READ_ONCE(queue->tx_pool.fallbacks);
+	}
 }
 
 static void xennet_get_strings(struct net_device *dev, u32 stringset, u8 * data)
@@ -2744,6 +3033,10 @@ static void xennet_get_strings(struct net_device *dev, u32 stringset, u8 * data)
 		for (i = 0; i < ARRAY_SIZE(xennet_stats); i++)
 			memcpy(data + i * ETH_GSTRING_LEN,
 			       xennet_stats[i].name, ETH_GSTRING_LEN);
+		data += ARRAY_SIZE(xennet_stats) * ETH_GSTRING_LEN;
+		for (i = 0; i < ARRAY_SIZE(xennet_pool_stats); i++)
+			memcpy(data + i * ETH_GSTRING_LEN,
+			       xennet_pool_stats[i], ETH_GSTRING_LEN);
 		break;
 	}
 }
