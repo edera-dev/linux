@@ -57,11 +57,13 @@
 #define EDERA_F_EVTCHN_DOORBELL		BIT_ULL(2)
 #define EDERA_F_GRANT_ONLY_LOCK		BIT_ULL(3)
 #define EDERA_F_GRANT_DOORBELLS		BIT_ULL(4)
+#define EDERA_F_GRANT_COPY		BIT_ULL(5)
 #define EDERA_F_DRIVER_SUPPORTED	(EDERA_F_GRANT_ADDRESSING | \
 					 EDERA_F_EVTCHN_QUEUES | \
 					 EDERA_F_EVTCHN_DOORBELL | \
 					 EDERA_F_GRANT_ONLY_LOCK | \
-					 EDERA_F_GRANT_DOORBELLS)
+					 EDERA_F_GRANT_DOORBELLS | \
+					 EDERA_F_GRANT_COPY)
 
 enum edera_cmd {
 	EDERA_CMD_NEGOTIATE	= 0x01,
@@ -120,6 +122,11 @@ module_param(edera_db_page, uint, 0444);
 MODULE_PARM_DESC(edera_db_page,
 		 "write doorbells to a granted page that the backend polls: 1 with MSI-X interrupts, 2 with event channel interrupts, 0 for event channels in both directions");
 
+static unsigned int edera_copy = 1;
+module_param(edera_copy, uint, 0444);
+MODULE_PARM_DESC(edera_copy,
+		 "grant a mapping's own pages for the backend to copy, instead of copying through the data pool: 1 for reads, 2 for reads and writes, 0 never");
+
 static bool edera_grant_only;
 module_param(edera_grant_only, bool, 0444);
 MODULE_PARM_DESC(edera_grant_only,
@@ -144,12 +151,17 @@ struct edera_slot {
 /*
  * One physically contiguous, persistently granted part of the data pool. Each
  * has its own lock, and a CPU starts at its own part, so mappings on different
- * CPUs rarely contend.
+ * CPUs rarely contend. A copy window has the same layout but no pages: its
+ * references grant the caller's own pages for one mapping, and the backend
+ * reaches them only with grant copy.
  */
 struct edera_pool {
 	/* Protects map and hint. */
 	spinlock_t lock;
 	struct edera_region *region;
+	grant_ref_t first;
+	unsigned int npages;
+	bool copy;
 	unsigned long *map;
 	struct edera_slot *slots;
 	/* Next-fit start, so a search does not rescan the busy front each time. */
@@ -183,6 +195,8 @@ struct edera_nvme {
 
 	struct edera_pool pools[EDERA_MAX_POOLS];
 	unsigned int nr_pools;
+	struct edera_pool wins[EDERA_MAX_POOLS];
+	unsigned int nr_wins;
 
 	/* The doorbell array, in a granted page, with EDERA_F_GRANT_DOORBELLS. */
 	struct edera_region *db;
@@ -409,30 +423,31 @@ static struct edera_pool *edera_pool_of(struct edera_nvme *e, dma_addr_t addr,
 
 	if (WARN_ON_ONCE(!(addr & EDERA_GADDR_FLAG)))
 		return NULL;
-	for (i = 0; i < e->nr_pools; i++) {
-		struct edera_region *r = e->pools[i].region;
+	for (i = 0; i < e->nr_pools + e->nr_wins; i++) {
+		struct edera_pool *p = i < e->nr_pools ? &e->pools[i] :
+				       &e->wins[i - e->nr_pools];
 
-		if (gref >= r->first && gref - r->first < r->npages) {
-			*slot = gref - r->first;
-			return &e->pools[i];
+		if (gref >= p->first && gref - p->first < p->npages) {
+			*slot = gref - p->first;
+			return p;
 		}
 	}
 	WARN_ON_ONCE(1);
 	return NULL;
 }
 
-/* Takes @npages consecutive pages of one pool part, this CPU's first. */
-static struct edera_pool *edera_pool_get(struct edera_nvme *e,
-					 unsigned int npages,
+/* Takes @npages consecutive pages of one of @nr parts, this CPU's first. */
+static struct edera_pool *edera_pool_get(struct edera_pool *pools,
+					 unsigned int nr, unsigned int npages,
 					 unsigned int *slot)
 {
-	unsigned int first = raw_smp_processor_id() % e->nr_pools;
+	unsigned int first = raw_smp_processor_id() % nr;
 	unsigned long flags, s;
 	unsigned int i;
 
-	for (i = 0; i < e->nr_pools; i++) {
-		struct edera_pool *p = &e->pools[(first + i) % e->nr_pools];
-		unsigned int size = p->region->npages;
+	for (i = 0; i < nr; i++) {
+		struct edera_pool *p = &pools[(first + i) % nr];
+		unsigned int size = p->npages;
 
 		spin_lock_irqsave(&p->lock, flags);
 		s = bitmap_find_next_zero_area(p->map, size, p->hint, npages, 0);
@@ -475,6 +490,44 @@ static dma_addr_t edera_map_into(struct edera_pool *p, unsigned int slot,
 	return edera_gaddr(p->region->first + slot, off);
 }
 
+/* Grants the backend the pages of @size bytes at @phys under window @slot on. */
+static dma_addr_t edera_grant_into(struct edera_nvme *e, struct edera_pool *p,
+				   unsigned int slot, phys_addr_t phys,
+				   size_t size, enum dma_data_direction dir)
+{
+	unsigned int off = offset_in_page(phys);
+	unsigned int npages = DIV_ROUND_UP(off + size, XEN_PAGE_SIZE);
+	unsigned int i;
+
+	for (i = 0; i < npages; i++)
+		gnttab_grant_foreign_access_ref(p->first + slot + i, e->backend,
+						pfn_to_gfn(PHYS_PFN(phys) + i),
+						dir == DMA_TO_DEVICE);
+	p->slots[slot].npages = npages;
+	return edera_gaddr(p->first + slot, off);
+}
+
+/* Ends the grants of a window mapping, or leaks it while the backend holds one. */
+static void edera_grant_end(struct edera_nvme *e, struct edera_pool *p,
+			    unsigned int slot)
+{
+	unsigned int npages = p->slots[slot].npages;
+	unsigned long flags;
+	unsigned int i;
+
+	for (i = 0; i < npages; i++) {
+		if (!gnttab_end_foreign_access_ref(p->first + slot + i)) {
+			dev_alert(&e->pdev->dev,
+				  "edera: grant %u still in use by the backend, leaking it\n",
+				  p->first + slot + i);
+			return;
+		}
+	}
+	spin_lock_irqsave(&p->lock, flags);
+	bitmap_clear(p->map, slot, npages);
+	spin_unlock_irqrestore(&p->lock, flags);
+}
+
 static dma_addr_t edera_dma_map_page(struct device *dev, struct page *page,
 				     unsigned long offset, size_t size,
 				     enum dma_data_direction dir,
@@ -489,7 +542,16 @@ static dma_addr_t edera_dma_map_page(struct device *dev, struct page *page,
 
 	if (!size || size > EDERA_MAX_MAPPING)
 		return DMA_MAPPING_ERROR;
-	p = edera_pool_get(e, npages, &slot);
+	/*
+	 * Writes stay in the pool: the backend limits the write bytes in
+	 * flight, and a copy inside that limit costs more than one before it.
+	 */
+	if (e->nr_wins && (dir == DMA_FROM_DEVICE || edera_copy > 1)) {
+		p = edera_pool_get(e->wins, e->nr_wins, npages, &slot);
+		if (p)
+			return edera_grant_into(e, p, slot, phys, size, dir);
+	}
+	p = edera_pool_get(e->pools, e->nr_pools, npages, &slot);
 	if (!p)
 		return DMA_MAPPING_ERROR;
 	return edera_map_into(p, slot, phys, size, dir, attrs);
@@ -508,6 +570,10 @@ static void edera_dma_unmap_page(struct device *dev, dma_addr_t addr,
 	p = edera_pool_of(e, addr, &slot);
 	if (!p)
 		return;
+	if (p->copy) {
+		edera_grant_end(e, p, slot);
+		return;
+	}
 	if (!(attrs & DMA_ATTR_SKIP_CPU_SYNC) &&
 	    (dir == DMA_FROM_DEVICE || dir == DMA_BIDIRECTIONAL))
 		edera_bounce_copy(p, slot, off, size, false);
@@ -527,7 +593,7 @@ static void edera_dma_sync_for_cpu(struct device *dev, dma_addr_t addr,
 	if (dir == DMA_TO_DEVICE)
 		return;
 	p = edera_pool_of(e, addr, &slot);
-	if (p)
+	if (p && !p->copy)
 		edera_bounce_copy(p, slot, addr & ~XEN_PAGE_MASK, size, false);
 }
 
@@ -539,7 +605,7 @@ static void edera_dma_sync_for_device(struct device *dev, dma_addr_t addr,
 	unsigned int slot;
 
 	p = edera_pool_of(e, addr, &slot);
-	if (p)
+	if (p && !p->copy)
 		edera_bounce_copy(p, slot, addr & ~XEN_PAGE_MASK, size, true);
 }
 
@@ -574,7 +640,7 @@ static int edera_dma_map_sg(struct device *dev, struct scatterlist *sgl,
 		total += DIV_ROUND_UP(offset_in_page(sg_phys(sg)) + sg->length,
 				      XEN_PAGE_SIZE);
 	}
-	p = total ? edera_pool_get(e, total, &slot) : NULL;
+	p = total ? edera_pool_get(e->pools, e->nr_pools, total, &slot) : NULL;
 	if (p) {
 		for_each_sg(sgl, sg, nents, i) {
 			phys_addr_t phys = sg_phys(sg);
@@ -689,6 +755,45 @@ static void edera_free_bounce(struct edera_nvme *e)
 		p->slots = NULL;
 	}
 	e->nr_pools = 0;
+	for (i = 0; i < e->nr_wins; i++) {
+		struct edera_pool *w = &e->wins[i];
+
+		/* Every mapping has ended its grants, so the references are free. */
+		gnttab_free_grant_reference_seq(w->first, w->npages);
+		bitmap_free(w->map);
+		w->map = NULL;
+		kvfree(w->slots);
+		w->slots = NULL;
+	}
+	e->nr_wins = 0;
+}
+
+/* One copy window per pool part, as large as the part. */
+static void edera_alloc_wins(struct edera_nvme *e)
+{
+	unsigned int i;
+
+	for (i = 0; i < e->nr_pools; i++) {
+		struct edera_pool *w = &e->wins[i];
+		unsigned int n = e->pools[i].npages;
+
+		spin_lock_init(&w->lock);
+		w->copy = true;
+		w->npages = n;
+		w->map = bitmap_zalloc(n, GFP_KERNEL);
+		w->slots = kvcalloc(n, sizeof(*w->slots), GFP_KERNEL);
+		if (!w->map || !w->slots ||
+		    gnttab_alloc_grant_reference_seq(n, &w->first)) {
+			bitmap_free(w->map);
+			w->map = NULL;
+			kvfree(w->slots);
+			w->slots = NULL;
+			break;
+		}
+		e->nr_wins++;
+	}
+	if (!e->nr_wins)
+		e->features &= ~EDERA_F_GRANT_COPY;
 }
 
 /* Returns NULL, and so stock emulated mode, unless enlightenment is usable. */
@@ -775,8 +880,15 @@ struct edera_nvme *edera_nvme_probe(struct pci_dev *pdev)
 					       GFP_KERNEL);
 		if (!p->region)
 			goto free_bounce;
+		p->first = p->region->first;
+		p->npages = p->region->npages;
 		e->nr_pools++;
 	}
+
+	if (edera_copy && (e->features & EDERA_F_GRANT_COPY))
+		edera_alloc_wins(e);
+	else
+		e->features &= ~EDERA_F_GRANT_COPY;
 
 	if (edera_db_page && (e->features & EDERA_F_GRANT_DOORBELLS)) {
 		e->features &= ~EDERA_F_EVTCHN_DOORBELL;
@@ -791,9 +903,9 @@ struct edera_nvme *edera_nvme_probe(struct pci_dev *pdev)
 
 	set_dma_ops(&pdev->dev, &e->ops);
 	dev_info(&pdev->dev,
-		 "edera: capability v%u.%u, backend domain %u, features %#llx, data pool %u x %u pages\n",
+		 "edera: capability v%u.%u, backend domain %u, features %#llx, data pool %u x %u pages, %u copy windows\n",
 		 version & 0xffff, version >> 16, e->backend, e->features,
-		 nr, per_pool);
+		 nr, per_pool, e->nr_wins);
 	return e;
 
 free_bounce:
