@@ -72,6 +72,11 @@ static bool __read_mostly xennet_trusted = true;
 module_param_named(trusted, xennet_trusted, bool, 0644);
 MODULE_PARM_DESC(trusted, "Is the backend trusted");
 
+static bool __read_mostly xennet_static_grants = true;
+module_param_named(static_grants, xennet_static_grants, bool, 0644);
+MODULE_PARM_DESC(static_grants,
+		 "Register a fixed pool of buffer pages with a backend that maps them once");
+
 #define XENNET_TIMEOUT  (5 * HZ)
 
 static const struct ethtool_ops xennet_ethtool_ops;
@@ -183,6 +188,13 @@ struct netfront_info {
 	bool bounce;
 
 	atomic_t rx_gso_checksum_fixup;
+
+	/* Control ring, used to register static grants. */
+	struct xen_netif_ctrl_front_ring ctrl;
+	grant_ref_t ctrl_ring_ref;
+	unsigned int ctrl_evtchn;
+	unsigned int ctrl_irq;
+	wait_queue_head_t ctrl_wq;
 };
 
 struct netfront_rx_info {
@@ -1735,6 +1747,8 @@ static struct net_device *xennet_create_dev(struct xenbus_device *dev)
 	np                   = netdev_priv(netdev);
 	np->xbdev            = dev;
 
+	init_waitqueue_head(&np->ctrl_wq);
+
 	np->queues = NULL;
 
 	err = -ENOMEM;
@@ -1817,6 +1831,60 @@ static int netfront_probe(struct xenbus_device *dev,
 	return 0;
 }
 
+static irqreturn_t xennet_ctrl_interrupt(int irq, void *dev_id)
+{
+	struct netfront_info *info = dev_id;
+
+	wake_up(&info->ctrl_wq);
+	return IRQ_HANDLED;
+}
+
+/* Set up the control ring. On failure the device runs without static grants. */
+static void setup_netfront_ctrl(struct xenbus_device *dev,
+				struct netfront_info *info)
+{
+	struct xen_netif_ctrl_sring *sring;
+	int err;
+
+	err = xenbus_setup_ring(dev, GFP_NOIO | __GFP_HIGH, (void **)&sring, 1,
+				&info->ctrl_ring_ref);
+	if (err)
+		goto fail;
+	XEN_FRONT_RING_INIT(&info->ctrl, sring, XEN_PAGE_SIZE);
+
+	err = xenbus_alloc_evtchn(dev, &info->ctrl_evtchn);
+	if (err)
+		goto fail_ring;
+
+	err = bind_evtchn_to_irqhandler(info->ctrl_evtchn, xennet_ctrl_interrupt,
+					0, "xennet-ctrl", info);
+	if (err < 0)
+		goto fail_evtchn;
+	info->ctrl_irq = err;
+	return;
+
+fail_evtchn:
+	xenbus_free_evtchn(dev, info->ctrl_evtchn);
+	info->ctrl_evtchn = 0;
+fail_ring:
+	xenbus_teardown_ring((void **)&sring, 1, &info->ctrl_ring_ref);
+	info->ctrl.sring = NULL;
+fail:
+	dev_warn(&dev->dev, "no control ring, so no static grants: %d\n", err);
+}
+
+static void xennet_disconnect_ctrl(struct netfront_info *info)
+{
+	if (info->ctrl_irq)
+		unbind_from_irqhandler(info->ctrl_irq, info);
+	info->ctrl_irq = 0;
+	info->ctrl_evtchn = 0;
+	if (info->ctrl.sring)
+		xenbus_teardown_ring((void **)&info->ctrl.sring, 1,
+				     &info->ctrl_ring_ref);
+	info->ctrl.sring = NULL;
+}
+
 static void xennet_end_access(int ref, void *page)
 {
 	/* This frees the page as a side-effect */
@@ -1872,6 +1940,8 @@ static void xennet_disconnect_backend(struct netfront_info *info)
 
 		page_pool_destroy(queue->page_pool);
 	}
+
+	xennet_disconnect_ctrl(info);
 }
 
 /*
@@ -2403,6 +2473,10 @@ static int talk_to_netback(struct xenbus_device *dev,
 			goto destroy_ring;
 	}
 
+	if (xennet_static_grants &&
+	    xenbus_read_unsigned(info->xbdev->otherend, "feature-ctrl-ring", 0))
+		setup_netfront_ctrl(dev, info);
+
 again:
 	err = xenbus_transaction_start(&xbt);
 	if (err) {
@@ -2472,6 +2546,30 @@ again:
 	if (err) {
 		message = "writing feature-ipv6-csum-offload";
 		goto abort_transaction;
+	}
+
+	if (!info->ctrl.sring) {
+		/*
+		 * Keys left from an earlier connection would make the backend
+		 * map a grant reference that may now name a different page.
+		 * The keys are absent on a first connection, so errors are
+		 * ignored.
+		 */
+		xenbus_rm(xbt, dev->nodename, "ctrl-ring-ref");
+		xenbus_rm(xbt, dev->nodename, "event-channel-ctrl");
+	} else {
+		err = xenbus_printf(xbt, dev->nodename, "ctrl-ring-ref", "%u",
+				    info->ctrl_ring_ref);
+		if (err) {
+			message = "writing ctrl-ring-ref";
+			goto abort_transaction;
+		}
+		err = xenbus_printf(xbt, dev->nodename, "event-channel-ctrl",
+				    "%u", info->ctrl_evtchn);
+		if (err) {
+			message = "writing event-channel-ctrl";
+			goto abort_transaction;
+		}
 	}
 
 	err = xenbus_transaction_end(xbt, 0);
