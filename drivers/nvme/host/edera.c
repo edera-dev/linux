@@ -122,7 +122,7 @@ module_param(edera_db_page, uint, 0444);
 MODULE_PARM_DESC(edera_db_page,
 		 "write doorbells to a granted page that the backend polls: 1 with MSI-X interrupts, 2 with event channel interrupts, 0 for event channels in both directions");
 
-static unsigned int edera_copy = 1;
+static unsigned int edera_copy = 2;
 module_param(edera_copy, uint, 0444);
 MODULE_PARM_DESC(edera_copy,
 		 "grant a mapping's own pages for the backend to copy, instead of copying through the data pool: 1 for reads, 2 for reads and writes, 0 never");
