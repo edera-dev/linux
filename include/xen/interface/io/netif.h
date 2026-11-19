@@ -348,6 +348,9 @@ struct xen_netif_ctrl_request {
 #define XEN_NETIF_CTRL_TYPE_SET_HASH_MAPPING_SIZE 5
 #define XEN_NETIF_CTRL_TYPE_SET_HASH_MAPPING      6
 #define XEN_NETIF_CTRL_TYPE_SET_HASH_ALGORITHM    7
+#define XEN_NETIF_CTRL_TYPE_GET_GREF_MAPPING_SIZE 8
+#define XEN_NETIF_CTRL_TYPE_ADD_GREF_MAPPING      9
+#define XEN_NETIF_CTRL_TYPE_DEL_GREF_MAPPING     10
 
 	uint32_t data[3];
 };
@@ -383,6 +386,44 @@ struct xen_netif_ctrl_response {
 #define XEN_NETIF_CTRL_STATUS_BUFFER_OVERFLOW   3
 
 	uint32_t data;
+};
+
+/*
+ * Static Grants (struct xen_netif_gref)
+ * =====================================
+ *
+ * A frontend may provide a fixed set of grant references to be mapped on
+ * the backend. The message of type XEN_NETIF_CTRL_TYPE_ADD_GREF_MAPPING
+ * prior its usage in the command ring allows for creation of these mappings.
+ * The backend will maintain a fixed amount of these mappings.
+ *
+ * XEN_NETIF_CTRL_TYPE_GET_GREF_MAPPING_SIZE lets a frontend query how many
+ * of these mappings can be kept.
+ *
+ * Each entry in the XEN_NETIF_CTRL_TYPE_{ADD,DEL}_GREF_MAPPING input table has
+ * the following format:
+ *
+ *    0     1     2     3     4     5     6     7  octet
+ * +-----+-----+-----+-----+-----+-----+-----+-----+
+ * | grant ref             |  flags    |  status   |
+ * +-----+-----+-----+-----+-----+-----+-----+-----+
+ *
+ * grant ref: grant reference (IN)
+ * flags: flags describing the control operation (IN)
+ * status: XEN_NETIF_CTRL_STATUS_* (OUT)
+ *
+ * 'status' is an output parameter which does not require to be set to zero
+ * prior to its usage in the corresponding control messages.
+ */
+
+struct xen_netif_gref {
+	grant_ref_t ref;
+	uint16_t flags;
+
+#define _XEN_NETIF_CTRLF_GREF_readonly    0
+#define XEN_NETIF_CTRLF_GREF_readonly    (1U<<_XEN_NETIF_CTRLF_GREF_readonly)
+
+	uint16_t status;
 };
 
 /*
