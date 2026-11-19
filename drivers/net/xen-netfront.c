@@ -72,6 +72,11 @@ static bool __read_mostly xennet_trusted = true;
 module_param_named(trusted, xennet_trusted, bool, 0644);
 MODULE_PARM_DESC(trusted, "Is the backend trusted");
 
+static bool __read_mostly xennet_static_grants = true;
+module_param_named(static_grants, xennet_static_grants, bool, 0644);
+MODULE_PARM_DESC(static_grants,
+		 "Register a fixed pool of buffer pages with a backend that maps them once");
+
 #define XENNET_TIMEOUT  (5 * HZ)
 
 static const struct ethtool_ops xennet_ethtool_ops;
@@ -105,6 +110,26 @@ struct netfront_stats {
 };
 
 struct netfront_info;
+
+/*
+ * Pages registered with the backend as static grants. The backend keeps them
+ * mapped, so a request that names one of them needs no grant of its own: the
+ * frontend copies the data in or out of the page instead.
+ */
+struct xennet_pool {
+	unsigned int nr;
+	struct page **pages;
+	grant_ref_t *refs;
+	/* Stack of free page indices. */
+	unsigned short *free;
+	unsigned int nr_free;
+	/* Requests that needed a grant of their own because no page was free. */
+	unsigned long fallbacks;
+};
+
+#define XENNET_NO_POOL_SLOT (-1)
+
+static void xennet_register_pools(struct work_struct *work);
 
 struct netfront_queue {
 	unsigned int id; /* Queue ID, 0-based */
@@ -157,6 +182,14 @@ struct netfront_queue {
 
 	struct page_pool *page_pool;
 	struct xdp_rxq_info xdp_rxq;
+
+	/* Static grant pools: tx_pool is used under tx_lock, rx_pool under rx_lock. */
+	struct xennet_pool tx_pool;
+	struct xennet_pool rx_pool;
+	/* The pool page each rx ring entry uses, or XENNET_NO_POOL_SLOT. */
+	short rx_pool_slot[NET_RX_RING_SIZE];
+	/* The pool page each tx request uses, or XENNET_NO_POOL_SLOT. */
+	short tx_pool_slot[NET_TX_RING_SIZE];
 };
 
 struct netfront_info {
@@ -183,6 +216,21 @@ struct netfront_info {
 	bool bounce;
 
 	atomic_t rx_gso_checksum_fixup;
+
+	/* Control ring, used to register static grants. */
+	struct xen_netif_ctrl_front_ring ctrl;
+	grant_ref_t ctrl_ring_ref;
+	unsigned int ctrl_evtchn;
+	unsigned int ctrl_irq;
+	wait_queue_head_t ctrl_wq;
+	/* Serialises control requests, pool registration and teardown. */
+	struct mutex ctrl_lock;
+	u16 ctrl_id;
+	/* A request timed out, so later responses cannot be matched. */
+	bool ctrl_broken;
+	bool pools_registered;
+	/* Registers the pools; it waits on the backend, so not from xenwatch. */
+	struct work_struct pool_work;
 };
 
 struct netfront_rx_info {
@@ -212,6 +260,22 @@ static unsigned short get_id_from_list(unsigned *head, unsigned short *list)
 	return id;
 }
 
+/* A free pool page, or XENNET_NO_POOL_SLOT when the request needs its own grant. */
+static int xennet_pool_get(struct xennet_pool *pool)
+{
+	if (!pool->nr_free) {
+		if (pool->nr)
+			pool->fallbacks++;
+		return XENNET_NO_POOL_SLOT;
+	}
+	return pool->free[--pool->nr_free];
+}
+
+static void xennet_pool_put(struct xennet_pool *pool, int slot)
+{
+	pool->free[pool->nr_free++] = slot;
+}
+
 static int xennet_rxidx(RING_IDX idx)
 {
 	return idx & (NET_RX_RING_SIZE - 1);
@@ -233,6 +297,86 @@ static grant_ref_t xennet_get_rx_ref(struct netfront_queue *queue,
 	grant_ref_t ref = queue->grant_rx_ref[i];
 	queue->grant_rx_ref[i] = INVALID_GRANT_REF;
 	return ref;
+}
+
+static int xennet_get_rx_pool_slot(struct netfront_queue *queue, RING_IDX ri)
+{
+	int i = xennet_rxidx(ri);
+	int slot = queue->rx_pool_slot[i];
+
+	queue->rx_pool_slot[i] = XENNET_NO_POOL_SLOT;
+	return slot;
+}
+
+/*
+ * Grant the backend the buffer for rx ring entry @id: a free pool page, or
+ * else the page of @skb.
+ */
+static grant_ref_t xennet_rx_grant(struct netfront_queue *queue,
+				   unsigned short id, struct sk_buff *skb)
+{
+	int slot = xennet_pool_get(&queue->rx_pool);
+	grant_ref_t ref;
+
+	queue->rx_pool_slot[id] = slot;
+	if (slot != XENNET_NO_POOL_SLOT)
+		return queue->rx_pool.refs[slot];
+
+	ref = gnttab_claim_grant_reference(&queue->gref_rx_head);
+	WARN_ON_ONCE(IS_ERR_VALUE((unsigned long)(int)ref));
+	gnttab_page_grant_foreign_access_ref_one(ref,
+						 queue->info->xbdev->otherend_id,
+						 skb_frag_page(&skb_shinfo(skb)->frags[0]),
+						 0);
+	return ref;
+}
+
+/*
+ * Take back the buffer of a valid rx response. Data in a pool page is copied
+ * into the page of @skb at the same offset. Returns false when the backend
+ * still has the grant of the skb's page mapped.
+ */
+static bool xennet_rx_ungrant(struct netfront_queue *queue, grant_ref_t ref,
+			      int slot, struct sk_buff *skb,
+			      const struct xen_netif_rx_response *rx)
+{
+	if (slot != XENNET_NO_POOL_SLOT) {
+		void *dst = kmap_local_page(skb_frag_page(&skb_shinfo(skb)->frags[0]));
+
+		memcpy(dst + rx->offset,
+		       page_address(queue->rx_pool.pages[slot]) + rx->offset,
+		       rx->status);
+		kunmap_local(dst);
+		xennet_pool_put(&queue->rx_pool, slot);
+		return true;
+	}
+
+	if (!gnttab_end_foreign_access_ref(ref))
+		return false;
+	gnttab_release_grant_reference(&queue->gref_rx_head, ref);
+	return true;
+}
+
+/* End the backend's access to the buffer of an rx ring entry being freed. */
+static void xennet_rx_end_access(struct netfront_queue *queue,
+				 unsigned short id, grant_ref_t ref,
+				 struct sk_buff *skb)
+{
+	struct page *page;
+
+	if (queue->rx_pool_slot[id] != XENNET_NO_POOL_SLOT) {
+		xennet_pool_put(&queue->rx_pool, queue->rx_pool_slot[id]);
+		queue->rx_pool_slot[id] = XENNET_NO_POOL_SLOT;
+		return;
+	}
+
+	page = skb_frag_page(&skb_shinfo(skb)->frags[0]);
+
+	/* gnttab_end_foreign_access() needs a page ref until
+	 * foreign access is ended (which may be deferred).
+	 */
+	get_page(page);
+	gnttab_end_foreign_access(ref, page);
 }
 
 #ifdef CONFIG_SYSFS
@@ -313,7 +457,6 @@ static void xennet_alloc_rx_buffers(struct netfront_queue *queue)
 		struct sk_buff *skb;
 		unsigned short id;
 		grant_ref_t ref;
-		struct page *page;
 		struct xen_netif_rx_request *req;
 
 		skb = xennet_alloc_one_rx_buffer(queue);
@@ -327,17 +470,10 @@ static void xennet_alloc_rx_buffers(struct netfront_queue *queue)
 		BUG_ON(queue->rx_skbs[id]);
 		queue->rx_skbs[id] = skb;
 
-		ref = gnttab_claim_grant_reference(&queue->gref_rx_head);
-		WARN_ON_ONCE(IS_ERR_VALUE((unsigned long)(int)ref));
+		ref = xennet_rx_grant(queue, id, skb);
 		queue->grant_rx_ref[id] = ref;
 
-		page = skb_frag_page(&skb_shinfo(skb)->frags[0]);
-
 		req = RING_GET_REQUEST(&queue->rx, req_prod);
-		gnttab_page_grant_foreign_access_ref_one(ref,
-							 queue->info->xbdev->otherend_id,
-							 page,
-							 0);
 		req->id = id;
 		req->gref = ref;
 	}
@@ -389,6 +525,68 @@ static int xennet_open(struct net_device *dev)
 	return 0;
 }
 
+/*
+ * Grant the backend the data of a tx request: copied into a free pool page at
+ * the same offset, or else the page itself, read-only.
+ */
+static grant_ref_t xennet_tx_grant(struct netfront_queue *queue,
+				   unsigned int id, struct page *page,
+				   unsigned long gfn, unsigned int offset,
+				   unsigned int len)
+{
+	int slot = xennet_pool_get(&queue->tx_pool);
+	grant_ref_t ref;
+
+	queue->tx_pool_slot[id] = slot;
+	if (slot != XENNET_NO_POOL_SLOT) {
+		void *src = kmap_local_page(page);
+
+		memcpy(page_address(queue->tx_pool.pages[slot]) + offset,
+		       src + offset, len);
+		kunmap_local(src);
+		return queue->tx_pool.refs[slot];
+	}
+
+	ref = gnttab_claim_grant_reference(&queue->gref_tx_head);
+	WARN_ON_ONCE(IS_ERR_VALUE((unsigned long)(int)ref));
+	gnttab_grant_foreign_access_ref(ref, queue->info->xbdev->otherend_id,
+					gfn, GNTMAP_readonly);
+	return ref;
+}
+
+/*
+ * Take back the grant of a completed tx request. Returns false when the
+ * backend still has it mapped.
+ */
+static bool xennet_tx_ungrant(struct netfront_queue *queue, unsigned int id)
+{
+	if (queue->tx_pool_slot[id] != XENNET_NO_POOL_SLOT) {
+		xennet_pool_put(&queue->tx_pool, queue->tx_pool_slot[id]);
+		queue->tx_pool_slot[id] = XENNET_NO_POOL_SLOT;
+		return true;
+	}
+
+	if (!gnttab_end_foreign_access_ref(queue->grant_tx_ref[id]))
+		return false;
+	gnttab_release_grant_reference(&queue->gref_tx_head,
+				       queue->grant_tx_ref[id]);
+	return true;
+}
+
+/* End the backend's access to the data of a tx request being freed. */
+static void xennet_tx_end_access(struct netfront_queue *queue, unsigned int id)
+{
+	if (queue->tx_pool_slot[id] != XENNET_NO_POOL_SLOT) {
+		xennet_pool_put(&queue->tx_pool, queue->tx_pool_slot[id]);
+		queue->tx_pool_slot[id] = XENNET_NO_POOL_SLOT;
+		return;
+	}
+
+	get_page(queue->grant_tx_page[id]);
+	gnttab_end_foreign_access(queue->grant_tx_ref[id],
+				  queue->grant_tx_page[id]);
+}
+
 static bool xennet_tx_buf_gc(struct netfront_queue *queue)
 {
 	RING_IDX cons, prod;
@@ -434,14 +632,11 @@ static bool xennet_tx_buf_gc(struct netfront_queue *queue)
 			queue->tx_link[id] = TX_LINK_NONE;
 			skb = queue->tx_skbs[id];
 			queue->tx_skbs[id] = NULL;
-			if (unlikely(!gnttab_end_foreign_access_ref(
-				queue->grant_tx_ref[id]))) {
+			if (unlikely(!xennet_tx_ungrant(queue, id))) {
 				dev_alert(dev,
 					  "Grant still in use by backend domain\n");
 				goto err;
 			}
-			gnttab_release_grant_reference(
-				&queue->gref_tx_head, queue->grant_tx_ref[id]);
 			queue->grant_tx_ref[id] = INVALID_GRANT_REF;
 			queue->grant_tx_page[id] = NULL;
 			add_id_to_list(&queue->tx_skb_freelist, queue->tx_link, id);
@@ -487,11 +682,7 @@ static void xennet_tx_setup_grant(unsigned long gfn, unsigned int offset,
 
 	id = get_id_from_list(&queue->tx_skb_freelist, queue->tx_link);
 	tx = RING_GET_REQUEST(&queue->tx, queue->tx.req_prod_pvt++);
-	ref = gnttab_claim_grant_reference(&queue->gref_tx_head);
-	WARN_ON_ONCE(IS_ERR_VALUE((unsigned long)(int)ref));
-
-	gnttab_grant_foreign_access_ref(ref, queue->info->xbdev->otherend_id,
-					gfn, GNTMAP_readonly);
+	ref = xennet_tx_grant(queue, id, page, gfn, offset, len);
 
 	queue->tx_skbs[id] = skb;
 	queue->grant_tx_page[id] = page;
@@ -912,13 +1103,14 @@ static void xennet_set_rx_rsp_cons(struct netfront_queue *queue, RING_IDX val)
 }
 
 static void xennet_move_rx_slot(struct netfront_queue *queue, struct sk_buff *skb,
-				grant_ref_t ref)
+				grant_ref_t ref, int slot)
 {
 	int new = xennet_rxidx(queue->rx.req_prod_pvt);
 
 	BUG_ON(queue->rx_skbs[new]);
 	queue->rx_skbs[new] = skb;
 	queue->grant_rx_ref[new] = ref;
+	queue->rx_pool_slot[new] = slot;
 	RING_GET_REQUEST(&queue->rx, queue->rx.req_prod_pvt)->id = new;
 	RING_GET_REQUEST(&queue->rx, queue->rx.req_prod_pvt)->gref = ref;
 	queue->rx.req_prod_pvt++;
@@ -959,7 +1151,8 @@ static int xennet_get_extras(struct netfront_queue *queue,
 
 		skb = xennet_get_rx_skb(queue, cons);
 		ref = xennet_get_rx_ref(queue, cons);
-		xennet_move_rx_slot(queue, skb, ref);
+		xennet_move_rx_slot(queue, skb, ref,
+				    xennet_get_rx_pool_slot(queue, cons));
 	} while (extra.flags & XEN_NETIF_EXTRA_FLAG_MORE);
 
 	xennet_set_rx_rsp_cons(queue, cons);
@@ -1031,6 +1224,7 @@ static int xennet_get_responses(struct netfront_queue *queue,
 	struct sk_buff *skb = xennet_get_rx_skb(queue, cons);
 	struct xen_netif_extra_info *extras = rinfo->extras;
 	grant_ref_t ref = xennet_get_rx_ref(queue, cons);
+	int slot = xennet_get_rx_pool_slot(queue, cons);
 	struct device *dev = &queue->info->netdev->dev;
 	struct bpf_prog *xdp_prog;
 	struct xdp_buff xdp;
@@ -1070,20 +1264,18 @@ static int xennet_get_responses(struct netfront_queue *queue,
 			if (net_ratelimit())
 				dev_warn(dev, "rx->offset: %u, size: %d\n",
 					 rx->offset, rx->status);
-			xennet_move_rx_slot(queue, skb, ref);
+			xennet_move_rx_slot(queue, skb, ref, slot);
 			err = -EINVAL;
 			goto next;
 		}
 
-		if (!gnttab_end_foreign_access_ref(ref)) {
+		if (!xennet_rx_ungrant(queue, ref, slot, skb, rx)) {
 			dev_alert(dev,
 				  "Grant still in use by backend domain\n");
 			queue->info->broken = true;
 			dev_alert(dev, "Disabled for further use\n");
 			return -EINVAL;
 		}
-
-		gnttab_release_grant_reference(&queue->gref_rx_head, ref);
 
 		rcu_read_lock();
 		xdp_prog = rcu_dereference(queue->xdp_prog);
@@ -1119,6 +1311,7 @@ next:
 		rx = &rx_local;
 		skb = xennet_get_rx_skb(queue, cons + slots);
 		ref = xennet_get_rx_ref(queue, cons + slots);
+		slot = xennet_get_rx_pool_slot(queue, cons + slots);
 		slots++;
 	}
 
@@ -1444,9 +1637,7 @@ static void xennet_release_tx_bufs(struct netfront_queue *queue)
 
 		skb = queue->tx_skbs[i];
 		queue->tx_skbs[i] = NULL;
-		get_page(queue->grant_tx_page[i]);
-		gnttab_end_foreign_access(queue->grant_tx_ref[i],
-					  queue->grant_tx_page[i]);
+		xennet_tx_end_access(queue, i);
 		queue->grant_tx_page[i] = NULL;
 		queue->grant_tx_ref[i] = INVALID_GRANT_REF;
 		add_id_to_list(&queue->tx_skb_freelist, queue->tx_link, i);
@@ -1462,7 +1653,6 @@ static void xennet_release_rx_bufs(struct netfront_queue *queue)
 
 	for (id = 0; id < NET_RX_RING_SIZE; id++) {
 		struct sk_buff *skb;
-		struct page *page;
 
 		skb = queue->rx_skbs[id];
 		if (!skb)
@@ -1472,13 +1662,7 @@ static void xennet_release_rx_bufs(struct netfront_queue *queue)
 		if (ref == INVALID_GRANT_REF)
 			continue;
 
-		page = skb_frag_page(&skb_shinfo(skb)->frags[0]);
-
-		/* gnttab_end_foreign_access() needs a page ref until
-		 * foreign access is ended (which may be deferred).
-		 */
-		get_page(page);
-		gnttab_end_foreign_access(ref, page);
+		xennet_rx_end_access(queue, id, ref, skb);
 		queue->grant_rx_ref[id] = INVALID_GRANT_REF;
 
 		kfree_skb(skb);
@@ -1735,6 +1919,10 @@ static struct net_device *xennet_create_dev(struct xenbus_device *dev)
 	np                   = netdev_priv(netdev);
 	np->xbdev            = dev;
 
+	init_waitqueue_head(&np->ctrl_wq);
+	mutex_init(&np->ctrl_lock);
+	INIT_WORK(&np->pool_work, xennet_register_pools);
+
 	np->queues = NULL;
 
 	err = -ENOMEM;
@@ -1817,6 +2005,285 @@ static int netfront_probe(struct xenbus_device *dev,
 	return 0;
 }
 
+static irqreturn_t xennet_ctrl_interrupt(int irq, void *dev_id)
+{
+	struct netfront_info *info = dev_id;
+
+	wake_up(&info->ctrl_wq);
+	return IRQ_HANDLED;
+}
+
+/* Set up the control ring. On failure the device runs without static grants. */
+static void setup_netfront_ctrl(struct xenbus_device *dev,
+				struct netfront_info *info)
+{
+	struct xen_netif_ctrl_sring *sring;
+	int err;
+
+	err = xenbus_setup_ring(dev, GFP_NOIO | __GFP_HIGH, (void **)&sring, 1,
+				&info->ctrl_ring_ref);
+	if (err)
+		goto fail;
+	XEN_FRONT_RING_INIT(&info->ctrl, sring, XEN_PAGE_SIZE);
+
+	err = xenbus_alloc_evtchn(dev, &info->ctrl_evtchn);
+	if (err)
+		goto fail_ring;
+
+	err = bind_evtchn_to_irqhandler(info->ctrl_evtchn, xennet_ctrl_interrupt,
+					0, "xennet-ctrl", info);
+	if (err < 0)
+		goto fail_evtchn;
+	info->ctrl_irq = err;
+	return;
+
+fail_evtchn:
+	xenbus_free_evtchn(dev, info->ctrl_evtchn);
+	info->ctrl_evtchn = 0;
+fail_ring:
+	xenbus_teardown_ring((void **)&sring, 1, &info->ctrl_ring_ref);
+	info->ctrl.sring = NULL;
+fail:
+	dev_warn(&dev->dev, "no control ring, so no static grants: %d\n", err);
+}
+
+/* Caller holds ctrl_lock. */
+static void xennet_disconnect_ctrl(struct netfront_info *info)
+{
+	if (info->ctrl_irq)
+		unbind_from_irqhandler(info->ctrl_irq, info);
+	info->ctrl_irq = 0;
+	info->ctrl_evtchn = 0;
+	if (info->ctrl.sring)
+		xenbus_teardown_ring((void **)&info->ctrl.sring, 1,
+				     &info->ctrl_ring_ref);
+	info->ctrl.sring = NULL;
+	info->ctrl_broken = false;
+	info->pools_registered = false;
+}
+
+/*
+ * Send one control request and wait for its response. Caller holds ctrl_lock.
+ * Returns -EOPNOTSUPP when the backend answered with a status other than
+ * success.
+ */
+static int xennet_ctrl_request(struct netfront_info *info, u16 type,
+			       u32 data0, u32 data1, u32 data2, u32 *data)
+{
+	struct xen_netif_ctrl_request *req;
+	struct xen_netif_ctrl_response rsp;
+	u16 id = info->ctrl_id++;
+	int notify;
+
+	if (!info->ctrl.sring || info->ctrl_broken)
+		return -ENODEV;
+
+	/* Ask for an event when the response arrives. */
+	info->ctrl.sring->rsp_event = info->ctrl.rsp_cons + 1;
+
+	req = RING_GET_REQUEST(&info->ctrl, info->ctrl.req_prod_pvt);
+	req->id = id;
+	req->type = type;
+	req->data[0] = data0;
+	req->data[1] = data1;
+	req->data[2] = data2;
+	info->ctrl.req_prod_pvt++;
+
+	RING_PUSH_REQUESTS_AND_CHECK_NOTIFY(&info->ctrl, notify);
+	if (notify)
+		notify_remote_via_irq(info->ctrl_irq);
+
+	if (!wait_event_timeout(info->ctrl_wq,
+				READ_ONCE(info->ctrl.sring->rsp_prod) !=
+				info->ctrl.rsp_cons,
+				XENNET_TIMEOUT)) {
+		/* A late response would answer the next request. */
+		info->ctrl_broken = true;
+		return -ETIMEDOUT;
+	}
+	virt_rmb(); /* Read the response after its producer index. */
+
+	RING_COPY_RESPONSE(&info->ctrl, info->ctrl.rsp_cons, &rsp);
+	info->ctrl.rsp_cons++;
+
+	if (rsp.id != id || rsp.type != type) {
+		info->ctrl_broken = true;
+		return -EIO;
+	}
+	if (rsp.status != XEN_NETIF_CTRL_STATUS_SUCCESS)
+		return -EOPNOTSUPP;
+	if (data)
+		*data = rsp.data;
+	return 0;
+}
+
+/*
+ * End the backend's access to each pool page and free it. A page the backend
+ * still has mapped is freed once it unmaps the page.
+ */
+static void xennet_free_pool(struct xennet_pool *pool)
+{
+	unsigned int i;
+
+	/* Every page is free once the rings are released, so a missing one leaked. */
+	WARN_ON_ONCE(pool->nr_free != pool->nr);
+	for (i = 0; i < pool->nr; i++)
+		gnttab_end_foreign_access(pool->refs[i], pool->pages[i]);
+	kfree(pool->pages);
+	kfree(pool->refs);
+	kfree(pool->free);
+	memset(pool, 0, sizeof(*pool));
+}
+
+static int xennet_alloc_pool(struct netfront_info *info,
+			     struct xennet_pool *pool, unsigned int nr,
+			     bool readonly)
+{
+	unsigned int i;
+
+	pool->pages = kcalloc(nr, sizeof(*pool->pages), GFP_KERNEL);
+	pool->refs = kcalloc(nr, sizeof(*pool->refs), GFP_KERNEL);
+	pool->free = kcalloc(nr, sizeof(*pool->free), GFP_KERNEL);
+	if (!pool->pages || !pool->refs || !pool->free)
+		goto fail;
+
+	for (i = 0; i < nr; i++) {
+		/*
+		 * Zeroed, because the backend can read the whole page, not only
+		 * the packet data copied into it.
+		 */
+		struct page *page = alloc_page(GFP_KERNEL | __GFP_ZERO);
+		int ref;
+
+		if (!page)
+			goto fail;
+		ref = gnttab_grant_foreign_access(info->xbdev->otherend_id,
+						  xen_page_to_gfn(page),
+						  readonly);
+		if (ref < 0) {
+			__free_page(page);
+			goto fail;
+		}
+		pool->pages[i] = page;
+		pool->refs[i] = ref;
+		pool->free[i] = i;
+		pool->nr++;
+		pool->nr_free++;
+	}
+	return 0;
+
+fail:
+	xennet_free_pool(pool);
+	return -ENOMEM;
+}
+
+/*
+ * Register a pool of RX and TX pages for one queue with the backend, then let
+ * the queue use them. Caller holds ctrl_lock.
+ */
+static int xennet_register_queue_pool(struct netfront_info *info,
+				      struct netfront_queue *queue)
+{
+	struct xennet_pool rx = {}, tx = {};
+	struct xen_netif_gref *table;
+	struct page *table_page;
+	unsigned int nr_rx, nr_tx, i, n = 0;
+	unsigned long flags;
+	int table_ref;
+	u32 size;
+	int err;
+
+	err = xennet_ctrl_request(info, XEN_NETIF_CTRL_TYPE_GET_GREF_MAPPING_SIZE,
+				  queue->id, 0, 0, &size);
+	if (err)
+		return err;
+
+	/* One table page holds every entry of a request. */
+	size = min_t(u32, size, XEN_PAGE_SIZE / sizeof(*table));
+	nr_rx = min_t(u32, size / 2, NET_RX_RING_SIZE);
+	nr_tx = min_t(u32, size - nr_rx, NET_TX_RING_SIZE);
+	if (!nr_rx || !nr_tx)
+		return -ENOSPC;
+
+	err = xennet_alloc_pool(info, &rx, nr_rx, false);
+	if (err)
+		return err;
+	err = xennet_alloc_pool(info, &tx, nr_tx, true);
+	if (err)
+		goto free_rx;
+
+	table_page = alloc_page(GFP_KERNEL | __GFP_ZERO);
+	if (!table_page) {
+		err = -ENOMEM;
+		goto free_tx;
+	}
+	table = page_address(table_page);
+	for (i = 0; i < nr_rx; i++, n++)
+		table[n].ref = rx.refs[i];
+	for (i = 0; i < nr_tx; i++, n++) {
+		table[n].ref = tx.refs[i];
+		table[n].flags = XEN_NETIF_CTRLF_GREF_readonly;
+	}
+	table_ref = gnttab_grant_foreign_access(info->xbdev->otherend_id,
+						xen_page_to_gfn(table_page), 0);
+	if (table_ref < 0) {
+		__free_page(table_page);
+		err = table_ref;
+		goto free_tx;
+	}
+
+	err = xennet_ctrl_request(info, XEN_NETIF_CTRL_TYPE_ADD_GREF_MAPPING,
+				  queue->id, table_ref, n, NULL);
+	/* This also frees the table page. */
+	gnttab_end_foreign_access(table_ref, table_page);
+	if (err)
+		goto free_tx;
+
+	spin_lock_irqsave(&queue->tx_lock, flags);
+	queue->tx_pool = tx;
+	spin_unlock_irqrestore(&queue->tx_lock, flags);
+	spin_lock_bh(&queue->rx_lock);
+	queue->rx_pool = rx;
+	spin_unlock_bh(&queue->rx_lock);
+	return 0;
+
+free_tx:
+	xennet_free_pool(&tx);
+free_rx:
+	xennet_free_pool(&rx);
+	return err;
+}
+
+/* Register static grant pools once the backend is connected. */
+static void xennet_register_pools(struct work_struct *work)
+{
+	struct netfront_info *info = container_of(work, struct netfront_info,
+						  pool_work);
+	unsigned int num_queues = info->netdev->real_num_tx_queues;
+	unsigned int i;
+	int err = 0;
+
+	mutex_lock(&info->ctrl_lock);
+	if (info->pools_registered || !info->ctrl.sring || !info->queues)
+		goto out;
+	info->pools_registered = true;
+
+	for (i = 0; i < num_queues; i++) {
+		err = xennet_register_queue_pool(info, &info->queues[i]);
+		if (err)
+			break;
+	}
+	if (err && err != -EOPNOTSUPP)
+		dev_warn(&info->xbdev->dev,
+			 "static grants for %u of %u queues: %d\n", i,
+			 num_queues, err);
+	else if (!err)
+		dev_info(&info->xbdev->dev,
+			 "static grants for %u queues\n", num_queues);
+out:
+	mutex_unlock(&info->ctrl_lock);
+}
+
 static void xennet_end_access(int ref, void *page)
 {
 	/* This frees the page as a side-effect */
@@ -1828,6 +2295,9 @@ static void xennet_disconnect_backend(struct netfront_info *info)
 {
 	unsigned int i = 0;
 	unsigned int num_queues = info->netdev->real_num_tx_queues;
+
+	/* So that no registration installs a pool in a queue torn down below. */
+	cancel_work_sync(&info->pool_work);
 
 	netif_carrier_off(info->netdev);
 
@@ -1872,6 +2342,15 @@ static void xennet_disconnect_backend(struct netfront_info *info)
 
 		page_pool_destroy(queue->page_pool);
 	}
+
+	/* The queues are stopped, so nothing uses the pools any more. */
+	mutex_lock(&info->ctrl_lock);
+	for (i = 0; i < num_queues && info->queues; ++i) {
+		xennet_free_pool(&info->queues[i].tx_pool);
+		xennet_free_pool(&info->queues[i].rx_pool);
+	}
+	xennet_disconnect_ctrl(info);
+	mutex_unlock(&info->ctrl_lock);
 }
 
 /*
@@ -2125,6 +2604,7 @@ static int xennet_init_queue(struct netfront_queue *queue)
 		queue->tx_link[i] = i + 1;
 		queue->grant_tx_ref[i] = INVALID_GRANT_REF;
 		queue->grant_tx_page[i] = NULL;
+		queue->tx_pool_slot[i] = XENNET_NO_POOL_SLOT;
 	}
 	queue->tx_link[NET_TX_RING_SIZE - 1] = TX_LINK_NONE;
 
@@ -2132,6 +2612,7 @@ static int xennet_init_queue(struct netfront_queue *queue)
 	for (i = 0; i < NET_RX_RING_SIZE; i++) {
 		queue->rx_skbs[i] = NULL;
 		queue->grant_rx_ref[i] = INVALID_GRANT_REF;
+		queue->rx_pool_slot[i] = XENNET_NO_POOL_SLOT;
 	}
 
 	/* A grant for every tx ring slot */
@@ -2404,6 +2885,10 @@ static int talk_to_netback(struct xenbus_device *dev,
 			goto destroy_ring;
 	}
 
+	if (xennet_static_grants &&
+	    xenbus_read_unsigned(info->xbdev->otherend, "feature-ctrl-ring", 0))
+		setup_netfront_ctrl(dev, info);
+
 again:
 	err = xenbus_transaction_start(&xbt);
 	if (err) {
@@ -2473,6 +2958,30 @@ again:
 	if (err) {
 		message = "writing feature-ipv6-csum-offload";
 		goto abort_transaction;
+	}
+
+	if (!info->ctrl.sring) {
+		/*
+		 * Keys left from an earlier connection would make the backend
+		 * map a grant reference that may now name a different page.
+		 * The keys are absent on a first connection, so errors are
+		 * ignored.
+		 */
+		xenbus_rm(xbt, dev->nodename, "ctrl-ring-ref");
+		xenbus_rm(xbt, dev->nodename, "event-channel-ctrl");
+	} else {
+		err = xenbus_printf(xbt, dev->nodename, "ctrl-ring-ref", "%u",
+				    info->ctrl_ring_ref);
+		if (err) {
+			message = "writing ctrl-ring-ref";
+			goto abort_transaction;
+		}
+		err = xenbus_printf(xbt, dev->nodename, "event-channel-ctrl",
+				    "%u", info->ctrl_evtchn);
+		if (err) {
+			message = "writing event-channel-ctrl";
+			goto abort_transaction;
+		}
 	}
 
 	err = xenbus_transaction_end(xbt, 0);
@@ -2596,6 +3105,7 @@ static void netback_changed(struct xenbus_device *dev,
 
 	case XenbusStateConnected:
 		netdev_notify_peers(netdev);
+		schedule_work(&np->pool_work);
 		break;
 
 	case XenbusStateClosed:
@@ -2618,11 +3128,19 @@ static const struct xennet_stat {
 	},
 };
 
+/* Static grant pool sizes and fallbacks, summed over the queues. */
+static const char xennet_pool_stats[][ETH_GSTRING_LEN] = {
+	"static_grant_rx_pages",
+	"static_grant_rx_fallbacks",
+	"static_grant_tx_pages",
+	"static_grant_tx_fallbacks",
+};
+
 static int xennet_get_sset_count(struct net_device *dev, int string_set)
 {
 	switch (string_set) {
 	case ETH_SS_STATS:
-		return ARRAY_SIZE(xennet_stats);
+		return ARRAY_SIZE(xennet_stats) + ARRAY_SIZE(xennet_pool_stats);
 	default:
 		return -EINVAL;
 	}
@@ -2632,10 +3150,23 @@ static void xennet_get_ethtool_stats(struct net_device *dev,
 				     struct ethtool_stats *stats, u64 * data)
 {
 	void *np = netdev_priv(dev);
+	struct netfront_info *info = np;
+	u64 *pool = data + ARRAY_SIZE(xennet_stats);
+	unsigned int q;
 	int i;
 
 	for (i = 0; i < ARRAY_SIZE(xennet_stats); i++)
 		data[i] = atomic_read((atomic_t *)(np + xennet_stats[i].offset));
+
+	memset(pool, 0, sizeof(*pool) * ARRAY_SIZE(xennet_pool_stats));
+	for (q = 0; info->queues && q < dev->real_num_tx_queues; q++) {
+		struct netfront_queue *queue = &info->queues[q];
+
+		pool[0] += READ_ONCE(queue->rx_pool.nr);
+		pool[1] += READ_ONCE(queue->rx_pool.fallbacks);
+		pool[2] += READ_ONCE(queue->tx_pool.nr);
+		pool[3] += READ_ONCE(queue->tx_pool.fallbacks);
+	}
 }
 
 static void xennet_get_strings(struct net_device *dev, u32 stringset, u8 * data)
@@ -2647,6 +3178,10 @@ static void xennet_get_strings(struct net_device *dev, u32 stringset, u8 * data)
 		for (i = 0; i < ARRAY_SIZE(xennet_stats); i++)
 			memcpy(data + i * ETH_GSTRING_LEN,
 			       xennet_stats[i].name, ETH_GSTRING_LEN);
+		data += ARRAY_SIZE(xennet_stats) * ETH_GSTRING_LEN;
+		for (i = 0; i < ARRAY_SIZE(xennet_pool_stats); i++)
+			memcpy(data + i * ETH_GSTRING_LEN,
+			       xennet_pool_stats[i], ETH_GSTRING_LEN);
 		break;
 	}
 }
