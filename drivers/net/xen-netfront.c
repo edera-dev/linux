@@ -188,6 +188,8 @@ struct netfront_queue {
 	struct xennet_pool rx_pool;
 	/* The pool page each rx ring entry uses, or XENNET_NO_POOL_SLOT. */
 	short rx_pool_slot[NET_RX_RING_SIZE];
+	/* The pool page each tx request uses, or XENNET_NO_POOL_SLOT. */
+	short tx_pool_slot[NET_TX_RING_SIZE];
 };
 
 struct netfront_info {
@@ -523,6 +525,68 @@ static int xennet_open(struct net_device *dev)
 	return 0;
 }
 
+/*
+ * Grant the backend the data of a tx request: copied into a free pool page at
+ * the same offset, or else the page itself, read-only.
+ */
+static grant_ref_t xennet_tx_grant(struct netfront_queue *queue,
+				   unsigned int id, struct page *page,
+				   unsigned long gfn, unsigned int offset,
+				   unsigned int len)
+{
+	int slot = xennet_pool_get(&queue->tx_pool);
+	grant_ref_t ref;
+
+	queue->tx_pool_slot[id] = slot;
+	if (slot != XENNET_NO_POOL_SLOT) {
+		void *src = kmap_local_page(page);
+
+		memcpy(page_address(queue->tx_pool.pages[slot]) + offset,
+		       src + offset, len);
+		kunmap_local(src);
+		return queue->tx_pool.refs[slot];
+	}
+
+	ref = gnttab_claim_grant_reference(&queue->gref_tx_head);
+	WARN_ON_ONCE(IS_ERR_VALUE((unsigned long)(int)ref));
+	gnttab_grant_foreign_access_ref(ref, queue->info->xbdev->otherend_id,
+					gfn, GNTMAP_readonly);
+	return ref;
+}
+
+/*
+ * Take back the grant of a completed tx request. Returns false when the
+ * backend still has it mapped.
+ */
+static bool xennet_tx_ungrant(struct netfront_queue *queue, unsigned int id)
+{
+	if (queue->tx_pool_slot[id] != XENNET_NO_POOL_SLOT) {
+		xennet_pool_put(&queue->tx_pool, queue->tx_pool_slot[id]);
+		queue->tx_pool_slot[id] = XENNET_NO_POOL_SLOT;
+		return true;
+	}
+
+	if (!gnttab_end_foreign_access_ref(queue->grant_tx_ref[id]))
+		return false;
+	gnttab_release_grant_reference(&queue->gref_tx_head,
+				       queue->grant_tx_ref[id]);
+	return true;
+}
+
+/* End the backend's access to the data of a tx request being freed. */
+static void xennet_tx_end_access(struct netfront_queue *queue, unsigned int id)
+{
+	if (queue->tx_pool_slot[id] != XENNET_NO_POOL_SLOT) {
+		xennet_pool_put(&queue->tx_pool, queue->tx_pool_slot[id]);
+		queue->tx_pool_slot[id] = XENNET_NO_POOL_SLOT;
+		return;
+	}
+
+	get_page(queue->grant_tx_page[id]);
+	gnttab_end_foreign_access(queue->grant_tx_ref[id],
+				  queue->grant_tx_page[id]);
+}
+
 static bool xennet_tx_buf_gc(struct netfront_queue *queue)
 {
 	RING_IDX cons, prod;
@@ -568,14 +632,11 @@ static bool xennet_tx_buf_gc(struct netfront_queue *queue)
 			queue->tx_link[id] = TX_LINK_NONE;
 			skb = queue->tx_skbs[id];
 			queue->tx_skbs[id] = NULL;
-			if (unlikely(!gnttab_end_foreign_access_ref(
-				queue->grant_tx_ref[id]))) {
+			if (unlikely(!xennet_tx_ungrant(queue, id))) {
 				dev_alert(dev,
 					  "Grant still in use by backend domain\n");
 				goto err;
 			}
-			gnttab_release_grant_reference(
-				&queue->gref_tx_head, queue->grant_tx_ref[id]);
 			queue->grant_tx_ref[id] = INVALID_GRANT_REF;
 			queue->grant_tx_page[id] = NULL;
 			add_id_to_list(&queue->tx_skb_freelist, queue->tx_link, id);
@@ -621,11 +682,7 @@ static void xennet_tx_setup_grant(unsigned long gfn, unsigned int offset,
 
 	id = get_id_from_list(&queue->tx_skb_freelist, queue->tx_link);
 	tx = RING_GET_REQUEST(&queue->tx, queue->tx.req_prod_pvt++);
-	ref = gnttab_claim_grant_reference(&queue->gref_tx_head);
-	WARN_ON_ONCE(IS_ERR_VALUE((unsigned long)(int)ref));
-
-	gnttab_grant_foreign_access_ref(ref, queue->info->xbdev->otherend_id,
-					gfn, GNTMAP_readonly);
+	ref = xennet_tx_grant(queue, id, page, gfn, offset, len);
 
 	queue->tx_skbs[id] = skb;
 	queue->grant_tx_page[id] = page;
@@ -1580,9 +1637,7 @@ static void xennet_release_tx_bufs(struct netfront_queue *queue)
 
 		skb = queue->tx_skbs[i];
 		queue->tx_skbs[i] = NULL;
-		get_page(queue->grant_tx_page[i]);
-		gnttab_end_foreign_access(queue->grant_tx_ref[i],
-					  queue->grant_tx_page[i]);
+		xennet_tx_end_access(queue, i);
 		queue->grant_tx_page[i] = NULL;
 		queue->grant_tx_ref[i] = INVALID_GRANT_REF;
 		add_id_to_list(&queue->tx_skb_freelist, queue->tx_link, i);
@@ -2549,6 +2604,7 @@ static int xennet_init_queue(struct netfront_queue *queue)
 		queue->tx_link[i] = i + 1;
 		queue->grant_tx_ref[i] = INVALID_GRANT_REF;
 		queue->grant_tx_page[i] = NULL;
+		queue->tx_pool_slot[i] = XENNET_NO_POOL_SLOT;
 	}
 	queue->tx_link[NET_TX_RING_SIZE - 1] = TX_LINK_NONE;
 
