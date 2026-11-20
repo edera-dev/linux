@@ -776,24 +776,6 @@ static int xennet_count_skb_slots(struct sk_buff *skb)
 	return slots;
 }
 
-static u16 xennet_select_queue(struct net_device *dev, struct sk_buff *skb,
-			       struct net_device *sb_dev)
-{
-	unsigned int num_queues = dev->real_num_tx_queues;
-	u32 hash;
-	u16 queue_idx;
-
-	/* First, check if there is only one queue */
-	if (num_queues == 1) {
-		queue_idx = 0;
-	} else {
-		hash = skb_get_hash(skb);
-		queue_idx = hash % num_queues;
-	}
-
-	return queue_idx;
-}
-
 static void xennet_mark_tx_pending(struct netfront_queue *queue)
 {
 	unsigned int i;
@@ -1889,7 +1871,6 @@ static const struct net_device_ops xennet_netdev_ops = {
 	.ndo_validate_addr   = eth_validate_addr,
 	.ndo_fix_features    = xennet_fix_features,
 	.ndo_set_features    = xennet_set_features,
-	.ndo_select_queue    = xennet_select_queue,
 	.ndo_bpf            = xennet_xdp,
 	.ndo_xdp_xmit	    = xennet_xdp_xmit,
 #ifdef CONFIG_NET_POLL_CONTROLLER
