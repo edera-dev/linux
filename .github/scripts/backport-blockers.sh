@@ -9,7 +9,7 @@
 # commits could be applied on top of code they were never written against.
 #
 # Usage:
-#   backport-blockers.sh <pending-file> <request-file> <lts-tip> <lts-upstream> <todo-out>
+#   backport-blockers.sh <pending-file> <request-file> <lts-tip> <lts-upstream> <todo-out> [<pr-number> [<merge-commit>]]
 #
 # <pending-file> is what pending-backports.sh prints for the whole of
 # edera/mainline: the mainline commits the LTS tree lacks, oldest first.
@@ -24,13 +24,20 @@
 #     commit that is already on the LTS tree from claiming a different
 #     pending commit that happens to share its subject.
 #
+# A squash merge puts none of the request's commits on mainline, only one
+# commit: <merge-commit> as GitHub reports it, or a rebased copy with its
+# patch-id, with a subject ending in " (#<pr-number>)" unless it was edited.
+# So when no request commit matches and <pr-number> is given, the pending
+# commits with that patch-id or that subject suffix are written to <todo-out>.
+#
 # Prints the pending commits the pull request has to wait for, oldest first,
 # and nothing when it can go ahead.
 
 set -euo pipefail
 
-if [ $# -ne 5 ] || [ ! -r "$1" ] || [ ! -r "$2" ]; then
-	echo "usage: $0 <pending-file> <request-file> <lts-tip> <lts-upstream> <todo-out>" >&2
+if [ $# -lt 5 ] || [ $# -gt 7 ] || [ ! -r "$1" ] || [ ! -r "$2" ] ||
+	! [[ ${6:-0} =~ ^[0-9]+$ ]] || ! [[ ${7:-0} =~ ^([0-9a-f]{40}|0)$ ]]; then
+	echo "usage: $0 <pending-file> <request-file> <lts-tip> <lts-upstream> <todo-out> [<pr-number> [<merge-commit>]]" >&2
 	exit 2
 fi
 pending=$1
@@ -38,6 +45,8 @@ request=$2
 l_tip=$(git rev-parse --verify "$3^{commit}")
 l_base=$(git merge-base "$l_tip" "$(git rev-parse --verify "$4^{commit}")")
 todo=$5
+pr=${6:-}
+merge=${7:-}
 
 work=$(mktemp -d)
 trap 'rm -rf "$work"' EXIT
@@ -78,6 +87,21 @@ while IFS=$'\t' read -r sha subject; do
 		files "$sha" >>"$work/files"
 	fi
 done <"$request"
+if [ ! -s "$todo" ] && [ -n "$pr" ]; then
+	mp=
+	if [ -n "$merge" ] && git cat-file -e "$merge^{commit}" 2>/dev/null; then
+		mp=$(pid "$merge")
+	fi
+	while IFS=$'\t' read -r n sha subject; do
+		echo "$n" >>"$work/claimed"
+		printf '%s\t%s\n' "$sha" "$subject" >>"$todo"
+		files "$sha" >>"$work/files"
+	done < <(awk -F'\t' -v t=" (#$pr)" -v p="$mp" '
+		(p != "" && $4 == p) ||
+		(length($3) > length(t) && substr($3, length($3) - length(t) + 1) == t) {
+			print $1 "\t" $2 "\t" $3
+		}' "$work/pending")
+fi
 [ -s "$todo" ] || exit 0
 sort -u -o "$work/files" "$work/files"
 first=$(sort -n "$work/claimed" | head -n1)

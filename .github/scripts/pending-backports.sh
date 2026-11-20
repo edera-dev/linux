@@ -9,7 +9,9 @@
 #   - a commit with the same subject, ignoring a trailing version tag such as
 #     " (6.18)" that a port may add (the k-th mainline commit with a subject
 #     pairs with the k-th LTS one, so repeated subjects are counted, not
-#     merged); or
+#     merged), and also ignoring each trailing " (#<n>)" that a squash merge
+#     on either tree adds with its own pull request's number when both
+#     commits change the same files; or
 #   - a commit with the same patch-id, which catches a port whose subject was
 #     reworded but whose change was not.
 #
@@ -44,17 +46,26 @@ skip=${5:-/dev/null}
 work=$(mktemp -d)
 trap 'rm -rf "$work"' EXIT
 
-# <sha> TAB <normalized subject> TAB <patch-id>, oldest first.
+# <sha> TAB <normalized subject> TAB <patch-id> TAB <subject without pull
+# request numbers> TAB <changed files>, oldest first.
 series() {
 	git log --no-merges --reverse --format='commit %H' --patch "$1" |
 		git patch-id --stable | awk '{ print $2 "\t" $1 }' >"$work/pid.map"
+	git log --no-merges --format='commit %H' --name-only "$1" |
+		awk '/^commit / { if (c != "") print c "\t" f; c = $2; f = ""; next }
+			NF { f = f (f == "" ? "" : " ") $0 }
+			END { if (c != "") print c "\t" f }' >"$work/files.map"
 	git log --no-merges --reverse --format='%H%x09%s' "$1" |
-		awk -F'\t' 'NR == FNR { pid[$1] = $2; next }
+		awk -F'\t' 'FILENAME == ARGV[1] { pid[$1] = $2; next }
+			FILENAME == ARGV[2] { files[$1] = $2; next }
 			{
 				s = $2
 				sub(/[ \t]*\((v?[0-9]+\.[0-9]+(\.[0-9y]+)?(-lts)?)\)$/, "", s)
-				print $1 "\t" s "\t" ($1 in pid ? pid[$1] : "-")
-			}' "$work/pid.map" -
+				k = s
+				while (sub(/ \(#[0-9]+\)$/, "", k))
+					;
+				print $1 "\t" s "\t" ($1 in pid ? pid[$1] : "-") "\t" k "\t" files[$1]
+			}' "$work/pid.map" "$work/files.map" -
 }
 series "$m_base..$m_tip" >"$work/mainline"
 series "$l_base..$l_tip" >"$work/lts"
@@ -68,13 +79,22 @@ grep -vE '^[[:space:]]*(#|$)' "$skip" | sed -E 's/^[[:space:]]+|[[:space:]]+$//g
 awk -F'\t' '
 	FILENAME == ARGV[1] { auto[$0] = 1; next }
 	FILENAME == ARGV[2] { skip[$0] = 1; next }
-	FILENAME == ARGV[3] { have[$2]++; if ($3 != "-") bypid[$3] = $2; next }
+	FILENAME == ARGV[3] {
+		n++; subj[n] = $2; key[n] = $4; files[n] = $5
+		if ($3 != "-") bypid[$3] = n
+		next
+	}
 	{
 		if (($1 in auto) || ($2 in skip)) next
-		# A patch-id match uses up the LTS commit it matched, under the
-		# subject that commit has there, so it cannot also pair with another.
-		if ($3 in bypid) { have[bypid[$3]]--; delete bypid[$3]; next }
-		if (have[$2] > 0) { have[$2]--; next }
+		# A patch-id match uses up the LTS commit it matched, so it cannot
+		# also pair with another.
+		if ($3 in bypid) { used[bypid[$3]] = 1; delete bypid[$3]; next }
+		m = 0
+		for (i = 1; i <= n && !m; i++)
+			if (!used[i] && subj[i] == $2) m = i
+		for (i = 1; i <= n && !m; i++)
+			if (!used[i] && key[i] == $4 && files[i] == $5) m = i
+		if (m) { used[m] = 1; next }
 		print $1 "\t" $2
 	}
 ' "$work/automation" "$work/skip" "$work/lts" "$work/mainline"
