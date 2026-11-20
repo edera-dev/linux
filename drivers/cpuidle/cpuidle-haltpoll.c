@@ -17,6 +17,7 @@
 #include <linux/sched/idle.h>
 #include <linux/kvm_para.h>
 #include <linux/cpuidle_haltpoll.h>
+#include <xen/xen.h>
 
 static bool force __read_mostly;
 module_param(force, bool, 0444);
@@ -93,9 +94,13 @@ static void haltpoll_uninit(void)
 	haltpoll_cpuidle_devices = NULL;
 }
 
+/*
+ * Xen does not poll for a halted vCPU before it deschedules it, so a Xen guest
+ * wants guest side polling just as a KVM guest without host halt polling does.
+ */
 static bool haltpoll_want(void)
 {
-	return kvm_para_has_hint(KVM_HINTS_REALTIME) || force;
+	return kvm_para_has_hint(KVM_HINTS_REALTIME) || xen_hvm_domain() || force;
 }
 
 static int __init haltpoll_init(void)
@@ -107,7 +112,7 @@ static int __init haltpoll_init(void)
 	if (boot_option_idle_override != IDLE_NO_OVERRIDE)
 		return -ENODEV;
 
-	if (!kvm_para_available() || !haltpoll_want())
+	if (!(kvm_para_available() || xen_hvm_domain()) || !haltpoll_want())
 		return -ENODEV;
 
 	cpuidle_poll_state_init(drv);
