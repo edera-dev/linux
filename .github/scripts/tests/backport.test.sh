@@ -45,8 +45,8 @@ echo "upstream main" >u.c
 commit "upstream: mainline moves on"
 
 # Edera on LTS: one commit both trees share, one ported with a version tag,
-# one reworded but identical in content, one LTS-only, and a repeated subject
-# once.
+# one reworded but identical in content, one LTS-only, a repeated subject
+# once, and #11 adapted and then squash-merged as pull request #22.
 git switch -q -c lts lts-up
 sed -i 's/^5$/5 shared/' a.c
 commit "xen: shared fix"
@@ -56,6 +56,8 @@ sed -i 's/^25$/25 reworded/' a.c
 commit "xen: lts wording of a fix"
 echo lts-only >l.c
 commit "drm: lts only"
+sed -i 's/^45$/45 adapted for lts/' a.c
+commit "xen: fixed by a squash merge (#11) (#22)"
 sed -i 's/^30$/30 dep one/' b.c
 commit "apply dep patch"
 lts_tip=$(git rev-parse HEAD)
@@ -70,6 +72,8 @@ sed -i 's/^15$/15 ported/' a.c
 commit "9p/xen: share one frontend"
 sed -i 's/^25$/25 reworded/' a.c
 commit "xen: mainline wording of a fix"
+sed -i 's/^35$/35 as on mainline/' a.c
+commit "xen: fixed by a squash merge (#11)"
 sed -i 's/^30$/30 dep one/' b.c
 commit "apply dep patch"
 git switch -q -c side
@@ -105,7 +109,7 @@ if [ -z "$got" ]; then ok "a tree against itself has nothing pending"; else
 bash "$PENDING" "$main_tip" mainline-up "$lts_tip" lts-up >"$WORK/pending-all"
 nth() { git log --reverse --format=%H --grep="^$1\$" "$main_tip" | sed -n "${2:-1}p"; }
 pr() { for c in "$@"; do printf '%s\t%s\n' "$c" "$(git log -1 --format=%s "$c")"; done >"$WORK/pr"; }
-blockers() { bash "$BLOCKERS" "$WORK/pending-all" "$WORK/pr" "$lts_tip" lts-up "$WORK/todo" | cut -f2; }
+blockers() { bash "$BLOCKERS" "$WORK/pending-all" "$WORK/pr" "$lts_tip" lts-up "$WORK/todo" ${prnum:+"$prnum"} ${mergesha:+"$mergesha"} | cut -f2; }
 check() { # check <description> <want blockers> <want todo count>
 	local got
 	got=$(blockers)
@@ -140,6 +144,67 @@ printf 'xen: new on mainline\n' >"$WORK/skip2"
 bash "$PENDING" "$main_tip" mainline-up "$lts_tip" lts-up "$WORK/skip2" >"$WORK/pending-all"
 pr "$(nth 'apply dep patch' 2)"
 check "a skipped commit does not block" "" 1
+
+# A squash merge of pull request #7: its two commits stay off mainline, one
+# commit titled "... (#7)" lands there. #17 lands the same way on another file,
+# and #9 with its title edited at merge.
+git switch -q -c pr7 "$main_tip"
+sed -i 's/^45$/45 part one/' b.c
+commit "xen: part one"
+sed -i 's/^55$/55 part two/' b.c
+commit "xen: part two"
+mapfile -t pr7_commits < <(git log --reverse --format=%H "$main_tip..pr7")
+git switch -q -c squashed "$main_tip"
+echo other >c.c
+commit "xen: other feature (#17)"
+git merge -q --squash pr7 >/dev/null 2>&1
+commit "xen: two part feature (#7)"
+git switch -q -c pr9 squashed
+echo one >d.c
+commit "xen: nine part one"
+echo two >>d.c
+commit "xen: nine part two"
+mapfile -t pr9_commits < <(git log --reverse --format=%H "squashed..pr9")
+git switch -q squashed
+git merge -q --squash pr9 >/dev/null 2>&1
+commit "xen: title edited at merge"
+pr9_merge=$(git rev-parse HEAD)
+bash "$PENDING" squashed mainline-up "$lts_tip" lts-up "$WORK/skip" >"$WORK/pending-all"
+git switch -q main
+
+pr "${pr7_commits[@]}"
+prnum=7
+check "a squashed pull request waits for earlier pending commits on its files" \
+	"$(printf '%s\n' "xen: new on mainline" "apply dep patch")" 1
+if [ "$(cut -f2 "$WORK/todo")" = "xen: two part feature (#7)" ]; then
+	ok "a squashed pull request requests its squash commit"
+else
+	bad "a squashed pull request requests its squash commit" "todo: $(cat "$WORK/todo")"
+fi
+pr "$(nth 'xen: new on mainline')"
+check "a request that matches does not also take the squash commit" "" 1
+pr "${pr9_commits[@]}"
+prnum=9 mergesha=$pr9_merge
+check "a squash commit with an edited title is matched by its merge commit" "" 1
+if [ "$(cut -f2 "$WORK/todo")" = "xen: title edited at merge" ]; then
+	ok "the merge commit's match requests the squash commit"
+else
+	bad "the merge commit's match requests the squash commit" "todo: $(cat "$WORK/todo")"
+fi
+prnum='' mergesha=''
+
+# A pull request number does not pair two commits with one title that change
+# different files.
+git switch -q -c lts-other "$lts_tip"
+echo lts >o.c
+commit "drm: one title (#31)"
+git switch -q -c main-other "$main_tip"
+echo main >p.c
+commit "drm: one title (#30)"
+git switch -q main
+got=$(bash "$PENDING" main-other mainline-up lts-other lts-up "$WORK/skip" | cut -f2 | tail -n1)
+if [ "$got" = "drm: one title (#30)" ]; then ok "one title on different files stays pending"; else
+	bad "one title on different files stays pending" "got: $got"; fi
 
 bash "$PENDING" "$main_tip" mainline-up "$lts_tip" lts-up "$WORK/skip" >"$WORK/request"
 

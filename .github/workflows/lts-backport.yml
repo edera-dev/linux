@@ -155,10 +155,16 @@ jobs:
           done >>"$out/skip"
 
           bash "$tools/scripts/pending-backports.sh" "$src" "$src_up" "$old" "$tgt_up" "$out/skip" >"$out/pending"
-          bash "$tools/scripts/backport-blockers.sh" "$out/pending" "$out/request" "$old" "$tgt_up" "$out/todo" >"$out/blockers"
+          # A squash merge's commit, for backport-blockers.sh to match by
+          # patch-id. Without it, the subject suffix " (#N)" still matches.
+          merge=$(jq -r '.merge_commit_sha // ""' <<<"$pr")
+          if ! [[ $merge =~ ^[0-9a-f]{40}$ ]] || ! git fetch --no-tags --filter=blob:none origin "$merge"; then
+            merge=
+          fi
+          bash "$tools/scripts/backport-blockers.sh" "$out/pending" "$out/request" "$old" "$tgt_up" "$out/todo" "$PR" ${merge:+"$merge"} >"$out/blockers"
 
           if [ ! -s "$out/todo" ]; then
-            finish skipped "Nothing to backport: every commit of #$PR is already on \`$TARGET\` (\`${old:0:12}\`), changes only automation, or is no longer an Edera commit on \`$SOURCE\`."
+            finish skipped "Nothing to backport: every commit of #$PR is already on \`$TARGET\` (tip \`${old:0:12}\`), changes only automation, or is no longer an Edera commit on \`$SOURCE\`."
           fi
           if [ -s "$out/blockers" ]; then
             {

@@ -15,7 +15,8 @@ rest.
 
 The list comes from `pending-backports.sh`, which counts a mainline commit as
 present on the LTS tree only when the LTS series has a commit with the same
-subject (ignoring a trailing version tag such as ` (6.18)`) or the same
+subject (ignoring a trailing version tag such as ` (6.18)`, and a trailing
+pull request number such as ` (#122)` when both change the same files) or the same
 patch-id. So a commit can be listed although it is there: ported under a
 reworded subject and with a changed diff, folded into another commit, or
 already in `linux-6.18.y` upstream. And a commit can be listed because it
