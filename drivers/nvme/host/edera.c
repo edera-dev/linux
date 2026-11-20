@@ -127,6 +127,11 @@ module_param(edera_copy, uint, 0444);
 MODULE_PARM_DESC(edera_copy,
 		 "grant a mapping's own pages for the backend to copy, instead of copying through the data pool: 1 for reads, 2 for reads and writes, 0 never");
 
+static unsigned int edera_pool_below = 4;
+module_param(edera_pool_below, uint, 0444);
+MODULE_PARM_DESC(edera_pool_below,
+		 "copy a mapping of up to 8 KiB through the data pool instead of granting its pages while this CPU's pool and copy window parts hold fewer pages than this");
+
 static bool edera_grant_only;
 module_param(edera_grant_only, bool, 0444);
 MODULE_PARM_DESC(edera_grant_only,
@@ -163,6 +168,8 @@ struct edera_pool {
 	unsigned int npages;
 	bool copy;
 	unsigned long *map;
+	/* Pages set in map. */
+	unsigned int used;
 	struct edera_slot *slots;
 	/* Next-fit start, so a search does not rescan the busy front each time. */
 	unsigned int hint;
@@ -456,6 +463,7 @@ static struct edera_pool *edera_pool_get(struct edera_pool *pools,
 						       0);
 		if (s < size) {
 			bitmap_set(p->map, s, npages);
+			p->used += npages;
 			p->hint = s + npages;
 			spin_unlock_irqrestore(&p->lock, flags);
 			*slot = s;
@@ -525,7 +533,17 @@ static void edera_grant_end(struct edera_nvme *e, struct edera_pool *p,
 	}
 	spin_lock_irqsave(&p->lock, flags);
 	bitmap_clear(p->map, slot, npages);
+	p->used -= npages;
 	spin_unlock_irqrestore(&p->lock, flags);
+}
+
+/* Pages in flight in this CPU's own pool and copy window parts, read without their locks. */
+static bool edera_lightly_loaded(struct edera_nvme *e)
+{
+	unsigned int i = raw_smp_processor_id() % e->nr_pools;
+
+	return READ_ONCE(e->pools[i].used) + READ_ONCE(e->wins[i].used) <
+	       edera_pool_below;
 }
 
 static dma_addr_t edera_dma_map_page(struct device *dev, struct page *page,
@@ -545,8 +563,12 @@ static dma_addr_t edera_dma_map_page(struct device *dev, struct page *page,
 	/*
 	 * Writes stay in the pool: the backend limits the write bytes in
 	 * flight, and a copy inside that limit costs more than one before it.
+	 * A small mapping on a lightly loaded CPU stays in the pool too: the
+	 * guest's copy is shorter than the backend's grant copy hypercall, and
+	 * with few requests in flight that hypercall is on the critical path.
 	 */
-	if (e->nr_wins && (dir == DMA_FROM_DEVICE || edera_copy > 1)) {
+	if (e->nr_wins && (dir == DMA_FROM_DEVICE || edera_copy > 1) &&
+	    !(size <= SZ_8K && edera_lightly_loaded(e))) {
 		p = edera_pool_get(e->wins, e->nr_wins, npages, &slot);
 		if (p)
 			return edera_grant_into(e, p, slot, phys, size, dir);
@@ -580,6 +602,7 @@ static void edera_dma_unmap_page(struct device *dev, dma_addr_t addr,
 
 	spin_lock_irqsave(&p->lock, flags);
 	bitmap_clear(p->map, slot, p->slots[slot].npages);
+	p->used -= p->slots[slot].npages;
 	spin_unlock_irqrestore(&p->lock, flags);
 }
 
