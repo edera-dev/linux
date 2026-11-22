@@ -477,9 +477,17 @@ static struct iommu_ops xen_iommu_ops = {
 	},
 };
 
+/*
+ * True when the host-bridge windows @dev sees are not the machine's and
+ * dma-iommu must not reserve them: a guest's IOVA space belongs to the
+ * hypervisor, and the windows it sees are invented.  Dom0 sees the real
+ * host bridges, whose windows route to real BARs, so there the reservation
+ * stands as on bare metal.
+ */
 bool xen_iommu_manages_iova(struct device *dev)
 {
-	return dev->iommu && dev_iommu_ops(dev) == &xen_iommu_ops;
+	return !xen_initial_domain() && dev->iommu &&
+	       dev_iommu_ops(dev) == &xen_iommu_ops;
 }
 
 static int __init xen_iommu_init(void)
